@@ -11,12 +11,11 @@ static constexpr uint32_t UART0_BAUD  = 115200;
 static constexpr uint32_t TMC_BAUD    = 115200;
 
 // ===================== PIN MAP =====================
-
 // AS5048A - HSPI
-static constexpr int PIN_AS5048_SCK  = 12;
-static constexpr int PIN_AS5048_MISO = 13;
-static constexpr int PIN_AS5048_MOSI = 11;
-static constexpr int PIN_AS5048_CS   = 10;
+static constexpr int PIN_AS5048_SCK  = 12;  // SCK = CLK   - green
+static constexpr int PIN_AS5048_MISO = 13;  // MISO = DOUT - purple 
+static constexpr int PIN_AS5048_MOSI = 11;  // MOSI = DIN  - blue
+static constexpr int PIN_AS5048_CS   = 10;  // CS = CS     - white
 
 // TMC2209 - per ora solo pin assegnati, driver non gestito
 static constexpr int PIN_TMC_TX = 7;
@@ -37,7 +36,7 @@ AS5048A encoder(EncoderSPI, PIN_AS5048_CS);
 // ===================== TIMING =====================
 
 static constexpr uint32_t ENCODER_READ_PERIOD_MS = 20;
-static constexpr uint32_t ENCODER_PRINT_PERIOD_MS = 250;
+static constexpr uint32_t ENCODER_PRINT_PERIOD_MS = 100;
 
 static uint32_t lastEncoderReadMs = 0;
 static uint32_t lastEncoderPrintMs = 0;
@@ -143,19 +142,22 @@ void loop() {
   if (now - lastEncoderPrintMs >= ENCODER_PRINT_PERIOD_MS) {
     lastEncoderPrintMs = now;
 
-    Serial.print("@enc_raw:");
+    Serial.print("@raw:");
     Serial.print(encoderRaw);
 
-    Serial.print(",enc_deg:");
+    Serial.print(",rdeg:");
     Serial.print(encoderDeg, 3);
 
-    Serial.print(",enc_ok:");
+    Serial.print(",cdeg:");
+    Serial.print(encoder.computeContinuousAngleDeg(encoderRaw), 3);
+
+    Serial.print(",ok:");
     Serial.print(encoderOk ? 1 : 0);
 
-    Serial.print(",parity_ok:");
+    Serial.print(",p:");
     Serial.print(encoder.lastParityOk() ? 1 : 0);
 
-    Serial.print(",err_flag:");
+    Serial.print(",err:");
     Serial.println(encoder.lastErrorFlag() ? 1 : 0);
   }
 }

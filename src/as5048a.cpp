@@ -1,5 +1,13 @@
 #include "as5048a.h"
 
+// ===================== AS5048A =====================
+// AS5048A SPI module implementation
+// Datasheet: https://ams.com/documents/20143/36005/AS5048A_DS000469_4-00.pdf
+// MISO = DOUT - purple 
+// MOSI = DIN  - blue
+// SCK = CLK   - green
+// CS = CS     - white
+// 
 // AS5048A SPI:
 // CPOL = 0, CPHA = 1 -> SPI_MODE1
 // Clock prudente: 1 MHz
@@ -26,6 +34,10 @@ void AS5048A::begin() {
   _lastReadOk = false;
   _lastParityOk = false;
   _lastErrorFlag = false;
+  _continuousInitialized = false;
+  _turnCount = 0;
+  _prevRawAngle = 0;
+  _continuousCounts = 0;
 }
 
 uint16_t AS5048A::transfer16(uint16_t value) {
@@ -127,4 +139,39 @@ bool AS5048A::lastParityOk() const {
 
 bool AS5048A::lastErrorFlag() const {
   return _lastErrorFlag;
+}
+
+// Track the AS5048A angle across multiple turns by unwrapping the 0..COUNTS_PER_REV value.
+float AS5048A::computeContinuousAngleDeg(uint16_t rawAngle) {
+  if (!_continuousInitialized) {
+    _prevRawAngle = rawAngle;
+    _continuousCounts = rawAngle;
+    _continuousInitialized = true;
+  } else {
+    int32_t delta = static_cast<int32_t>(rawAngle) -
+                    static_cast<int32_t>(_prevRawAngle);
+
+    if (delta > HALF_REV) {
+      _turnCount--;
+    } else if (delta < -HALF_REV) {
+      _turnCount++;
+    }
+
+    _prevRawAngle = rawAngle;
+    _continuousCounts = (_turnCount * COUNTS_PER_REV) + rawAngle;
+  }
+
+  return (static_cast<float>(_continuousCounts) * 360.0f) /
+         static_cast<float>(COUNTS_PER_REV);
+}
+
+bool AS5048A::readContinuousDegrees(float& angleDeg) {
+  uint16_t raw = 0;
+
+  if (!readRaw(raw)) {
+    return false;
+  }
+
+  angleDeg = computeContinuousAngleDeg(raw);
+  return true;
 }

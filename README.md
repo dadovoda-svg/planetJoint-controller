@@ -11,7 +11,9 @@ The target hardware is a Waveshare ESP32-S3 Zero module, developed using the Ard
 
 - AS5048A magnetic encoder support over SPI
 - 14-bit absolute angular position reading
-- Encoder parity and error flag checking
+- Encoder parity checking
+- AS5048A error flag checking
+- Continuous angle computation for rotations greater than one revolution
 - WS2812 RGB LED diagnostic state machine
 - USB CDC serial console
 - UART0 initialized for future use
@@ -33,7 +35,16 @@ The target hardware is a Waveshare ESP32-S3 Zero module, developed using the Ard
 - AS5048A magnetic absolute encoder
 - SPI interface
 - 14-bit resolution
+- 16384 counts per revolution
 - Used to measure the output angle of the planetary gearbox
+
+The encoder driver currently supports:
+
+- raw 14-bit position reading
+- angle conversion in degrees
+- SPI response parity validation
+- AS5048A error flag detection
+- continuous angle computation over multiple turns
 
 ### Motor Driver
 
@@ -140,12 +151,59 @@ Fields:
 | Field | Description |
 |---|---|
 | `enc_raw` | Raw 14-bit encoder value, from 0 to 16383 |
-| `enc_deg` | Converted angle in degrees |
+| `enc_deg` | Converted absolute angle in degrees, from 0 to almost 360 |
 | `enc_ok` | Encoder read status |
 | `parity_ok` | SPI response parity check result |
 | `err_flag` | AS5048A error flag |
 
 The `@` prefix is intended to make the output easy to filter with serial plotting tools.
+
+## Continuous Angle Tracking
+
+The AS5048A reports an absolute position within a single revolution.  
+Its raw value wraps around after one full turn:
+
+```text
+0 ... 16383 -> 0 ... 16383
+```
+
+To support rotations greater than one revolution, the encoder driver includes a continuous angle computation function.
+
+The continuous angle logic:
+
+- stores the previous raw encoder value
+- computes the delta between the current and previous reading
+- detects wrap-around when the delta crosses half a revolution
+- increments or decrements an internal turn counter
+- returns an angle that can grow above 360 degrees or below 0 degrees
+
+Example:
+
+```text
+absolute angle:    350° -> 355° ->   2° ->   8°
+continuous angle:  350° -> 355° -> 362° -> 368°
+```
+
+### Important Reliability Notes
+
+Continuous angle tracking is reliable only if the output shaft moves less than half a revolution between two valid encoder readings.
+
+For a 14-bit encoder:
+
+```text
+counts per revolution = 16384
+half revolution       = 8192 counts
+```
+
+If the shaft moves more than 180 degrees between two consecutive valid samples, the software cannot reliably determine the direction of the wrap-around.
+
+Recommended precautions:
+
+- sample the encoder significantly faster than the maximum expected output shaft speed
+- update the continuous angle only after a valid encoder read
+- do not update the continuous angle after parity errors or AS5048A error flags
+- keep the continuous counter state inside the encoder object, not in local static variables
+- use a wide integer type, such as `int64_t`, for internal continuous count tracking
 
 ## Development Roadmap
 
@@ -157,8 +215,10 @@ Planned steps:
 - [x] Implement AS5048A basic reading
 - [x] Add parity and error flag checking
 - [x] Add WS2812 diagnostic LED state machine
+- [x] Add continuous angle computation for multi-turn tracking
 - [ ] Add encoder offset calibration
-- [ ] Add angle unwrapping / multi-turn tracking
+- [ ] Add angle normalization helpers
+- [ ] Add angle unwrapping diagnostics
 - [ ] Add TMC2209 UART configuration
 - [ ] Add STEP/DIR motion generation
 - [ ] Add closed-loop position control
@@ -200,6 +260,7 @@ The current firmware focuses on:
 - hardware resource assignment
 - diagnostic LED handling
 - reliable AS5048A encoder reading
+- continuous encoder angle tracking over multiple turns
 - basic serial diagnostic output
 
 Motor driver configuration and motion control will be added later.

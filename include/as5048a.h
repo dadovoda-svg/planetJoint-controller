@@ -17,10 +17,15 @@ public:
   bool lastReadOk() const;
   bool lastParityOk() const;
   bool lastErrorFlag() const;
+  float computeContinuousAngleDeg(uint16_t rawAngle);
+  bool readContinuousDegrees(float& angleDeg);
 
 private:
   SPIClass& _spi;
   int _csPin;
+
+  static constexpr int32_t COUNTS_PER_REV = 16384;
+  static constexpr int32_t HALF_REV = COUNTS_PER_REV / 2;
 
   uint16_t _lastRaw = 0;
   bool _lastReadOk = false;
@@ -31,4 +36,9 @@ private:
   uint16_t buildCommand(uint16_t commandWithoutParity) const;
   bool checkEvenParity(uint16_t value) const;
   bool calcEvenParity(uint16_t value) const;
+
+  bool _continuousInitialized = false;
+  int64_t _turnCount = 0;
+  uint16_t _prevRawAngle = 0;
+  int64_t _continuousCounts = 0;
 };
