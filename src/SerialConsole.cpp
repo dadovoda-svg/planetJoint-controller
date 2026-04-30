@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <esp_system.h>
 
 extern bool toggleTrace();
 extern bool toggleTest(float microstepsPerSecond);
@@ -58,6 +59,12 @@ const SerialConsole::Command SerialConsole::_commands[] = {
     &SerialConsole::cmdCancel
   },
   {
+    "reboot",
+    "reboot",
+    "Forza reboot completo del micro",
+    &SerialConsole::cmdReboot
+  },
+  {
     "trace",
     "trace",
     "abilita/disabilita trace",
@@ -101,6 +108,19 @@ void SerialConsole::update()
   while (_serial.available() > 0) {
     char c = static_cast<char>(_serial.read());
     processChar(c);
+  }
+}
+
+void SerialConsole::setParamSetCallback(ParamSetCallback callback)
+{
+  _paramSetCallback = callback;
+}
+
+
+void SerialConsole::notifyParamSet(const char* key)
+{
+  if (_paramSetCallback != nullptr) {
+    _paramSetCallback(key);
   }
 }
 
@@ -379,6 +399,8 @@ void SerialConsole::cmdSet(int argc, char* argv[])
   _serial.print(key);
   _serial.print("=");
   _serial.println(value, 6);
+
+  notifyParamSet(key);
 }
 
 
@@ -472,6 +494,23 @@ void SerialConsole::cmdCancel(int argc, char* argv[])
   } else {
     _serial.println("OK nothing to cancel");
   }
+}
+
+void SerialConsole::cmdReboot(int argc, char* argv[])
+{
+  (void)argv;
+
+  if (argc != 1) {
+    _serial.println("ERR usage: reboot");
+    return;
+  }
+
+  _serial.println("OK rebooting MCU...");
+  _serial.flush();
+
+  delay(100);
+
+  ESP.restart();
 }
 
 void SerialConsole::cmdTrace(int argc, char* argv[])

@@ -109,7 +109,7 @@ void paramsInit() {
     float value = 0.0f;
 
     if (params.getByIndex(i, key, value)) {
-        Serial.printf("%s = %.5f\n", key, value);
+        Serial.printf("%s = %.5f\r\n", key, value);
     }
   }
 }
@@ -144,24 +144,121 @@ bool encoderFirstReadTest() {
   return false;
 }
 
-void applyAllParams() {
-    float irun = 0.0f;
-    float ihold = 0.0f;
-    float ustep = 0.0f;
+static bool readParamU8(const char* key, uint8_t& out)
+{
+  float value = 0.0f;
 
-    if (params.get("irun", irun) && params.get("ihold", ihold)) {
-        tmc.setCurrentScale(static_cast<uint8_t>(irun), static_cast<uint8_t>(ihold), tmcConfig.iholdDelay);
-        Serial.printf("[OK] Updated TMC2209 current scale: IRUN=%d, IHOLD=%d\n", static_cast<int>(irun), static_cast<int>(ihold));
-    } else {
-        Serial.println("[ERR] Failed to get IRUN/IHOLD from parameters");
-    }
+  if (!params.get(key, value)) {
+    Serial.print("[ERR] Parameter not found: ");
+    Serial.println(key);
+    return false;
+  }
 
-    if (params.get("ustep", ustep)) {
-        tmc.setMicrostepResolution(static_cast<uint16_t>(ustep));
-        Serial.printf("[OK] Updated TMC2209 microstep resolution: USTEP=%d\n", static_cast<int>(ustep));
-    } else {
-        Serial.println("[ERR] Failed to get USTEP from parameters");
-    }
+  if (value < 0.0f || value > 255.0f) {
+    Serial.print("[ERR] Parameter out of uint8 range: ");
+    Serial.print(key);
+    Serial.print("=");
+    Serial.println(value, 6);
+    return false;
+  }
+
+  out = static_cast<uint8_t>(value);
+  return true;
+}
+
+
+static bool readParamU16(const char* key, uint16_t& out)
+{
+  float value = 0.0f;
+
+  if (!params.get(key, value)) {
+    Serial.print("[ERR] Parameter not found: ");
+    Serial.println(key);
+    return false;
+  }
+
+  if (value < 0.0f || value > 65535.0f) {
+    Serial.print("[ERR] Parameter out of uint16 range: ");
+    Serial.print(key);
+    Serial.print("=");
+    Serial.println(value, 6);
+    return false;
+  }
+
+  out = static_cast<uint16_t>(value);
+  return true;
+}
+
+
+static void applyCurrentScaleFromParams()
+{
+  uint8_t irun = 0;
+  uint8_t ihold = 0;
+
+  if (!readParamU8("irun", irun) || !readParamU8("ihold", ihold)) {
+    Serial.println("[ERR] Current scale update skipped");
+    return;
+  }
+
+  tmc.setCurrentScale(irun, ihold, tmcConfig.iholdDelay);
+
+  Serial.printf(
+    "[OK] Updated TMC2209 current scale: IRUN=%u, IHOLD=%u\r\n",
+    static_cast<unsigned>(irun),
+    static_cast<unsigned>(ihold)
+  );
+}
+
+
+static void applyMicrostepResolutionFromParams()
+{
+  uint16_t ustep = 0;
+
+  if (!readParamU16("ustep", ustep)) {
+    Serial.println("[ERR] Microstep resolution update skipped");
+    return;
+  }
+
+  tmc.setMicrostepResolution(ustep);
+
+  Serial.printf(
+    "[OK] Updated TMC2209 microstep resolution: USTEP=%u\r\n",
+    static_cast<unsigned>(ustep)
+  );
+}
+
+
+void applyAllParams()
+{
+  applyCurrentScaleFromParams();
+  applyMicrostepResolutionFromParams();
+}
+
+
+void onConsoleParamSet(const char* key)
+{
+  if (key == nullptr) {
+    return;
+  }
+
+  if (strcmp(key, "irun") == 0 || strcmp(key, "ihold") == 0) {
+    applyCurrentScaleFromParams();
+    return;
+  }
+
+  if (strcmp(key, "ustep") == 0) {
+    applyMicrostepResolutionFromParams();
+    return;
+  }
+
+  if (strcmp(key, "kp") == 0 || strcmp(key, "ki") == 0 || strcmp(key, "kd") == 0) {
+    Serial.print("[PARAMS] PID parameter changed in RAM: ");
+    Serial.println(key);
+    return;
+  }
+
+  Serial.print("[PARAMS] No runtime action defined for key: ");
+  Serial.println(key);
 }
 
 bool tmcInit() {
@@ -255,6 +352,7 @@ void setup() {
 
   Serial.println("[BOOT] Init complete");
 
+  console.setParamSetCallback(onConsoleParamSet);
   console.begin("pj> ");
 }
 

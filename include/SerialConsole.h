@@ -6,6 +6,7 @@
 class SerialConsole {
 public:
   typedef void (SerialConsole::*CommandHandler)(int argc, char* argv[]);
+  typedef void (*ParamSetCallback)(const char* key);
 
   struct Command {
     const char* name;
@@ -18,6 +19,7 @@ public:
 
   void begin(const char* prompt = "> ");
   void update();
+  void setParamSetCallback(ParamSetCallback callback);
 
 private:
   static constexpr size_t RX_BUFFER_SIZE = 128;
@@ -31,6 +33,8 @@ private:
 
   Stream& _serial;
   PersistentParams& _params;
+
+  ParamSetCallback _paramSetCallback = nullptr;
 
   const char* _prompt = "> ";
   Mode _mode = Mode::Normal;
@@ -49,6 +53,7 @@ private:
   const Command* findCommand(const char* name) const;
 
   void printPrompt();
+  void notifyParamSet(const char* key);
 
   void cmdHelp(int argc, char* argv[]);
   void cmdGet(int argc, char* argv[]);
@@ -60,6 +65,7 @@ private:
   void cmdCancel(int argc, char* argv[]);
   void cmdTrace(int argc, char* argv[]);
   void cmdTest(int argc, char* argv[]);
+  void cmdReboot(int argc, char* argv[]);
 
   bool parseKeyValueLine(
     const char* line,
