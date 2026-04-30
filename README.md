@@ -15,9 +15,12 @@ The target hardware is a Waveshare ESP32-S3 Zero module, developed using the Ard
 - AS5048A error flag checking
 - Continuous angle computation for rotations greater than one revolution
 - WS2812 RGB LED diagnostic state machine
-- USB CDC serial console
+- USB CDC serial console with interactive command support
+- Persistent parameter storage in ESP32 NVS
+- TMC2209 UART communication, probe, and safe register configuration
+- Motor test command to enable/disable the driver and command velocity
 - UART0 initialized for future use
-- UART2 reserved for TMC2209 stepper driver configuration
+- UART2 used for TMC2209 configuration
 - Safe motor GPIO initialization
 - Modular firmware structure
 
@@ -49,11 +52,11 @@ The encoder driver currently supports:
 ### Motor Driver
 
 - Trinamic TMC2209 stepper motor driver
-- STEP/DIR motion control
-- UART configuration interface
+- UART configuration interface via `Serial2`
+- Safe driver initialization and register configuration
+- Motor test mode with controlled enable/disable
 
-The TMC2209 support is planned but not yet implemented.  
-At the current stage, the related GPIO and UART resources are initialized but the driver is not configured.
+The firmware now includes TMC2209 UART communication, device probing, and safe register configuration. The driver remains disabled by default and can be enabled using the serial console `test` command for controlled motion validation.
 
 ### Diagnostic LED
 
@@ -81,9 +84,28 @@ At the current stage, the related GPIO and UART resources are initialized but th
 
 | Interface | Purpose |
 |---|---|
-| USB CDC Serial | Debug console |
+| USB CDC Serial | Debug console and command console |
 | UART0 | Reserved for future use |
-| UART2 | Reserved for TMC2209 configuration |
+| UART2 | TMC2209 register access and driver communication |
+
+## Serial Console
+
+The firmware includes an interactive USB CDC console with command support for parameter management and diagnostics.
+
+Available commands:
+
+- `help`
+- `get <key>`
+- `set <key> <value>`
+- `load`
+- `save`
+- `export`
+- `import`
+- `cancel`
+- `trace`
+- `test <speed>`
+
+Parameters are stored in non-volatile ESP32 NVS and loaded at boot, allowing configuration values to persist across power cycles.
 
 ## LED States
 
@@ -138,23 +160,20 @@ src/
 
 ## Encoder Output
 
-The firmware periodically reads the AS5048A encoder and prints diagnostic data to the USB serial console.
+The firmware periodically reads the AS5048A encoder and prints trace output to the USB serial console when the `trace` command is enabled.
 
 Example output:
 
 ```text
-@enc_raw:12345,enc_deg:271.384,enc_ok:1,parity_ok:1,err_flag:0
+@rdeg:271.384,cdeg:271.384
 ```
 
 Fields:
 
 | Field | Description |
 |---|---|
-| `enc_raw` | Raw 14-bit encoder value, from 0 to 16383 |
-| `enc_deg` | Converted absolute angle in degrees, from 0 to almost 360 |
-| `enc_ok` | Encoder read status |
-| `parity_ok` | SPI response parity check result |
-| `err_flag` | AS5048A error flag |
+| `rdeg` | Absolute encoder angle in degrees, 0..360 |
+| `cdeg` | Continuous angle in degrees, unwrapped across full revolutions |
 
 The `@` prefix is intended to make the output easy to filter with serial plotting tools.
 
@@ -216,10 +235,12 @@ Planned steps:
 - [x] Add parity and error flag checking
 - [x] Add WS2812 diagnostic LED state machine
 - [x] Add continuous angle computation for multi-turn tracking
+- [x] Add persistent parameter storage and console commands
+- [x] Add TMC2209 UART configuration
+- [x] Add motor test command
 - [ ] Add encoder offset calibration
 - [ ] Add angle normalization helpers
 - [ ] Add angle unwrapping diagnostics
-- [ ] Add TMC2209 UART configuration
 - [ ] Add STEP/DIR motion generation
 - [ ] Add closed-loop position control
 - [ ] Add motion profiles
@@ -259,11 +280,13 @@ The current firmware focuses on:
 
 - hardware resource assignment
 - diagnostic LED handling
-- reliable AS5048A encoder reading
+- reliable AS5048A encoder reading with parity and error checks
 - continuous encoder angle tracking over multiple turns
-- basic serial diagnostic output
+- USB CDC command console with persistent parameter storage
+- TMC2209 UART communication, probe, and safe register configuration
+- motor test mode for controlled driver enable/disable
 
-Motor driver configuration and motion control will be added later.
+Motor position control and motion profiles are still under development.
 
 ## License
 

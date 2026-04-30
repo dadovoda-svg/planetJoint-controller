@@ -4,7 +4,8 @@
 static constexpr int PIN_WS2812 = 21;
 static constexpr int NUM_LEDS   = 1;
 
-static Adafruit_NeoPixel wsLed(NUM_LEDS, PIN_WS2812, NEO_GRB + NEO_KHZ800);
+//static Adafruit_NeoPixel wsLed(NUM_LEDS, PIN_WS2812, NEO_GRB + NEO_KHZ800);
+static Adafruit_NeoPixel wsLed(NUM_LEDS, PIN_WS2812, NEO_RGB + NEO_KHZ800);
 
 static LedState currentState = LedState::BOOT;
 static uint32_t lastUpdateMs = 0;
