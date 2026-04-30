@@ -70,15 +70,19 @@ SerialConsole console(Serial, params);
 
 static constexpr uint32_t ENCODER_READ_PERIOD_MS = 20;
 static constexpr uint32_t ENCODER_PRINT_PERIOD_MS = 250;
+static constexpr uint32_t TEST_PERIOD_MS = 1;
 
-static uint32_t lastEncoderReadMs = 0;
+static uint32_t lastTestMs = 0;
 static uint32_t lastEncoderPrintMs = 0;
+static uint32_t lastEncoderReadMs = 0;
 
 static uint16_t encoderRaw = 0;
 static float encoderDeg = 0.0f;
 static bool encoderOk = false;
 static bool traceEnabled = false;
 static bool testEnabled = false;
+static bool testForward = false;
+static int32_t stepNum = 3200 ; // 16 microstep * 200 steps/rev * 1 rev/s * 60 s/min = 192000 microsteps/min = 3200 microsteps/s -> 5000 microsteps = 1.56s di test
 
 // ===================== SETUP =====================
 void paramsInit() {
@@ -91,7 +95,9 @@ void paramsInit() {
   params.initKey("kp", 1.0f);
   params.initKey("ki", 0.0f);
   params.initKey("kd", 0.0f);
-  params.initKey("jerk", 1.0f);
+  params.initKey("ustep", 16.0f);
+  params.initKey("irun", 10.0f);
+  params.initKey("ihold", 4.0f);
 
   //merge con i parametri di default, senza sovrascrivere quelli già presenti
   params.load();
@@ -136,6 +142,26 @@ bool encoderFirstReadTest() {
 
   Serial.println("[ERR] AS5048A first read failed");
   return false;
+}
+
+void applyAllParams() {
+    float irun = 0.0f;
+    float ihold = 0.0f;
+    float ustep = 0.0f;
+
+    if (params.get("irun", irun) && params.get("ihold", ihold)) {
+        tmc.setCurrentScale(static_cast<uint8_t>(irun), static_cast<uint8_t>(ihold), tmcConfig.iholdDelay);
+        Serial.printf("[OK] Updated TMC2209 current scale: IRUN=%d, IHOLD=%d\n", static_cast<int>(irun), static_cast<int>(ihold));
+    } else {
+        Serial.println("[ERR] Failed to get IRUN/IHOLD from parameters");
+    }
+
+    if (params.get("ustep", ustep)) {
+        tmc.setMicrostepResolution(static_cast<uint16_t>(ustep));
+        Serial.printf("[OK] Updated TMC2209 microstep resolution: USTEP=%d\n", static_cast<int>(ustep));
+    } else {
+        Serial.println("[ERR] Failed to get USTEP from parameters");
+    }
 }
 
 bool tmcInit() {
@@ -215,6 +241,8 @@ void setup() {
   if (!tmcInit()) {
     Serial.println("[ERR] Failed to initialize TMC2209 driver");
     wsSetState(LedState::FAULT);
+  } else {
+    Serial.println("[OK] TMC2209 driver initialized");
   }
 
   encoderInit();
@@ -236,6 +264,7 @@ bool toggleTrace() {
 }
 
 bool toggleTest(float microstepsPerSecond = 100.0f) {
+
   testEnabled = !testEnabled;
 
   if ( testEnabled ) {
@@ -243,6 +272,8 @@ bool toggleTest(float microstepsPerSecond = 100.0f) {
     tmc.armPowerStage();
     tmc.enableDriver();
     tmc.runVelocityMicrostepsPerSecond(microstepsPerSecond );
+    // testForward  = !testForward;
+    // stepNum = 64000;
   } else {
     Serial.println("Test motore DISABLED");
     tmc.stopInternalMotion();
@@ -286,7 +317,7 @@ void loop() {
     Serial.print(encoderDeg, 3);
 
     Serial.print(",cdeg:");
-    Serial.print(encoder.computeContinuousAngleDeg(encoderRaw), 3);
+    Serial.println(encoder.computeContinuousAngleDeg(encoderRaw), 3);
 
     // Serial.print(",ok:");
     // Serial.print(encoderOk ? 1 : 0);
@@ -297,4 +328,14 @@ void loop() {
     // Serial.print(",err:");
     // Serial.println(encoder.lastErrorFlag() ? 1 : 0);
   }
+
+  // //test motore per step/dir
+  // if (testEnabled && now - lastTestMs >= TEST_PERIOD_MS) {
+  //   lastTestMs = now;
+  //   if (stepNum > 0) {
+  //     tmc.step(testForward, 200); // step in avanti con high time di 1000 microsecondi
+  //     stepNum--;
+  //   } 
+  //   else toggleTest(0); // disabilita test al termine dei step programmati
+  // }
 }

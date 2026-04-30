@@ -166,6 +166,42 @@ bool Tmc2209Driver::stopInternalMotion()
     return writeReg(REG_VACTUAL, 0);
 }
 
+bool Tmc2209Driver::setMicrostepResolution(uint16_t microsteps)
+{
+    if (!isValidMicrostepResolution(microsteps)) {
+        return false;
+    }
+
+    _cfg.microstepResolution = microsteps;
+
+    // If the chip has not been configured yet, only update the cached
+    // configuration. configure() will later write CHOPCONF.
+    if (_status == Status::NotStarted || _status == Status::CommunicationOnly) {
+        return true;
+    }
+
+    if (_status != Status::Configured && _status != Status::Enabled) {
+        return false;
+    }
+
+    // Preserve the current chopper enable state while rebuilding CHOPCONF.
+    const bool chopperEnabled = ((_chopconfShadow & 0x0F) != 0);
+    const uint32_t oldChopconf = _chopconfShadow;
+
+    _chopconfShadow = buildChopconf(chopperEnabled);
+    if (!writeReg(REG_CHOPCONF, _chopconfShadow)) {
+        _chopconfShadow = oldChopconf;
+        return false;
+    }
+
+    return true;
+}
+
+uint16_t Tmc2209Driver::microstepResolution() const
+{
+    return _cfg.microstepResolution;
+}
+
 bool Tmc2209Driver::setCurrentScale(uint8_t irun, uint8_t ihold, uint8_t iholdDelay)
 {
     irun = constrain(irun, 0, 31);
@@ -387,6 +423,24 @@ uint32_t Tmc2209Driver::buildChopconf(bool chopperEnabled) const
     }
 
     return value;
+}
+
+bool Tmc2209Driver::isValidMicrostepResolution(uint16_t microsteps)
+{
+    switch (microsteps) {
+        case 1:
+        case 2:
+        case 4:
+        case 8:
+        case 16:
+        case 32:
+        case 64:
+        case 128:
+        case 256:
+            return true;
+        default:
+            return false;
+    }
 }
 
 uint8_t Tmc2209Driver::mresCode(uint16_t microsteps)

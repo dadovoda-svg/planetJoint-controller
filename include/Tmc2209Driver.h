@@ -58,6 +58,10 @@ public:
     bool runVelocityMicrostepsPerSecond(float microstepsPerSecond);
     bool stopInternalMotion();
 
+    // Microstep setting
+    bool setMicrostepResolution(uint16_t microsteps);
+    uint16_t microstepResolution() const;
+
     // Current setting
     bool setCurrentScale(uint8_t irun, uint8_t ihold, uint8_t iholdDelay);
     bool setRunCurrentRms(float targetRmsA, float rsenseOhm, float holdRatio = 0.5f);
@@ -102,6 +106,7 @@ private:
 
     static void setBit(uint32_t& value, uint8_t bit, bool enabled);
     static uint8_t calcCrc(uint8_t* datagram, uint8_t length);
+    static bool isValidMicrostepResolution(uint16_t microsteps);
     static uint8_t mresCode(uint16_t microsteps);
     static uint32_t encodeSigned24(int32_t value);
 

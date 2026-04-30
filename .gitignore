@@ -36,3 +36,6 @@ ControllerV7.0-backups/
 
 # --- Kate backuo
 *.kate-swp
+
+# --- Archive path
+archive/
