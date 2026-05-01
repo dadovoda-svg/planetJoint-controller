@@ -7,7 +7,8 @@
 
 extern bool toggleTrace();
 extern bool toggleTest(float microstepsPerSecond);
-
+extern bool moveStep(float steps);
+extern void setZero();
 
 const SerialConsole::Command SerialConsole::_commands[] = {
   {
@@ -59,6 +60,12 @@ const SerialConsole::Command SerialConsole::_commands[] = {
     &SerialConsole::cmdCancel
   },
   {
+    "zero",
+    "zero",
+    "Set current encoder position as zero",
+    &SerialConsole::cmdZero
+  },
+  {
     "reboot",
     "reboot",
     "Forza reboot completo del micro",
@@ -71,10 +78,16 @@ const SerialConsole::Command SerialConsole::_commands[] = {
     &SerialConsole::cmdTrace
   },
   {
-    "test",
-    "test <speed>",
-    "abilita/disabilita test motore",
-    &SerialConsole::cmdTest
+    "go",
+    "go <speed>",
+    "abilita/disabilita test velocità motore <testp/s>",
+    &SerialConsole::cmdGo
+  },
+  {
+    "step",
+    "step <steps>",
+    "abilita/disabilita test step motore <steps>",
+    &SerialConsole::cmdStep
   }
 };
 
@@ -496,6 +509,21 @@ void SerialConsole::cmdCancel(int argc, char* argv[])
   }
 }
 
+void SerialConsole::cmdZero(int argc, char* argv[])
+{
+  (void)argv;
+
+  if (argc != 1) {
+    _serial.println("ERR usage: zero");
+    return;
+  }
+
+  _serial.println("OK setting zero position...");
+  _serial.flush();
+
+  setZero();
+}
+
 void SerialConsole::cmdReboot(int argc, char* argv[])
 {
   (void)argv;
@@ -528,12 +556,12 @@ void SerialConsole::cmdTrace(int argc, char* argv[])
   _serial.println(enabled ? "enabled" : "disabled");
 }
 
-void SerialConsole::cmdTest(int argc, char* argv[])
+void SerialConsole::cmdGo(int argc, char* argv[])
 {
   (void)argv;
 
   if (argc != 2) {
-    _serial.println("ERR usage: test <speed>");
+    _serial.println("ERR usage: go <speed>");
     return;
   }
 
@@ -548,7 +576,31 @@ void SerialConsole::cmdTest(int argc, char* argv[])
 
   bool enabled = toggleTest(value);
 
-  _serial.print("OK test ");
+  _serial.print("OK test Go ");
+  _serial.println(enabled ? "enabled" : "disabled");
+}
+
+void SerialConsole::cmdStep(int argc, char* argv[])
+{
+  (void)argv;
+
+  if (argc != 2) {
+    _serial.println("ERR usage: step <steps>");
+    return;
+  }
+
+  char* endPtr = nullptr;
+  float value = strtof(argv[1], &endPtr);
+
+  if (endPtr == argv[1] || *endPtr != '\0') {
+    _serial.print("ERR invalid value: ");
+    _serial.println(argv[1]);
+    return;
+  }
+
+  bool enabled = moveStep(value);
+
+  _serial.print("OK test Step ");
   _serial.println(enabled ? "enabled" : "disabled");
 }
 

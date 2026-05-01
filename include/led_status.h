@@ -7,6 +7,7 @@ enum class LedState : uint8_t {
   READY,
   ENCODER_OK,
   ENCODER_ERROR,
+  TEST,
   FAULT
 };
 

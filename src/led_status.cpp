@@ -69,6 +69,19 @@ void wsLedsUpdate() {
       }
       break;
 
+    case LedState::TEST:
+      // Rosso lampeggiante lento
+      if (now - lastUpdateMs >= 300) {
+        lastUpdateMs = now;
+        blinkPhase = !blinkPhase;
+        if (blinkPhase) {
+          setColor(60, 0, 0);
+        } else {
+          setColor(0, 0, 0);
+        }
+      }
+      break;
+      
     case LedState::FAULT:
       // Rosso lampeggiante veloce
       if (now - lastUpdateMs >= 150) {

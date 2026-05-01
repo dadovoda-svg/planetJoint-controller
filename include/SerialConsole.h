@@ -63,8 +63,10 @@ private:
   void cmdExport(int argc, char* argv[]);
   void cmdImport(int argc, char* argv[]);
   void cmdCancel(int argc, char* argv[]);
+  void cmdZero(int argc, char* argv[]);
   void cmdTrace(int argc, char* argv[]);
-  void cmdTest(int argc, char* argv[]);
+  void cmdGo(int argc, char* argv[]);
+  void cmdStep(int argc, char* argv[]);
   void cmdReboot(int argc, char* argv[]);
 
   bool parseKeyValueLine(

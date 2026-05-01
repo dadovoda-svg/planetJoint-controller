@@ -11,7 +11,7 @@
 
 static constexpr uint32_t USB_BAUD    = 115200;
 static constexpr uint32_t UART0_BAUD  = 115200;
-static constexpr uint32_t TMC_BAUD    = 115200;
+static constexpr uint32_t TMC_BAUD    = 230400;
 
 // ===================== PIN MAP =====================
 // AS5048A - HSPI
@@ -37,7 +37,7 @@ Tmc2209Driver::Pins tmcPins {
 
 Tmc2209Driver::Config tmcConfig {
     .uartAddress = 0,
-    .baud = 115200,
+    .baud = TMC_BAUD,
     .fclkHz = 12000000.0f,
 
     .useInternalRsense = false,
@@ -78,11 +78,13 @@ static uint32_t lastEncoderReadMs = 0;
 
 static uint16_t encoderRaw = 0;
 static float encoderDeg = 0.0f;
+static float encoderZero = 0.0f;
 static bool encoderOk = false;
 static bool traceEnabled = false;
 static bool testEnabled = false;
+static bool testStepEnabled = false;
 static bool testForward = false;
-static int32_t stepNum = 3200 ; // 16 microstep * 200 steps/rev * 1 rev/s * 60 s/min = 192000 microsteps/min = 3200 microsteps/s -> 5000 microsteps = 1.56s di test
+static int32_t stepNum = 0 ; // contatore step da eseguire in modalità test
 
 // ===================== SETUP =====================
 void paramsInit() {
@@ -188,7 +190,6 @@ static bool readParamU16(const char* key, uint16_t& out)
   out = static_cast<uint16_t>(value);
   return true;
 }
-
 
 static void applyCurrentScaleFromParams()
 {
@@ -366,18 +367,51 @@ bool toggleTest(float microstepsPerSecond = 100.0f) {
   testEnabled = !testEnabled;
 
   if ( testEnabled ) {
-    Serial.println("Test motore ENABLED");
+    wsSetState(LedState::TEST);
+    //Serial.println("Test motore ENABLED");
     tmc.armPowerStage();
     tmc.enableDriver();
     tmc.runVelocityMicrostepsPerSecond(microstepsPerSecond );
-    // testForward  = !testForward;
-    // stepNum = 64000;
   } else {
-    Serial.println("Test motore DISABLED");
+    //Serial.println("Test motore DISABLED");
     tmc.stopInternalMotion();
     tmc.disableDriver();
+    wsSetState(LedState::READY);  
   } 
   return testEnabled;
+}
+
+bool moveStep(float steps = 1.0f) {
+  int32_t out = static_cast<int32_t>(steps);
+  testStepEnabled = !testStepEnabled;
+
+  if ( testStepEnabled ) {
+    wsSetState(LedState::TEST);
+    tmc.armPowerStage();
+    tmc.enableDriver();
+    if (steps > 0) {
+      testForward = true;
+    } else {
+      testForward = false;
+      out = -out; // convert to positive for step counting
+    } 
+    stepNum = out;
+  } else {
+    Serial.println("\b\b\b\bTest step DISABLED\a");
+    Serial.print("pj> ");
+    tmc.stopInternalMotion();
+    tmc.disableDriver();
+    wsSetState(LedState::READY);
+  } 
+
+  return testStepEnabled;
+}
+
+void setZero () {
+  // Funzione per azzerare la posizione dell'encoder, se implementata
+  // Potrebbe essere necessario un comando specifico al driver o una logica di offset
+  encoderZero = encoder.computeContinuousAngleDeg(encoderRaw);
+  Serial.println("Zero Set");
 }
 
 // ===================== LOOP =====================
@@ -398,7 +432,7 @@ void loop() {
     if (encoderOk) {
       encoderRaw = encoder.lastRaw();
       encoderDeg = angle;
-      wsSetState(LedState::ENCODER_OK);
+      //wsSetState(LedState::ENCODER_OK);
     } else {
       wsSetState(LedState::ENCODER_ERROR);
     }
@@ -412,10 +446,10 @@ void loop() {
     // Serial.print(encoderRaw);
 
     Serial.print("@rdeg:");
-    Serial.print(encoderDeg, 3);
+    Serial.print(encoderDeg, 2);
 
     Serial.print(",cdeg:");
-    Serial.println(encoder.computeContinuousAngleDeg(encoderRaw), 3);
+    Serial.println((7.8f * 2.0f / 360.0f) * (encoder.computeContinuousAngleDeg(encoderRaw) - encoderZero), 2);
 
     // Serial.print(",ok:");
     // Serial.print(encoderOk ? 1 : 0);
@@ -427,13 +461,13 @@ void loop() {
     // Serial.println(encoder.lastErrorFlag() ? 1 : 0);
   }
 
-  // //test motore per step/dir
-  // if (testEnabled && now - lastTestMs >= TEST_PERIOD_MS) {
-  //   lastTestMs = now;
-  //   if (stepNum > 0) {
-  //     tmc.step(testForward, 200); // step in avanti con high time di 1000 microsecondi
-  //     stepNum--;
-  //   } 
-  //   else toggleTest(0); // disabilita test al termine dei step programmati
-  // }
+  //test motore per step/dir
+  if (testStepEnabled && now - lastTestMs >= TEST_PERIOD_MS) {
+    lastTestMs = now;
+    if (stepNum > 0) {
+      tmc.step(testForward, 100); // step in avanti con high time di 1000 microsecondi
+      stepNum--;
+    } 
+    else moveStep(0); // disabilita test al termine dei step programmati
+  }
 }

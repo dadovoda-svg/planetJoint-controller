@@ -1,70 +1,39 @@
 # Planetary Joint Controller
 
-Embedded motor controller and motion control framework for a planetary joint actuator.
+Firmware for a planetary gearbox actuator using an ESP32-S3 controller board.
 
-The project is based on a stepper motor driving a planetary gearbox.  
-The angular position of the gearbox output shaft is measured using an AS5048A 14-bit magnetic absolute encoder.
+This project reads an AS5048A magnetic absolute encoder over SPI and drives a Trinamic TMC2209 stepper motor driver via UART. The core firmware is built with the Arduino framework and PlatformIO.
 
-The target hardware is a Waveshare ESP32-S3 Zero module, developed using the Arduino framework on PlatformIO.
+## Key Features
 
-## Features
-
-- AS5048A magnetic encoder support over SPI
-- 14-bit absolute angular position reading
-- Encoder parity checking
-- AS5048A error flag checking
-- Continuous angle computation for rotations greater than one revolution
+- AS5048A 14-bit SPI encoder support
+- Raw and continuous angle computation for multi-turn tracking
+- SPI parity and AS5048A error flag validation
+- TMC2209 UART communication and safe register configuration
+- Motor enable/disable and velocity test support
+- USB CDC serial console with interactive commands
+- Persistent configuration storage in ESP32 NVS
 - WS2812 RGB LED diagnostic state machine
-- USB CDC serial console with interactive command support
-- Persistent parameter storage in ESP32 NVS
-- TMC2209 UART communication, probe, and safe register configuration
-- Motor test command to enable/disable the driver and command velocity
-- UART0 initialized for future use
-- UART2 used for TMC2209 configuration
-- Safe motor GPIO initialization
-- Modular firmware structure
+- Modular source layout with headers in `include/`
 
-## Hardware
+## Hardware Target
 
-### Target Board
+- Board: Waveshare ESP32-S3 Zero
+- MCU: ESP32-S3
+- Framework: Arduino
+- Build system: PlatformIO
 
-- Waveshare ESP32-S3 Zero
-- ESP32-S3 based module
-- Arduino framework
-- PlatformIO build system
+## Project Layout
 
-### Encoder
+- `platformio.ini` — build configuration
+- `src/main.cpp` — firmware entry point
+- `src/as5048a.cpp`, `include/as5048a.h` — encoder support
+- `src/Tmc2209Driver.cpp`, `include/Tmc2209Driver.h` — stepper driver interface
+- `src/SerialConsole.cpp`, `include/SerialConsole.h` — USB command console
+- `src/led_status.cpp`, `include/led_status.h` — status LED state management
+- `src/params.h` — persistent parameter storage
 
-- AS5048A magnetic absolute encoder
-- SPI interface
-- 14-bit resolution
-- 16384 counts per revolution
-- Used to measure the output angle of the planetary gearbox
-
-The encoder driver currently supports:
-
-- raw 14-bit position reading
-- angle conversion in degrees
-- SPI response parity validation
-- AS5048A error flag detection
-- continuous angle computation over multiple turns
-
-### Motor Driver
-
-- Trinamic TMC2209 stepper motor driver
-- UART configuration interface via `Serial2`
-- Safe driver initialization and register configuration
-- Motor test mode with controlled enable/disable
-
-The firmware now includes TMC2209 UART communication, device probing, and safe register configuration. The driver remains disabled by default and can be enabled using the serial console `test` command for controlled motion validation.
-
-### Diagnostic LED
-
-- WS2812 RGB LED connected to GPIO21
-- Controlled using the Adafruit NeoPixel library
-- Used to report firmware and encoder status
-
-## Pin Assignment
+## Pinout
 
 | Function | GPIO |
 |---|---:|
@@ -80,36 +49,45 @@ The firmware now includes TMC2209 UART communication, device probing, and safe r
 | WS2812 DIN | GPIO21 |
 | Reserved / unused | GPIO1, GPIO2, GPIO3 |
 
-## Serial Interfaces
+## Firmware Behavior
 
-| Interface | Purpose |
-|---|---|
-| USB CDC Serial | Debug console and command console |
-| UART0 | Reserved for future use |
-| UART2 | TMC2209 register access and driver communication |
+- `Serial` is used for the USB CDC console at 115200 baud
+- `Serial2` is used for TMC2209 UART communication at 115200 baud
+- HSPI is used for AS5048A encoder communication
+- Parameters are initialized, loaded from NVS, and printed at boot
+- Encoder reads happen periodically and trace output can be enabled
+- TMC2209 is configured safely before any motor enable request
 
-## Serial Console
+## Supported Serial Commands
 
-The firmware includes an interactive USB CDC console with command support for parameter management and diagnostics.
+- `help` — list available commands
+- `get <key>` — read a stored parameter
+- `set <key> <value>` — write a parameter value
+- `load` — load parameters from NVS
+- `save` — save parameters to NVS
+- `export` — export current parameters over serial
+- `import` — import parameters from serial input
+- `cancel` — cancel import mode
+- `trace` — toggle encoder trace output
+- `test <speed>` — run the motor at a target microstep speed for validation
+- `reboot` — reboot the board
 
-Available commands:
+## Persistent Parameters
 
-- `help`
-- `get <key>`
-- `set <key> <value>`
-- `load`
-- `save`
-- `export`
-- `import`
-- `cancel`
-- `trace`
-- `test <speed>`
+The firmware initializes the following parameters by default:
 
-Parameters are stored in non-volatile ESP32 NVS and loaded at boot, allowing configuration values to persist across power cycles.
+- `kp` — proportional gain
+- `ki` — integral gain
+- `kd` — derivative gain
+- `ustep` — microstep resolution
+- `irun` — TMC2209 run current scale
+- `ihold` — TMC2209 hold current scale
 
-## LED States
+These values persist across power cycles using ESP32 NVS.
 
-| State | LED behavior |
+## LED Status
+
+| State | Behavior |
 |---|---|
 | BOOT | Blue fixed |
 | READY | Green fixed |
@@ -119,7 +97,7 @@ Parameters are stored in non-volatile ESP32 NVS and loaded at boot, allowing con
 
 ## PlatformIO Configuration
 
-Example `platformio.ini`:
+Current supported environment:
 
 ```ini
 [env:esp32-s3-fh4r2]
@@ -127,76 +105,50 @@ platform = https://github.com/pioarduino/platform-espressif32/releases/download/
 framework = arduino
 board = esp32-s3-fh4r2
 
-lib_deps = 
-    adafruit/Adafruit NeoPixel@^1.15.1
+lib_deps =
+  adafruit/Adafruit NeoPixel@^1.15.1
 
-build_flags = 
-    -DBOARD_HAS_PSRAM
-    -mfix-esp32-psram-cache-issue
-    -DARDUINO_USB_CDC_ON_BOOT=1
-    -DARDUINO_USB_MODE=1
+build_flags =
+  -DBOARD_HAS_PSRAM
+  -mfix-esp32-psram-cache-issue
+  -DARDUINO_USB_CDC_ON_BOOT=1
+  -DARDUINO_USB_MODE=1
 
 monitor_port = /dev/ttyACM0
 monitor_speed = 115200
-
-monitor_filters = 
-    default,
-    log2file,
-    time
+monitor_filters =
+  default,
+  log2file,
+  time
 ```
 
-## Current Firmware Structure
+## Build and Run
 
-Suggested source structure:
-
-```text
-src/
-├── main.cpp
-├── led_status.h
-├── led_status.cpp
-├── as5048a.h
-└── as5048a.cpp
-```
+1. Open the project in PlatformIO.
+2. Build the `esp32-s3-fh4r2` environment.
+3. Upload firmware to the ESP32-S3 Zero module.
+4. Open the serial monitor at `115200` baud.
 
 ## Encoder Output
 
-The firmware periodically reads the AS5048A encoder and prints trace output to the USB serial console when the `trace` command is enabled.
-
-Example output:
+When `trace` mode is enabled, the console prints periodic encoder values like:
 
 ```text
 @rdeg:271.384,cdeg:271.384
 ```
 
-Fields:
-
-| Field | Description |
-|---|---|
-| `rdeg` | Absolute encoder angle in degrees, 0..360 |
-| `cdeg` | Continuous angle in degrees, unwrapped across full revolutions |
-
-The `@` prefix is intended to make the output easy to filter with serial plotting tools.
+- `rdeg` — absolute encoder angle in degrees (0..360)
+- `cdeg` — continuous angle in degrees across revolutions
 
 ## Continuous Angle Tracking
 
-The AS5048A reports an absolute position within a single revolution.  
-Its raw value wraps around after one full turn:
+The AS5048A reports an absolute position inside one revolution. The firmware computes a continuous angle by:
 
-```text
-0 ... 16383 -> 0 ... 16383
-```
-
-To support rotations greater than one revolution, the encoder driver includes a continuous angle computation function.
-
-The continuous angle logic:
-
-- stores the previous raw encoder value
-- computes the delta between the current and previous reading
-- detects wrap-around when the delta crosses half a revolution
-- increments or decrements an internal turn counter
-- returns an angle that can grow above 360 degrees or below 0 degrees
-
-Example:
+- tracking the previous raw encoder value
+- computing delta on each read
+- detecting wrap-around at half revolution
+- incrementing or decrementing a turn counter
+- outputting an unwrapped angle that can exceed 360° or go below 0°
 
 ```text
 absolute angle:    350° -> 355° ->   2° ->   8°
