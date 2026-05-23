@@ -10,15 +10,29 @@ public:
   void begin();
 
   bool readRaw(uint16_t& rawAngle);
+
+  // Raw encoder angle, modulo one encoder revolution, in encoder degrees.
   bool readDegrees(float& angleDeg);
+
+  // Continuous output/joint angle, in real mechanical output degrees.
+  bool readContinuousDegrees(float& angleDeg);
+
+  // Updates the internal unwrap state and returns real output/joint degrees.
+  float computeContinuousAngleDeg(uint16_t rawAngle);
+
+  void resetContinuousTracking();
+
+  void setOutputDegreesPerEncoderRevolution(float degreesPerEncoderRev);
+  float outputDegreesPerEncoderRevolution() const;
 
   uint16_t lastRaw() const;
   float lastDegrees() const;
+  float lastContinuousDegrees() const;
+  float lastContinuousEncoderDegrees() const;
+
   bool lastReadOk() const;
   bool lastParityOk() const;
   bool lastErrorFlag() const;
-  float computeContinuousAngleDeg(uint16_t rawAngle);
-  bool readContinuousDegrees(float& angleDeg);
 
 private:
   SPIClass& _spi;
@@ -32,13 +46,20 @@ private:
   bool _lastParityOk = false;
   bool _lastErrorFlag = false;
 
-  uint16_t transfer16(uint16_t value);
-  uint16_t buildCommand(uint16_t commandWithoutParity) const;
-  bool checkEvenParity(uint16_t value) const;
-  bool calcEvenParity(uint16_t value) const;
+  float _outputDegreesPerEncoderRev = 360.0f;
+  float _lastContinuousDeg = 0.0f;
 
   bool _continuousInitialized = false;
   int64_t _turnCount = 0;
   uint16_t _prevRawAngle = 0;
   int64_t _continuousCounts = 0;
+
+  uint16_t transfer16(uint16_t value);
+  uint16_t buildCommand(uint16_t commandWithoutParity) const;
+  bool checkEvenParity(uint16_t value) const;
+  bool calcEvenParity(uint16_t value) const;
+
+  int64_t updateContinuousCounts(uint16_t rawAngle);
+  float continuousCountsToOutputDegrees(int64_t counts) const;
+  float continuousCountsToEncoderDegrees(int64_t counts) const;
 };

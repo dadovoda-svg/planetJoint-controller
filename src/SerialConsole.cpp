@@ -6,9 +6,18 @@
 #include <esp_system.h>
 
 extern bool toggleTrace();
+extern bool setTraceEnabled(bool enabled);
+extern bool setTraceMode(uint8_t mode);
+extern uint8_t getTraceMode();
+extern const char* getTraceModeName();
 extern bool toggleTest(float microstepsPerSecond);
 extern bool moveStep(float steps);
+extern bool calibrateStepsPerDegree(float targetDegrees);
+extern float getStdegCalibrationDefaultTargetDeg();
 extern void setZero();
+extern bool moveJointToDeg(float targetDeg);
+extern void stopMotion();
+extern void printServoStatus();
 
 const SerialConsole::Command SerialConsole::_commands[] = {
   {
@@ -73,14 +82,14 @@ const SerialConsole::Command SerialConsole::_commands[] = {
   },
   {
     "trace",
-    "trace",
-    "abilita/disabilita trace",
+    "trace [0..4|on|off]",
+    "abilita/disabilita trace o seleziona il set di valori esportati",
     &SerialConsole::cmdTrace
   },
   {
     "go",
-    "go <speed>",
-    "abilita/disabilita test velocità motore <testp/s>",
+    "go <deg/s>",
+    "abilita/disabilita test velocità motore in gradi/sec giunto",
     &SerialConsole::cmdGo
   },
   {
@@ -88,6 +97,30 @@ const SerialConsole::Command SerialConsole::_commands[] = {
     "step <steps>",
     "abilita/disabilita test step motore <steps>",
     &SerialConsole::cmdStep
+  },
+  {
+    "calstdeg",
+    "calstdeg [deg]",
+    "stima stdeg muovendo il giunto e misurando l'encoder",
+    &SerialConsole::cmdCalStdeg
+  },
+  {
+    "pos",
+    "pos <deg>",
+    "muove il giunto alla posizione indicata, relativa allo zero",
+    &SerialConsole::cmdPos
+  },
+  {
+    "stop",
+    "stop",
+    "ferma immediatamente ogni movimento",
+    &SerialConsole::cmdStop
+  },
+  {
+    "servo",
+    "servo",
+    "stampa stato controller posizione",
+    &SerialConsole::cmdServo
   }
 };
 
@@ -543,17 +576,60 @@ void SerialConsole::cmdReboot(int argc, char* argv[])
 
 void SerialConsole::cmdTrace(int argc, char* argv[])
 {
-  (void)argv;
+  if (argc == 1) {
+    const bool enabled = toggleTrace();
 
-  if (argc != 1) {
-    _serial.println("ERR usage: trace");
+    _serial.print("OK trace ");
+    _serial.print(enabled ? "enabled" : "disabled");
+    _serial.print(" mode=");
+    _serial.print(getTraceMode());
+    _serial.print(" ");
+    _serial.println(getTraceModeName());
     return;
   }
 
-  bool enabled = toggleTrace();
+  if (argc != 2) {
+    _serial.println("ERR usage: trace [0..4|on|off]");
+    return;
+  }
 
-  _serial.print("OK trace ");
-  _serial.println(enabled ? "enabled" : "disabled");
+  if (strcmp(argv[1], "on") == 0) {
+    setTraceEnabled(true);
+    _serial.print("OK trace enabled mode=");
+    _serial.print(getTraceMode());
+    _serial.print(" ");
+    _serial.println(getTraceModeName());
+    return;
+  }
+
+  if (strcmp(argv[1], "off") == 0) {
+    setTraceEnabled(false);
+    _serial.println("OK trace disabled");
+    return;
+  }
+
+  char* endPtr = nullptr;
+  const long mode = strtol(argv[1], &endPtr, 10);
+
+  if (endPtr == argv[1] || *endPtr != '\0' || mode < 0 || mode > 4) {
+    _serial.println("ERR usage: trace [0..4|on|off]");
+    _serial.println("  0 FULL");
+    _serial.println("  1 POS_TARGET");
+    _serial.println("  2 POS_TARGET_VEL");
+    _serial.println("  3 PID");
+    _serial.println("  4 SCURVE");
+    return;
+  }
+
+  if (!setTraceMode(static_cast<uint8_t>(mode))) {
+    _serial.println("ERR invalid trace mode");
+    return;
+  }
+
+  _serial.print("OK trace enabled mode=");
+  _serial.print(getTraceMode());
+  _serial.print(" ");
+  _serial.println(getTraceModeName());
 }
 
 void SerialConsole::cmdGo(int argc, char* argv[])
@@ -561,7 +637,7 @@ void SerialConsole::cmdGo(int argc, char* argv[])
   (void)argv;
 
   if (argc != 2) {
-    _serial.println("ERR usage: go <speed>");
+    _serial.println("ERR usage: go <deg/s>");
     return;
   }
 
@@ -576,7 +652,7 @@ void SerialConsole::cmdGo(int argc, char* argv[])
 
   bool enabled = toggleTest(value);
 
-  _serial.print("OK test Go ");
+  _serial.print("OK velocity test ");
   _serial.println(enabled ? "enabled" : "disabled");
 }
 
@@ -602,6 +678,83 @@ void SerialConsole::cmdStep(int argc, char* argv[])
 
   _serial.print("OK test Step ");
   _serial.println(enabled ? "enabled" : "disabled");
+}
+
+
+
+void SerialConsole::cmdCalStdeg(int argc, char* argv[])
+{
+  float targetDeg = getStdegCalibrationDefaultTargetDeg();
+
+  if (argc > 2) {
+    _serial.println("ERR usage: calstdeg [deg]");
+    return;
+  }
+
+  if (argc == 2) {
+    char* endPtr = nullptr;
+    targetDeg = strtof(argv[1], &endPtr);
+
+    if (endPtr == argv[1] || *endPtr != '\0') {
+      _serial.print("ERR invalid value: ");
+      _serial.println(argv[1]);
+      return;
+    }
+  }
+
+  bool ok = calibrateStepsPerDegree(targetDeg);
+  _serial.print("OK calstdeg ");
+  _serial.println(ok ? "completed" : "failed");
+}
+
+void SerialConsole::cmdPos(int argc, char* argv[])
+{
+  if (argc != 2) {
+    _serial.println("ERR usage: pos <deg>");
+    return;
+  }
+
+  char* endPtr = nullptr;
+  float value = strtof(argv[1], &endPtr);
+
+  if (endPtr == argv[1] || *endPtr != '\0') {
+    _serial.print("ERR invalid value: ");
+    _serial.println(argv[1]);
+    return;
+  }
+
+  if (moveJointToDeg(value)) {
+    _serial.print("OK moving to ");
+    _serial.print(value, 3);
+    _serial.println(" deg");
+  } else {
+    _serial.println("ERR move rejected");
+  }
+}
+
+void SerialConsole::cmdStop(int argc, char* argv[])
+{
+  (void)argv;
+
+  if (argc != 1) {
+    _serial.println("ERR usage: stop");
+    return;
+  }
+
+  stopMotion();
+  _serial.println("OK stopped");
+}
+
+void SerialConsole::cmdServo(int argc, char* argv[])
+{
+  (void)argv;
+
+  if (argc != 1) {
+    _serial.println("ERR usage: servo");
+    return;
+  }
+
+  printServoStatus();
 }
 
 bool SerialConsole::parseKeyValueLine(
