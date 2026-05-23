@@ -165,6 +165,18 @@ enum class MotionMode : uint8_t {
 
 static MotionMode motionMode = MotionMode::IDLE;
 
+struct JointMoveCommand {
+  // All fields are expressed in real joint degrees, relative to the logical zero.
+  float targetDeg = 0.0f;
+  float vmaxDegS = 0.0f;
+  float amaxDegS2 = 0.0f;
+  float sCurveTimeS = 0.0f;   // <= 0 means keep current/default parameter
+  float outMaxDegS = 0.0f;    // <= 0 means auto: 1.25 * vmax
+};
+
+static constexpr float PLANNER_HARD_VMAX_LIMIT_DEG_S = 12.0f;
+static constexpr float PLANNER_HARD_AMAX_LIMIT_DEG_S2 = 100.0f;
+
 // ===================== PARAMS =====================
 
 static bool readParamU8(const char* key, uint8_t& out)
@@ -524,6 +536,58 @@ static const char* motionModeName(MotionMode mode)
   return "UNKNOWN";
 }
 
+float jointGetPositionDeg()
+{
+  // Public/planner-facing coordinate system:
+  // real joint degrees, relative to the logical zero set by the `zero` command.
+  return jointDeg - encoderZero;
+}
+
+float jointGetTargetDeg()
+{
+  return jointCtrl.target();
+}
+
+float jointGetErrorDeg()
+{
+  return jointGetTargetDeg() - jointGetPositionDeg();
+}
+
+float jointGetCommandVelocityDegS()
+{
+  return servoLastCmdDegS;
+}
+
+float jointGetMeasuredVelocityDegS()
+{
+  return jointCtrl.getLastMeasuredVel();
+}
+
+float jointGetRefPositionDeg()
+{
+  return jointCtrl.refPos();
+}
+
+float jointGetRefVelocityDegS()
+{
+  return jointCtrl.refVel();
+}
+
+bool jointIsBusy()
+{
+  return motionMode == MotionMode::POSITION;
+}
+
+bool jointIsSettled()
+{
+  return jointCtrl.isSettled();
+}
+
+bool jointHasFault()
+{
+  return jointCtrl.fault() || motionMode == MotionMode::FAULT;
+}
+
 bool setMotorVelocityDegPerSecond(float degreesPerSecond)
 {
   if (!tmcReady) {
@@ -577,8 +641,15 @@ void stopMotion()
     motionMode = MotionMode::IDLE;
   }
 
-  jointCtrl.reset(jointDeg);
+  // The position controller always works in zeroed joint coordinates.
+  jointCtrl.reset(jointGetPositionDeg());
   wsSetState(LedState::READY);
+}
+
+bool jointStop()
+{
+  stopMotion();
+  return true;
 }
 
 void jointControllerInit(float currentJointDeg)
@@ -593,7 +664,7 @@ void jointControllerInit(float currentJointDeg)
   Serial.println("[SAFE] Servo parameters are runtime-tunable with 'set <key> <value>'. Keep early tests slow.");
 }
 
-bool moveJointToDeg(float targetZeroedDeg)
+bool jointMoveTo(const JointMoveCommand& cmd)
 {
   if (motionMode == MotionMode::CALIBRATION) {
     Serial.println("[ERR] Calibration in progress");
@@ -610,6 +681,19 @@ bool moveJointToDeg(float targetZeroedDeg)
     return false;
   }
 
+  if (!isfinite(cmd.targetDeg) || !isfinite(cmd.vmaxDegS) || !isfinite(cmd.amaxDegS2)) {
+    Serial.println("[ERR] Invalid move command: non-finite value");
+    return false;
+  }
+
+  if (cmd.vmaxDegS <= 0.0f || cmd.amaxDegS2 <= 0.0f) {
+    Serial.println("[ERR] Invalid move command: vmax and amax must be > 0");
+    return false;
+  }
+
+  const float safeVmax = constrain(fabsf(cmd.vmaxDegS), 0.01f, PLANNER_HARD_VMAX_LIMIT_DEG_S);
+  const float safeAmax = constrain(fabsf(cmd.amaxDegS2), 0.01f, PLANNER_HARD_AMAX_LIMIT_DEG_S2);
+
   stopMotion();
 
   if (!ensureDriverEnabled()) {
@@ -618,16 +702,61 @@ bool moveJointToDeg(float targetZeroedDeg)
     return false;
   }
 
-  servoTargetZeroedDeg = targetZeroedDeg;
   jointCtrl.clearFault();
-  jointCtrl.reset(jointDeg);
-  jointCtrl.setTarget(encoderZero + targetZeroedDeg);
+  jointCtrl.setLimits(safeVmax, safeAmax);
+
+  if (isfinite(cmd.sCurveTimeS) && cmd.sCurveTimeS > 0.0f) {
+    jointCtrl.setSCurveTime(cmd.sCurveTimeS);
+  }
+
+  if (isfinite(cmd.outMaxDegS) && cmd.outMaxDegS > 0.0f) {
+    jointCtrl.setOutputMax(cmd.outMaxDegS);
+  } else {
+    jointCtrl.setOutputMax(safeVmax * 1.25f);
+  }
+
+  // IMPORTANT: controller coordinates are zeroed joint degrees.
+  const float currentZeroedDeg = jointGetPositionDeg();
+  servoTargetZeroedDeg = cmd.targetDeg;
+  jointCtrl.reset(currentZeroedDeg);
+  jointCtrl.setTarget(cmd.targetDeg);
+
   lastServoUs = micros();
   motionMode = MotionMode::POSITION;
 
-  Serial.printf("[MOVE] target_zeroed=%.3f deg target_abs=%.3f deg current_abs=%.3f deg\r\n",
-                targetZeroedDeg, encoderZero + targetZeroedDeg, jointDeg);
+  Serial.printf("[MOVE] target=%.3f deg current=%.3f deg vmax=%.3f deg/s amax=%.3f deg/s2\r\n",
+                cmd.targetDeg, currentZeroedDeg, safeVmax, safeAmax);
   return true;
+}
+
+bool jointMoveTo(float targetDeg, float vmaxDegS, float amaxDegS2)
+{
+  JointMoveCommand cmd;
+  cmd.targetDeg = targetDeg;
+  cmd.vmaxDegS = vmaxDegS;
+  cmd.amaxDegS2 = amaxDegS2;
+  return jointMoveTo(cmd);
+}
+
+bool jointMoveTo(float targetDeg, float vmaxDegS, float amaxDegS2, float sCurveTimeS)
+{
+  JointMoveCommand cmd;
+  cmd.targetDeg = targetDeg;
+  cmd.vmaxDegS = vmaxDegS;
+  cmd.amaxDegS2 = amaxDegS2;
+  cmd.sCurveTimeS = sCurveTimeS;
+  return jointMoveTo(cmd);
+}
+
+bool moveJointToDeg(float targetZeroedDeg)
+{
+  JointMoveCommand cmd;
+  cmd.targetDeg = targetZeroedDeg;
+  cmd.vmaxDegS = readParamMinOrDefault("vmax", SERVO_VMAX_DEG_S, 0.001f);
+  cmd.amaxDegS2 = readParamMinOrDefault("amax", SERVO_AMAX_DEG_S2, 0.001f);
+  cmd.sCurveTimeS = readParamMinOrDefault("sct", SERVO_SCURVE_TIME_S, 0.001f);
+  cmd.outMaxDegS = readParamMinOrDefault("outmax", SERVO_OUTPUT_MAX_DEG_S, 0.0f);
+  return jointMoveTo(cmd);
 }
 
 static const char* traceModeName(TraceMode mode)
@@ -909,7 +1038,7 @@ bool calibrateStepsPerDegree(float targetDegrees = STDEG_CALIBRATION_TARGET_DEG)
     Serial.println("[CAL] stdeg updated in RAM. Use 'save' to persist it in NVS.");
     motionMode = MotionMode::IDLE;
     wsSetState(LedState::READY);
-    jointCtrl.reset(jointDeg);
+    jointCtrl.reset(jointGetPositionDeg());
   } else {
     motionMode = MotionMode::FAULT;
     wsSetState(LedState::FAULT);
@@ -920,33 +1049,52 @@ bool calibrateStepsPerDegree(float targetDegrees = STDEG_CALIBRATION_TARGET_DEG)
 
 void setZero()
 {
-  encoderZero = jointDeg;
+  testEnabled = false;
+  testStepEnabled = false;
+  stepNum = 0;
+  servoLastCmdDegS = 0.0f;
+
+  tmc.stopInternalMotion();
+  tmc.disableDriver(false);
+
+  // Reset continuous tracking so the current physical position becomes a clean software origin.
   encoder.resetContinuousTracking();
 
-  // Re-read immediately to re-seed unwrap state after reset.
   float tmp = 0.0f;
   if (encoder.readContinuousDegrees(tmp)) {
+    encoderOk = true;
     jointDeg = tmp;
     encoderRaw = encoder.lastRaw();
     encoderDeg = encoder.lastDegrees();
-    encoderZero = jointDeg;
+  } else {
+    encoderOk = false;
+    Serial.println("[ERR] Encoder read failed while setting zero");
+    wsSetState(LedState::ENCODER_ERROR);
+    return;
   }
 
-  jointCtrl.reset(jointDeg);
+  encoderZero = jointDeg;
   servoTargetZeroedDeg = 0.0f;
-  Serial.printf("Zero set at joint_abs=%.3f deg\r\n", encoderZero);
+
+  // After zeroing, the controller coordinate system is zeroed too.
+  jointCtrl.reset(0.0f);
+  jointCtrl.setTarget(0.0f);
+
+  motionMode = MotionMode::IDLE;
+  wsSetState(LedState::READY);
+  Serial.printf("Zero set at joint_abs=%.3f deg; zeroed position is now 0.000 deg\r\n", encoderZero);
 }
 
 void printServoStatus()
 {
-  const float zeroed = jointDeg - encoderZero;
+  const float zeroed = jointGetPositionDeg();
   Serial.printf("mode=%s enc=%.3f joint=%.3f zeroed=%.3f target=%.3f ref=%.3f refv=%.3f measv=%.3f cmd=%.3f stdeg=%.6f fault=%u\r\n",
                 motionModeName(motionMode),
                 encoderDeg,
                 jointDeg,
                 zeroed,
                 servoTargetZeroedDeg,
-                jointCtrl.refPos() - encoderZero,
+                jointCtrl.refPos(),
                 jointCtrl.refVel(),
                 jointCtrl.getLastMeasuredVel(),
                 servoLastCmdDegS,
@@ -1004,7 +1152,8 @@ void servoUpdate()
     return;
   }
 
-  const float vCmdDegS = jointCtrl.update(jointDeg, dt);
+  const float currentZeroedDeg = jointGetPositionDeg();
+  const float vCmdDegS = jointCtrl.update(currentZeroedDeg, dt);
 
   if (!setMotorVelocityDegPerSecond(vCmdDegS)) {
     motionMode = MotionMode::FAULT;
@@ -1027,7 +1176,7 @@ void servoUpdate()
     motionMode = MotionMode::IDLE;
     servoLastCmdDegS = 0.0f;
     wsSetState(LedState::READY);
-    Serial.printf("[OK] Move complete zeroed=%.3f deg\r\n", jointDeg - encoderZero);
+    Serial.printf("[OK] Move complete zeroed=%.3f deg\r\n", jointGetPositionDeg());
   }
 }
 
@@ -1065,7 +1214,7 @@ void setup()
 
   if (encoderFirstReadTest()) {
     encoderZero = jointDeg;
-    jointControllerInit(jointDeg);
+    jointControllerInit(jointGetPositionDeg());
     wsSetState(LedState::READY);
   } else {
     wsSetState(LedState::ENCODER_ERROR);
@@ -1096,9 +1245,9 @@ void loop()
   if (traceEnabled && now - lastEncoderPrintMs >= ENCODER_PRINT_PERIOD_MS) {
     lastEncoderPrintMs = now;
 
-    const float jointZeroedDeg = jointDeg - encoderZero;
+    const float jointZeroedDeg = jointGetPositionDeg();
     const float targetDeg = servoTargetZeroedDeg;
-    const float refDeg = jointCtrl.refPos() - encoderZero;
+    const float refDeg = jointCtrl.refPos();
     const float errDeg = targetDeg - jointZeroedDeg;
     const float measVel = jointCtrl.getLastMeasuredVel();
     const float refVel = jointCtrl.refVel();

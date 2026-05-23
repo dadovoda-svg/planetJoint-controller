@@ -69,6 +69,7 @@ private:
   void cmdStep(int argc, char* argv[]);
   void cmdCalStdeg(int argc, char* argv[]);
   void cmdPos(int argc, char* argv[]);
+  void cmdMove(int argc, char* argv[]);
   void cmdStop(int argc, char* argv[]);
   void cmdServo(int argc, char* argv[]);
   void cmdReboot(int argc, char* argv[]);
