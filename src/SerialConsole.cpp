@@ -18,6 +18,8 @@ extern void setZero();
 extern bool moveJointToDeg(float targetDeg);
 extern bool jointMoveTo(float targetDeg, float vmaxDegS, float amaxDegS2);
 extern bool jointMoveTo(float targetDeg, float vmaxDegS, float amaxDegS2, float sCurveTimeS);
+extern bool jointMoveToBlended(float targetDeg, float vmaxDegS, float amaxDegS2);
+extern bool jointMoveToBlended(float targetDeg, float vmaxDegS, float amaxDegS2, float sCurveTimeS);
 extern bool jointStop();
 extern void stopMotion();
 extern void printServoStatus();
@@ -118,6 +120,12 @@ const SerialConsole::Command SerialConsole::_commands[] = {
     "move <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]",
     "planner-style move con target, velocita e accelerazione espliciti",
     &SerialConsole::cmdMove
+  },
+  {
+    "moveb",
+    "moveb <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]",
+    "planner-style blended move senza azzerare la velocita di riferimento",
+    &SerialConsole::cmdMoveBlended
   },
   {
     "stop",
@@ -376,6 +384,7 @@ void SerialConsole::printPrompt()
     _serial.print("import> ");
   } else {
     _serial.print(_prompt);
+    _serial.println();
   }
 }
 
@@ -787,6 +796,55 @@ void SerialConsole::cmdMove(int argc, char* argv[])
   }
 
   _serial.println(ok ? "OK move accepted" : "ERR move rejected");
+}
+
+
+void SerialConsole::cmdMoveBlended(int argc, char* argv[])
+{
+  if (argc != 4 && argc != 5) {
+    _serial.println("ERR usage: moveb <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]");
+    return;
+  }
+
+  char* endPtr = nullptr;
+
+  const float target = strtof(argv[1], &endPtr);
+  if (endPtr == argv[1] || *endPtr != '\0') {
+    _serial.print("ERR invalid target_deg: ");
+    _serial.println(argv[1]);
+    return;
+  }
+
+  const float vmax = strtof(argv[2], &endPtr);
+  if (endPtr == argv[2] || *endPtr != '\0') {
+    _serial.print("ERR invalid vmax_deg_s: ");
+    _serial.println(argv[2]);
+    return;
+  }
+
+  const float amax = strtof(argv[3], &endPtr);
+  if (endPtr == argv[3] || *endPtr != '\0') {
+    _serial.print("ERR invalid amax_deg_s2: ");
+    _serial.println(argv[3]);
+    return;
+  }
+
+  bool ok = false;
+
+  if (argc == 5) {
+    const float sct = strtof(argv[4], &endPtr);
+    if (endPtr == argv[4] || *endPtr != '\0') {
+      _serial.print("ERR invalid sct_s: ");
+      _serial.println(argv[4]);
+      return;
+    }
+
+    ok = jointMoveToBlended(target, vmax, amax, sct);
+  } else {
+    ok = jointMoveToBlended(target, vmax, amax);
+  }
+
+  _serial.println(ok ? "OK blended move accepted" : "ERR blended move rejected");
 }
 
 void SerialConsole::cmdStop(int argc, char* argv[])

@@ -76,3 +76,52 @@ pos 0
 ```
 
 Increase only one parameter at a time.
+
+## Trace modes
+
+The `trace` command can now be used both as an on/off toggle and as a trace format selector.
+
+```text
+trace          toggle trace on/off, keeping the current mode
+trace on       enable trace, keeping the current mode
+trace off      disable trace
+trace 0        full diagnostic trace
+trace 1        position and target only
+trace 2        position, target, commanded velocity, measured velocity
+trace 3        error, commanded velocity, measured velocity
+trace 4        position, S-curve reference, target, reference velocity, commanded velocity
+```
+
+Trace output always keeps the `@name:value,name:value` format so it can be plotted by the serial plotter.
+
+Recommended usage while checking overshoot:
+
+```text
+trace 1
+pos 1
+pos 0
+pos -1
+pos 0
+```
+
+If the position response looks suspicious, switch to:
+
+```text
+trace 2
+```
+
+for velocity diagnostics, or:
+
+```text
+trace 3
+```
+
+for PID-focused tuning.
+
+## Motor direction
+
+This build uses the direction measured on the real hardware:
+
+```cpp
+static constexpr float MOTOR_DIRECTION_SIGN = -1.0f;
+```

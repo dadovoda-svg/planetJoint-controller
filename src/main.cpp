@@ -614,6 +614,17 @@ static bool ensureDriverEnabled()
     return false;
   }
 
+  const Tmc2209Driver::Status st = tmc.status();
+
+  if (st == Tmc2209Driver::Status::Enabled) {
+    return true;
+  }
+
+  if (st != Tmc2209Driver::Status::Configured) {
+    Serial.println("[ERR] TMC is not in a configurable state");
+    return false;
+  }
+
   if (!tmc.armPowerStage()) {
     Serial.println("[ERR] Unable to arm TMC power stage");
     return false;
@@ -746,6 +757,135 @@ bool jointMoveTo(float targetDeg, float vmaxDegS, float amaxDegS2, float sCurveT
   cmd.amaxDegS2 = amaxDegS2;
   cmd.sCurveTimeS = sCurveTimeS;
   return jointMoveTo(cmd);
+}
+
+
+bool jointMoveToBlended(const JointMoveCommand& cmd)
+{
+  if (motionMode == MotionMode::CALIBRATION) {
+    Serial.println("[ERR] Calibration in progress");
+    return false;
+  }
+
+  if (motionMode == MotionMode::FAULT) {
+    Serial.println("[ERR] Motion fault latched; use stop/reboot after checking hardware");
+    return false;
+  }
+
+  if (!encoderOk) {
+    Serial.println("[ERR] Encoder not OK");
+    return false;
+  }
+
+  if (!isfinite(cmd.targetDeg) || !isfinite(cmd.vmaxDegS) || !isfinite(cmd.amaxDegS2)) {
+    Serial.println("[ERR] Invalid blended move command: non-finite value");
+    return false;
+  }
+
+  if (cmd.vmaxDegS <= 0.0f || cmd.amaxDegS2 <= 0.0f) {
+    Serial.println("[ERR] Invalid blended move command: vmax and amax must be > 0");
+    return false;
+  }
+
+  const float safeVmax = constrain(fabsf(cmd.vmaxDegS), 0.01f, PLANNER_HARD_VMAX_LIMIT_DEG_S);
+  const float safeAmax = constrain(fabsf(cmd.amaxDegS2), 0.01f, PLANNER_HARD_AMAX_LIMIT_DEG_S2);
+
+  const bool alreadyPositioning = (motionMode == MotionMode::POSITION);
+  const bool driverAlreadyEnabled = (tmc.status() == Tmc2209Driver::Status::Enabled);
+
+  // If another manual/test mode is running, stop it and start the blended move
+  // from the current zeroed position. If we are already in POSITION mode, do
+  // NOT call stopMotion(), because it intentionally disables the driver and
+  // resets the internal reference velocity.
+  if (!alreadyPositioning) {
+    stopMotion();
+  }
+
+  // If we are already positioning and the TMC is already enabled, this is a
+  // pure re-target operation: do not arm the power stage again.
+  if (!alreadyPositioning || !driverAlreadyEnabled) {
+    if (!ensureDriverEnabled()) {
+      motionMode = MotionMode::FAULT;
+      wsSetState(LedState::FAULT);
+      return false;
+    }
+  }
+
+  if (!alreadyPositioning) {
+    jointCtrl.clearFault();
+  }
+
+  jointCtrl.setLimits(safeVmax, safeAmax);
+
+  if (isfinite(cmd.sCurveTimeS) && cmd.sCurveTimeS > 0.0f) {
+    jointCtrl.setSCurveTime(cmd.sCurveTimeS);
+  }
+
+  if (isfinite(cmd.outMaxDegS) && cmd.outMaxDegS > 0.0f) {
+    jointCtrl.setOutputMax(cmd.outMaxDegS);
+  } else {
+    jointCtrl.setOutputMax(safeVmax * 1.25f);
+  }
+
+  const float currentZeroedDeg = jointGetPositionDeg();
+  servoTargetZeroedDeg = cmd.targetDeg;
+
+  const float refPos = jointCtrl.refPos();
+  const float refVel = jointCtrl.refVel();
+  const float distToNewTarget = cmd.targetDeg - refPos;
+
+  static constexpr float BLEND_MIN_REF_VEL_DEG_S = 0.02f;
+
+  const bool movingReference = fabsf(refVel) > BLEND_MIN_REF_VEL_DEG_S;
+  const bool targetAheadOfVelocity =
+    !movingReference || ((distToNewTarget * refVel) >= 0.0f);
+
+  bool fullBlend = false;
+
+  if (alreadyPositioning && targetAheadOfVelocity) {
+    // Good case: the new target is compatible with the current reference
+    // velocity. Keep ref_pos/ref_vel/ref_acc and only update the target.
+    jointCtrl.setTargetBlended(cmd.targetDeg);
+    fullBlend = true;
+  } else {
+    // First segment, or reversal / ambiguous target.
+    // Safe fallback: replan from the current measured zeroed position.
+    // This intentionally drops the internal reference velocity to zero instead
+    // of carrying a velocity that would push the joint further away.
+    jointCtrl.reset(currentZeroedDeg);
+    jointCtrl.setTarget(cmd.targetDeg);
+    fullBlend = false;
+  }
+
+  lastServoUs = micros();
+  motionMode = MotionMode::POSITION;
+
+  Serial.printf("[MOVEB] target=%.3f deg current=%.3f deg vmax=%.3f deg/s amax=%.3f deg/s2 mode=%s\r\n",
+                cmd.targetDeg,
+                currentZeroedDeg,
+                safeVmax,
+                safeAmax,
+                fullBlend ? "blend" : "safe-replan");
+  return true;
+}
+
+bool jointMoveToBlended(float targetDeg, float vmaxDegS, float amaxDegS2)
+{
+  JointMoveCommand cmd;
+  cmd.targetDeg = targetDeg;
+  cmd.vmaxDegS = vmaxDegS;
+  cmd.amaxDegS2 = amaxDegS2;
+  return jointMoveToBlended(cmd);
+}
+
+bool jointMoveToBlended(float targetDeg, float vmaxDegS, float amaxDegS2, float sCurveTimeS)
+{
+  JointMoveCommand cmd;
+  cmd.targetDeg = targetDeg;
+  cmd.vmaxDegS = vmaxDegS;
+  cmd.amaxDegS2 = amaxDegS2;
+  cmd.sCurveTimeS = sCurveTimeS;
+  return jointMoveToBlended(cmd);
 }
 
 bool moveJointToDeg(float targetZeroedDeg)
@@ -1246,7 +1386,7 @@ void loop()
     lastEncoderPrintMs = now;
 
     const float jointZeroedDeg = jointGetPositionDeg();
-    const float targetDeg = servoTargetZeroedDeg;
+    const float targetDeg = jointCtrl.target();
     const float refDeg = jointCtrl.refPos();
     const float errDeg = targetDeg - jointZeroedDeg;
     const float measVel = jointCtrl.getLastMeasuredVel();

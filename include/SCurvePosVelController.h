@@ -139,6 +139,13 @@ public:
     _db_active = false;     // consigliato: esci dalla deadband quando cambia target
   }
 
+  // Blended target update: keeps the current internal reference state
+  // (_ref_pos, _ref_vel, _ref_acc). This is intended for planner-style
+  // target changes while a move is already running.
+  void setTargetBlended(float target_pos) {
+    setTarget(target_pos);
+  }
+
   float target() const { return _target; }
 
   // Optional debug access
