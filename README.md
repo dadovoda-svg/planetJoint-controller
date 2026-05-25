@@ -1,125 +1,74 @@
-# Planetary Joint Controller - AS5048A PID + S-curve Planner Build
+# Planetary Joint Controller
 
-This firmware variant integrates the `SCurvePosVelController` with the AS5048A-based Planetary Joint Controller and adds a first reusable planner module.
+Firmware for a planetary gearbox actuator using an ESP32-S3 controller board.
 
-The firmware is intentionally conservative for real hardware tests. The current validated baseline includes:
+This project implements a compact closed-loop joint controller based on:
 
-- AS5048A absolute encoder feedback
-- TMC2209 UART-configured stepper driver
-- PID + S-curve position/velocity control
-- runtime-tunable parameters stored in NVS
-- selectable trace output for tuning
-- header-only logger with configurable log level
-- `JointPlanner` module split into `JointPlanner.h` / `JointPlanner.cpp`
-- planner-style `move` and intelligent retarget command `moveb`
+- an AS5048A 14-bit magnetic absolute encoder over SPI
+- a Trinamic TMC2209 stepper motor driver configured over UART
+- a stepper motor driving a planetary gearbox actuator
+- a PID + S-curve position controller running on an ESP32-S3
 
-This build has been tested on real hardware with normal moves, blended retargets, forced direction reversals, and `stop` followed by recovery move.
+The firmware is built with the Arduino framework and PlatformIO.
 
-## Safety Defaults
+## Key Features
 
-The real joint was observed to lose steps above about 15 deg/s during early tests. This build starts much lower:
+- AS5048A 14-bit SPI encoder support
+- Raw encoder angle reading
+- Continuous multi-turn angle tracking
+- Mechanical angle scaling between encoder rotation and real joint motion
+- SPI parity and AS5048A error flag validation
+- TMC2209 UART communication and safe register configuration
+- STEP/DIR motor velocity control
+- Closed-loop joint position control
+- PID + S-curve motion controller
+- Runtime tunable PID, feed-forward, motion profile and settling parameters
+- `stdeg` calibration routine for estimating motor microsteps per real joint degree
+- Direct velocity test mode in real joint degrees/second
+- Direct STEP/DIR pulse test mode
+- USB CDC serial console with interactive commands
+- Persistent configuration storage in ESP32 NVS
+- Selectable trace modes for tuning, overshoot analysis and diagnostics
+- WS2812 RGB LED diagnostic state machine
+- Modular source layout
 
-- servo max velocity: `2.0 deg/s`
-- servo output clamp: `2.5 deg/s`
-- acceleration: `6.0 deg/s^2`
-- S-curve jerk time: `0.150 s`
-- `ki = 0.0` by default
+## Hardware Target
 
-Start with very small moves:
+- Board: Waveshare ESP32-S3 Zero
+- MCU: ESP32-S3
+- Framework: Arduino
+- Build system: PlatformIO
 
-```text
-zero
-pos 1
-pos 0
-pos -1
-pos 0
-```
+## Mechanical Model
 
-If the joint moves away from the target instead of toward it, run:
+The encoder does not map 1:1 to real joint movement.
 
-```text
-stop
-```
-
-Then check the compile-time motor polarity constant:
-
-```cpp
-static constexpr float MOTOR_DIRECTION_SIGN = -1.0f;
-```
-
-According to the real hardware tests performed on this joint, the correct value is currently:
-
-```cpp
-static constexpr float MOTOR_DIRECTION_SIGN = -1.0f;
-```
-
-## Important Units
-
-The encoder does not map 1:1 to real joint motion.
+In the current mechanism:
 
 ```text
 360 encoder degrees = 15.6 real joint degrees
 ```
 
-Therefore:
+Therefore the firmware distinguishes between:
 
-- `readDegrees()` reports encoder angle modulo 360 degrees.
-- `readContinuousDegrees()` reports real unrolled joint angle in degrees.
-- Motion commands such as `pos`, `move`, and `moveb` use real joint degrees relative to the current zero.
+- encoder angle: the raw AS5048A angle modulo 360 degrees
+- joint angle: the real scaled joint angle, unwrapped across multiple turns
 
-The conversion from real joint speed to step generation is:
-
-```text
-microsteps_per_second = joint_deg_per_second * stdeg
-```
-
-## Architecture
-
-The movement-related planner code has been moved out of `main.cpp` and into a dedicated module:
+In the encoder API:
 
 ```text
-src/JointPlanner.h
-src/JointPlanner.cpp
+readDegrees()           -> encoder angle modulo 360 degrees
+readContinuousDegrees() -> real unrolled joint angle in degrees
 ```
 
-The goal of this refactoring is to keep `main.cpp` focused on hardware wiring, initialization, console setup, and the fast control loop, while keeping the planner logic isolated and easier to extend.
+The closed-loop controller, `pos` command, `zero` command, trace output and `stdeg` calibration all work in **real joint degrees**.
 
-At this stage the refactoring is intentionally conservative:
-
-- `main.cpp` still owns the low-level hardware objects.
-- `main.cpp` still runs the real-time servo update.
-- `JointPlanner` owns high-level move request handling.
-- The existing console commands remain compatible.
-- The planner receives the previously unused serial port in its constructor.
-
-Example initialization pattern:
-
-```cpp
-JointPlanner planner(SerialFuture);
-
-void setup()
-{
-  // ...
-  planner.begin(UART0_BAUD);
-}
-
-void loop()
-{
-  // ...
-  planner.update();
-}
-```
-
-The serial port passed to the planner is reserved for future integration with an external motion planner or host controller.
-
-## Files
+## Project Layout
 
 ```text
+platformio.ini
 src/
 ├── main.cpp
-├── JointPlanner.h
-├── JointPlanner.cpp
-├── Logger.h
 ├── SCurvePosVelController.h
 ├── as5048a.h
 ├── as5048a.cpp
@@ -132,245 +81,370 @@ src/
 └── Tmc2209Driver.cpp
 ```
 
-## Commands
+## Pinout
+
+| Function | GPIO |
+|---|---:|
+| AS5048A SCK | GPIO12 |
+| AS5048A MISO | GPIO13 |
+| AS5048A MOSI | GPIO11 |
+| AS5048A CS | GPIO10 |
+| TMC2209 UART TX | GPIO7 |
+| TMC2209 UART RX | GPIO8 |
+| TMC2209 STEP | GPIO4 |
+| TMC2209 DIR | GPIO5 |
+| TMC2209 EN | GPIO6 |
+| WS2812 DIN | GPIO21 |
+| Reserved / unused | GPIO1, GPIO2, GPIO3 |
+
+## Firmware Behavior
+
+- `Serial` is used for the USB CDC console at 115200 baud
+- `Serial2` is used for TMC2209 UART communication at 115200 baud
+- HSPI is used for AS5048A encoder communication
+- UART0 is initialized for future use
+- Parameters are initialized, loaded from NVS and printed at boot
+- TMC2209 is configured safely before motor enable
+- Motor GPIO is initialized in a safe disabled state
+- Encoder reads update the real unrolled joint angle
+- The PID + S-curve controller commands motor velocity in real joint deg/s
+- TMC2209 velocity commands are converted using `stdeg`
+
+## Motor Direction
+
+Real hardware tests showed that the motor polarity is inverted.
+
+The current firmware uses:
+
+```cpp
+static constexpr float MOTOR_DIRECTION_SIGN = -1.0f;
+```
+
+This is important for closed-loop control. A wrong sign would turn negative feedback into positive feedback.
+
+## Supported Serial Commands
 
 | Command | Description |
 |---|---|
+| `help` | List available commands |
+| `get <key>` | Read a stored parameter |
+| `set <key> <value>` | Write a parameter value in RAM |
+| `load` | Load parameters from NVS |
+| `save` | Save parameters to NVS |
+| `export` | Export current parameters over serial |
+| `import` | Import parameters from serial input |
+| `cancel` | Cancel import mode |
 | `zero` | Set current real joint position as zero |
-| `pos <deg>` | Move to target position relative to zero using the default position command |
-| `move <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]` | Planner-style move with explicit speed, acceleration, and optional S-curve time |
-| `moveb <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]` | Intelligent retarget command; blends only when safe, otherwise safe-replans |
-| `stop` | Stop all motion and disable motor bridge |
+| `pos <deg>` | Move to target position relative to zero |
+| `stop` | Stop all motion |
 | `servo` | Print controller status |
-| `trace` | Toggle periodic trace output |
-| `trace <mode>` | Enable trace and select trace mode |
+| `trace` | Toggle trace output using the current trace mode |
+| `trace on` | Enable trace output |
+| `trace off` | Disable trace output |
+| `trace <mode>` | Enable trace output and select trace mode |
 | `go <deg/s>` | Toggle direct velocity test in real joint deg/s |
 | `step <steps>` | Toggle direct STEP/DIR pulse test |
-| `calstdeg [deg]` | Calibrate `stdeg` using a measured real joint move |
-| `get <key>` | Read parameter |
-| `set <key> <value>` | Set parameter in RAM |
-| `save` | Save parameters to NVS |
-| `load` | Load parameters from NVS |
+| `calstdeg [deg]` | Estimate `stdeg` by moving the joint and measuring encoder feedback |
+| `reboot` | Reboot the board |
 
-## Parameters
+## Runtime Parameters
 
-| Parameter | Description |
+All parameter keys are limited to 6 characters.
+
+### PID and Feed-forward
+
+| Key | Meaning | Default |
+|---|---|---:|
+| `kp` | Proportional gain | `0.8` |
+| `ki` | Integral gain | `0.0` |
+| `kd` | Derivative gain on measured velocity | `0.02` |
+| `ffv` | Velocity feed-forward gain | `1.0` |
+| `ilim` | Absolute integrator limit | `0.0` |
+
+### Motion Profile and Output Limits
+
+| Key | Meaning | Default |
+|---|---|---:|
+| `vmax` | S-curve reference max velocity, deg/s | `2.0` |
+| `amax` | S-curve reference max acceleration, deg/s² | `6.0` |
+| `sct` | S-curve acceleration ramp time, seconds | `0.150` |
+| `outmax` | Final command velocity clamp, deg/s | `2.5` |
+
+`vmax` limits the internal S-curve reference velocity.
+
+`outmax` limits the final velocity command sent to the motor after PID and feed-forward processing.
+
+Normally `outmax` should be slightly higher than `vmax`, so the controller has a small correction margin without being overly aggressive.
+
+### Settling, Deadband and Velocity Estimate
+
+| Key | Meaning | Default |
+|---|---|---:|
+| `ptol` | Settled position tolerance, degrees | `0.08` |
+| `vtol` | Settled velocity tolerance, deg/s | `0.15` |
+| `dbent` | Deadband enter threshold, degrees | `0.05` |
+| `dbext` | Deadband exit threshold, degrees | `0.12` |
+| `dbvel` | Deadband velocity threshold, deg/s | `0.20` |
+| `vtau` | Measured velocity low-pass filter tau, seconds | `0.050` |
+
+### Motor and Driver
+
+| Key | Meaning |
 |---|---|
-| `kp` | Position proportional gain |
-| `ki` | Integral gain, default 0 |
-| `kd` | Derivative on measurement |
-| `ffv` | Velocity feed-forward gain |
-| `ilim` | Integral limit |
-| `vmax` | Default servo/planner max velocity in deg/s |
-| `amax` | Default acceleration in deg/s^2 |
-| `sct` | Default S-curve jerk time in seconds |
-| `outmax` | Servo output clamp in deg/s |
-| `ptol` | Position tolerance for settled detection |
-| `vtol` | Velocity tolerance for settled detection |
-| `dbent` | Deadband enter threshold |
-| `dbext` | Deadband exit threshold |
-| `dbvel` | Deadband velocity threshold |
-| `vtau` | Velocity filter time constant |
-| `ustep` | TMC2209 microstep resolution |
+| `stdeg` | Motor microsteps per real joint degree |
+| `ustep` | TMC2209 microstep setting |
 | `irun` | TMC2209 run current scale |
 | `ihold` | TMC2209 hold current scale |
-| `stdeg` | Motor microsteps per real joint degree |
-| `loglvl` | Logger verbosity level |
 
-## Logger
-
-The firmware uses a header-only logger with four levels:
-
-| `loglvl` | Meaning |
-|---:|---|
-| `0` | Logging disabled |
-| `1` | Errors only, prefixed with `[ERR]` |
-| `2` | Errors and info, prefixed with `[NFO]` |
-| `3` | Errors, info, and debug, prefixed with `[DBG]` |
-
-Example:
+The velocity conversion is:
 
 ```text
-set loglvl 2
-save
+microsteps_per_second = joint_deg_per_second * stdeg
 ```
 
-The default validated runtime logging level is normally `2`, which keeps useful movement status messages without flooding the serial console.
+## `stdeg` Calibration
 
-Trace output is separate from logger output. Trace lines are intended for the serial plotter and are emitted with the `@` prefix.
-
-## STDEG Calibration
-
-Command:
+The `calstdeg` command estimates the conversion between real joint degrees and motor microsteps.
 
 ```text
-calstdeg [deg]
+calstdeg
+calstdeg 30
+calstdeg -30
 ```
 
-Default target is 30 degrees. The routine takes exclusive motor control, moves the joint by the requested calibration angle using the current `stdeg` as seed, measures the real unrolled joint angle, and updates `stdeg` in RAM.
+The calibration routine:
 
-Use:
+1. takes exclusive control of the motor
+2. stops normal velocity or position control
+3. reads the real unrolled joint angle
+4. moves the motor using the current `stdeg` value as seed
+5. measures the actual real joint movement
+6. updates `stdeg` in RAM
 
-```text
-save
-```
-
-to persist the calibrated value.
+Use `save` after a successful calibration to persist the new value.
 
 ## Trace Modes
 
-This build adds selectable trace outputs for tuning and overshoot analysis.
+Trace output always uses this plotter-friendly format:
 
 ```text
-trace          toggle trace on/off
-trace on       enable trace
-trace off      disable trace
-trace 0        full diagnostic trace
-trace 1        joint_zeroed_deg, target_deg
-trace 2        joint_zeroed_deg, target_deg, cmd_deg_s, meas_vel
-trace 3        err_deg, cmd_deg_s, meas_vel
-trace 4        joint_zeroed_deg, ref_deg, target_deg, ref_vel, cmd_deg_s
+@name:value,name:value,name:value
 ```
 
-For planner validation and retarget tests, `trace 4` is the most useful mode:
+Available modes:
+
+| Command | Fields | Purpose |
+|---|---|---|
+| `trace 0` | Full diagnostic trace | General debug |
+| `trace 1` | `joint_zeroed_deg`, `target_deg` | Overshoot and settling view |
+| `trace 2` | `joint_zeroed_deg`, `target_deg`, `cmd_deg_s`, `meas_vel` | Position and velocity tuning |
+| `trace 3` | `err_deg`, `cmd_deg_s`, `meas_vel` | PID-focused tuning |
+| `trace 4` | `joint_zeroed_deg`, `ref_deg`, `target_deg`, `ref_vel`, `cmd_deg_s` | S-curve/reference tracking |
+
+Recommended overshoot check:
 
 ```text
-trace 4
-```
-
-It shows:
-
-```text
-@joint_zeroed_deg:<...>,ref_deg:<...>,target_deg:<...>,ref_vel:<...>,cmd_deg_s:<...>
-```
-
-## Move and MoveB
-
-### `move`
-
-Syntax:
-
-```text
-move <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]
-```
-
-`move` starts a planner-style point-to-point move toward the requested target. It is the right command when the previous trajectory should not be blended.
-
-Example:
-
-```text
-move 20 5 5
-move 0 5 5
-```
-
-### `moveb`
-
-Syntax:
-
-```text
-moveb <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]
-```
-
-`moveb` means intelligent retargeting, not unconditional blending.
-
-When a new target is compatible with the current direction of motion, `moveb` keeps the current S-curve reference velocity and creates a smoother continuation.
-
-When the new target is behind the current motion direction, or when reaching it requires a direction reversal, `moveb` automatically switches to safe-replan mode.
-
-This is intentional and was validated on real hardware.
-
-Example log for safe replanning:
-
-```text
-[NFO] MOVEB target=-45.000 deg current=22.158 deg vmax=8.000 deg/s amax=4.000 deg/s2 mode=safe-replan
-```
-
-Example log for true blending:
-
-```text
-[NFO] MOVEB target=45.000 deg current=-14.496 deg vmax=8.000 deg/s amax=4.000 deg/s2 mode=blend
-```
-
-In short:
-
-```text
-moveb = blend when safe, safe-replan when not safe
-```
-
-This behavior avoids aggressive velocity discontinuities during retargets and keeps the motion predictable even during hostile command sequences.
-
-## Suggested Validation Tests
-
-Basic move test:
-
-```text
-stop
 zero
-trace 4
+trace 1
 pos 1
 pos 0
 pos -1
 pos 0
 ```
 
-Forward retarget test:
+If the position response looks suspicious, switch to:
 
 ```text
-stop
+trace 2
+```
+
+or:
+
+```text
+trace 3
+```
+
+## Encoder Output and Angle Tracking
+
+The AS5048A reports an absolute position inside one encoder revolution. The firmware computes a continuous angle by:
+
+- tracking the previous raw encoder value
+- computing delta on each valid read
+- detecting wrap-around at half revolution
+- incrementing or decrementing a turn counter
+- scaling the continuous encoder count to real joint degrees
+
+Example for encoder degrees:
+
+```text
+absolute angle:    350° -> 355° ->   2° ->   8°
+continuous angle:  350° -> 355° -> 362° -> 368°
+```
+
+Then the firmware scales encoder revolutions to real joint movement:
+
+```text
+joint_degrees = continuous_encoder_counts * 15.6 / 16384
+```
+
+### Important Reliability Notes
+
+Continuous angle tracking is reliable only if the encoder moves less than half a revolution between two valid encoder readings.
+
+For the AS5048A:
+
+```text
+counts per encoder revolution = 16384
+half encoder revolution       = 8192 counts
+```
+
+If the encoder moves more than 180 encoder degrees between two consecutive valid samples, the firmware cannot reliably determine the direction of wrap-around.
+
+Recommended precautions:
+
+- sample the encoder significantly faster than the maximum expected output shaft speed
+- update the continuous angle only after a valid encoder read
+- do not update the continuous angle after parity errors or AS5048A error flags
+- keep the continuous counter state inside the encoder object
+- use a wide integer type, such as `int64_t`, for internal continuous count tracking
+
+## LED Status
+
+| State | Behavior |
+|---|---|
+| BOOT | Blue fixed |
+| READY | Green fixed |
+| ENCODER_OK | Dim green |
+| ENCODER_ERROR | Yellow blinking |
+| FAULT | Red fast blinking |
+
+The tested Waveshare ESP32-S3 Zero onboard WS2812 uses RGB channel order in this project build. If colors appear swapped on another board revision, check the NeoPixel order setting.
+
+## PlatformIO Configuration
+
+Current supported environment:
+
+```ini
+[env:esp32-s3-fh4r2]
+platform = https://github.com/pioarduino/platform-espressif32/releases/download/55.03.30-2/platform-espressif32.zip
+framework = arduino
+board = esp32-s3-fh4r2
+
+lib_deps =
+  adafruit/Adafruit NeoPixel@^1.15.1
+
+build_flags =
+  -DBOARD_HAS_PSRAM
+  -mfix-esp32-psram-cache-issue
+  -DARDUINO_USB_CDC_ON_BOOT=1
+  -DARDUINO_USB_MODE=1
+
+monitor_port = /dev/ttyACM0
+monitor_speed = 115200
+monitor_filters =
+  default,
+  log2file,
+  time
+```
+
+## Build and Upload
+
+Build the firmware:
+
+```bash
+pio run
+```
+
+Upload to the board:
+
+```bash
+pio run --target upload
+```
+
+Open the serial monitor:
+
+```bash
+pio device monitor
+```
+
+Or explicitly:
+
+```bash
+pio device monitor --baud 115200 --port /dev/ttyACM0
+```
+
+## Recommended Bring-up Sequence
+
+Start with the default conservative parameters.
+
+The real joint was observed to start losing steps above roughly 15 deg/s. The default controller values are intentionally much lower.
+
+Suggested first sequence:
+
+```text
+get
 zero
-trace 4
-moveb 30 8 4
-moveb 35 8 4
-moveb 40 8 4
-moveb 45 8 4
+trace 1
+pos 1
+pos 0
+pos -1
+pos 0
+servo
 ```
 
-Direction reversal stress test:
+Then tune one parameter at a time:
 
 ```text
-stop
-zero
-trace 4
-moveb 45 8 4
-moveb -45 8 4
-moveb 45 8 4
-moveb -45 8 4
+set kp 1.0
+set kd 0.03
+set vmax 3.0
+set amax 8.0
+pos 1
 ```
 
-Stop and recovery test:
+Only after stable tests:
 
 ```text
-stop
-move 0 5 5
+save
 ```
 
-Expected behavior:
+## Development Roadmap
 
-- `moveb` reports `mode=blend` only when the retarget is kinematically safe.
-- `moveb` reports `mode=safe-replan` for reversals or unsafe retargets.
-- `ref_deg` remains continuous.
-- `ref_vel` changes sign progressively.
-- `stop` freezes the target at the current reference position.
-- A subsequent `move 0 5 5` returns cleanly to zero.
+Completed:
 
-## Notes for External Planner Integration
+- [x] Define pin assignment
+- [x] Initialize USB CDC console
+- [x] Initialize UART0 for future use
+- [x] Initialize SPI bus for AS5048A
+- [x] Implement AS5048A basic reading
+- [x] Add parity and error flag checking
+- [x] Add WS2812 diagnostic LED state machine
+- [x] Add continuous angle computation for multi-turn tracking
+- [x] Add mechanical encoder-to-joint angle scaling
+- [x] Add persistent parameter storage and console commands
+- [x] Add TMC2209 UART configuration
+- [x] Add direct motor velocity test mode
+- [x] Add direct STEP/DIR pulse test mode
+- [x] Add `stdeg` calibration routine
+- [x] Add closed-loop PID + S-curve position control
+- [x] Add runtime PID and motion parameter tuning
+- [x] Add selectable trace modes
 
-The current `JointPlanner` module is the first step toward integration with an external planner.
+Planned:
 
-The dedicated serial port passed to the planner constructor is reserved for receiving planner commands independently from the interactive USB console.
+- [ ] Add encoder offset calibration workflow
+- [ ] Add configurable software position limits
+- [ ] Add hard fault latch and reset workflow
+- [ ] Add more complete safety handling
+- [ ] Add homing/calibration procedures if required by the final mechanics
+- [ ] Add consolidated release documentation
 
-Current status:
+## Status
 
-- console commands still call the same movement API;
-- external planner serial infrastructure is initialized;
-- planner `update()` is called from the main loop;
-- command grammar can be extended inside `JointPlanner` without growing `main.cpp`.
+Work in progress.
 
-Future likely extensions:
+The current firmware is a functional closed-loop prototype. It supports real joint position control using AS5048A feedback, TMC2209 velocity control, persistent runtime tuning, trace-based analysis and conservative safe defaults for hardware bring-up.
 
-- binary or line-based external planner protocol;
-- queue of motion segments;
-- planner acknowledgements;
-- busy/idle status reporting;
-- synchronization command equivalent to `M400`;
-- multi-axis generalization.
+## License
+
+MIT
