@@ -8,6 +8,8 @@
 #include "SerialConsole.h"
 #include "Tmc2209Driver.h"
 #include "SCurvePosVelController.h"
+#include "JointPlanner.h"
+#include "logger.h"
 
 // ===================== BAUDRATE =====================
 
@@ -118,13 +120,14 @@ SCurvePosVelController jointCtrl;
 
 PersistentParams params;
 SerialConsole console(Serial, params);
+JointPlanner planner(SerialFuture);
 
 // ===================== STATE =====================
 
 static constexpr uint32_t ENCODER_PRINT_PERIOD_MS = 250;
 static constexpr uint32_t TEST_PERIOD_MS = 1;
 
-static uint32_t lastServoUs = 0;
+uint32_t lastServoUs = 0;
 static uint32_t lastTestMs = 0;
 static uint32_t lastEncoderPrintMs = 0;
 
@@ -132,7 +135,7 @@ static uint16_t encoderRaw = 0;
 static float encoderDeg = 0.0f;          // encoder angle modulo 360
 static float jointDeg = 0.0f;            // real unrolled joint angle
 static float encoderZero = 0.0f;         // real unrolled joint zero
-static bool encoderOk = false;
+bool encoderOk = false;
 static bool traceEnabled = false;
 
 enum class TraceMode : uint8_t {
@@ -150,32 +153,11 @@ static bool testStepEnabled = false;
 static bool testForward = false;
 static int32_t stepNum = 0;
 
-static float servoTargetZeroedDeg = 0.0f;
+float servoTargetZeroedDeg = 0.0f;
 static float servoLastCmdDegS = 0.0f;
-static bool tmcReady = false;
+bool tmcReady = false;
 
-enum class MotionMode : uint8_t {
-  IDLE,
-  VELOCITY_TEST,
-  STEP_TEST,
-  POSITION,
-  CALIBRATION,
-  FAULT
-};
-
-static MotionMode motionMode = MotionMode::IDLE;
-
-struct JointMoveCommand {
-  // All fields are expressed in real joint degrees, relative to the logical zero.
-  float targetDeg = 0.0f;
-  float vmaxDegS = 0.0f;
-  float amaxDegS2 = 0.0f;
-  float sCurveTimeS = 0.0f;   // <= 0 means keep current/default parameter
-  float outMaxDegS = 0.0f;    // <= 0 means auto: 1.25 * vmax
-};
-
-static constexpr float PLANNER_HARD_VMAX_LIMIT_DEG_S = 12.0f;
-static constexpr float PLANNER_HARD_AMAX_LIMIT_DEG_S2 = 100.0f;
+MotionMode motionMode = MotionMode::IDLE;
 
 // ===================== PARAMS =====================
 
@@ -184,13 +166,12 @@ static bool readParamU8(const char* key, uint8_t& out)
   float value = 0.0f;
 
   if (!params.get(key, value)) {
-    Serial.print("[ERR] Parameter not found: ");
-    Serial.println(key);
+    LOG_ERR("Parameter not found: %s\r\n", key);
     return false;
   }
 
   if (value < 0.0f || value > 255.0f) {
-    Serial.printf("[ERR] Parameter out of uint8 range: %s=%.6f\r\n", key, value);
+    LOG_ERR("Parameter out of uint8 range: %s=%.6f\r\n", key, value);
     return false;
   }
 
@@ -203,13 +184,12 @@ static bool readParamU16(const char* key, uint16_t& out)
   float value = 0.0f;
 
   if (!params.get(key, value)) {
-    Serial.print("[ERR] Parameter not found: ");
-    Serial.println(key);
+    LOG_ERR("Parameter not found: %s\r\n", key);
     return false;
   }
 
   if (value < 0.0f || value > 65535.0f) {
-    Serial.printf("[ERR] Parameter out of uint16 range: %s=%.6f\r\n", key, value);
+    LOG_ERR("Parameter out of uint16 range: %s=%.6f\r\n", key, value);
     return false;
   }
 
@@ -226,12 +206,12 @@ static float readParamFloatOrDefault(const char* key, float fallback)
   return value;
 }
 
-static float readParamMinOrDefault(const char* key, float fallback, float minValue)
+float readParamMinOrDefault(const char* key, float fallback, float minValue)
 {
   const float value = readParamFloatOrDefault(key, fallback);
 
   if (!isfinite(value) || value < minValue) {
-    Serial.printf("[WARN] Invalid parameter %s=%.6f, using default %.6f\r\n", key, value, fallback);
+    LOG_NFO("Invalid parameter %s=%.6f, using default %.6f\r\n", key, value, fallback);
     return fallback;
   }
 
@@ -247,10 +227,34 @@ static float stepsPerDegree()
   return value;
 }
 
+
+static void applyLogLevelFromParams(bool announce)
+{
+  float value = 2.0f;
+
+  if (!params.get("loglvl", value) || !isfinite(value)) {
+    value = 2.0f;
+  }
+
+  int level = static_cast<int>(value);
+
+  if (level < 0) {
+    level = 0;
+  } else if (level > 3) {
+    level = 3;
+  }
+
+  Logger::setLevel(static_cast<uint8_t>(level));
+
+  if (announce) {
+    LOG_NFO("loglvl=%d (0=OFF, 1=ERR, 2=NFO, 3=DBG)\r\n", level);
+  }
+}
+
 void paramsInit()
 {
   if (!params.begin()) {
-    Serial.println("[ERR] Failed to initialize parameters storage");
+    LOG_ERR("Failed to initialize parameters storage\r\n");
     return;
   }
 
@@ -259,6 +263,7 @@ void paramsInit()
   params.initKey("irun", 10.0f);
   params.initKey("ihold", 4.0f);
   params.initKey("stdeg", 100.0f); // motor microsteps per real joint degree
+  params.initKey("loglvl", 2.0f); // 0=OFF, 1=ERR, 2=NFO, 3=DBG
 
   // PID + S-curve controller parameters.
   // Key names are intentionally short because PersistentParams allows max 6 chars.
@@ -281,14 +286,15 @@ void paramsInit()
   params.initKey("vtau", SERVO_VEL_FILTER_TAU_S);
 
   params.load();
+  applyLogLevelFromParams(false);
 
-  Serial.println("[PARAMS] Loaded parameters:");
+  LOG_DBG("Loaded parameters:\r\n");
   for (uint8_t i = 0; i < params.count(); i++) {
     const char* key = nullptr;
     float value = 0.0f;
 
     if (params.getByIndex(i, key, value)) {
-      Serial.printf("%s = %.6f\r\n", key, value);
+      LOG_DBG("%s = %.6f\r\n", key, value);
     }
   }
 }
@@ -299,12 +305,12 @@ static void applyCurrentScaleFromParams()
   uint8_t ihold = 0;
 
   if (!readParamU8("irun", irun) || !readParamU8("ihold", ihold)) {
-    Serial.println("[ERR] Current scale update skipped");
+    LOG_ERR("Current scale update skipped\r\n");
     return;
   }
 
   tmc.setCurrentScale(irun, ihold, tmcConfig.iholdDelay);
-  Serial.printf("[OK] Updated TMC2209 current scale: IRUN=%u, IHOLD=%u\r\n", irun, ihold);
+  LOG_NFO("Updated TMC2209 current scale: IRUN=%u, IHOLD=%u\r\n", irun, ihold);
 }
 
 static void applyMicrostepResolutionFromParams()
@@ -312,16 +318,16 @@ static void applyMicrostepResolutionFromParams()
   uint16_t ustep = 0;
 
   if (!readParamU16("ustep", ustep)) {
-    Serial.println("[ERR] Microstep resolution update skipped");
+    LOG_ERR("Microstep resolution update skipped\r\n");
     return;
   }
 
   if (!tmc.setMicrostepResolution(ustep)) {
-    Serial.printf("[ERR] Invalid TMC2209 microstep resolution: %u\r\n", ustep);
+    LOG_ERR("Invalid TMC2209 microstep resolution: %u\r\n", ustep);
     return;
   }
 
-  Serial.printf("[OK] Updated TMC2209 microstep resolution: USTEP=%u\r\n", ustep);
+  LOG_NFO("Updated TMC2209 microstep resolution: USTEP=%u\r\n", ustep);
 }
 
 static void applyControllerMotionParamsFromParams()
@@ -335,7 +341,7 @@ static void applyControllerMotionParamsFromParams()
   jointCtrl.setSCurveTime(sct);
   jointCtrl.setOutputMax(outmax);
 
-  Serial.printf("[OK] Servo motion params: vmax=%.4f amax=%.4f sct=%.4f outmax=%.4f\r\n",
+  LOG_NFO("Servo motion params: vmax=%.4f amax=%.4f sct=%.4f outmax=%.4f\r\n",
                 vmax, amax, sct, outmax);
 }
 
@@ -350,7 +356,7 @@ static void applyControllerGainsFromParams()
   jointCtrl.setGains(kp, ki, kd, ffv);
   jointCtrl.setIntegratorLimit(ilim);
 
-  Serial.printf("[OK] PID params: kp=%.4f ki=%.4f kd=%.4f ffv=%.4f ilim=%.4f\r\n",
+  LOG_NFO("PID params: kp=%.4f ki=%.4f kd=%.4f ffv=%.4f ilim=%.4f\r\n",
                 kp, ki, kd, ffv, ilim);
 }
 
@@ -367,7 +373,7 @@ static void applyControllerSettlingParamsFromParams()
   jointCtrl.setDeadband(dbent, dbext, dbvel);
   jointCtrl.setVelocityFilterTau(vtau);
 
-  Serial.printf("[OK] Servo settling params: ptol=%.4f vtol=%.4f dbent=%.4f dbext=%.4f dbvel=%.4f vtau=%.4f\r\n",
+  LOG_NFO("Servo settling params: ptol=%.4f vtol=%.4f dbent=%.4f dbext=%.4f dbvel=%.4f vtau=%.4f\r\n",
                 ptol, vtol, dbent, dbext, dbvel, vtau);
 }
 
@@ -421,13 +427,17 @@ void onConsoleParamSet(const char* key)
     return;
   }
 
-  if (strcmp(key, "stdeg") == 0) {
-    Serial.printf("[OK] steps/degree now %.6f microsteps/deg\r\n", stepsPerDegree());
+  if (strcmp(key, "loglvl") == 0) {
+    applyLogLevelFromParams(true);
     return;
   }
 
-  Serial.print("[PARAMS] No runtime action defined for key: ");
-  Serial.println(key);
+  if (strcmp(key, "stdeg") == 0) {
+    LOG_NFO("steps/degree now %.6f microsteps/deg\r\n", stepsPerDegree());
+    return;
+  }
+
+  LOG_DBG("No runtime action defined for key: %s\r\n", key);
 }
 
 // ===================== ENCODER / TMC INIT =====================
@@ -438,8 +448,8 @@ void encoderInit()
   encoder.begin();
   encoder.setOutputDegreesPerEncoderRevolution(JOINT_DEGREES_PER_ENCODER_REV);
 
-  Serial.println("[OK] HSPI initialized for AS5048A");
-  Serial.printf("[OK] Encoder scale: 360.000 encoder deg = %.6f joint deg\r\n",
+  LOG_NFO("HSPI initialized for AS5048A\r\n");
+  LOG_NFO("Encoder scale: 360.000 encoder deg = %.6f joint deg\r\n",
                 encoder.outputDegreesPerEncoderRevolution());
 }
 
@@ -450,74 +460,68 @@ bool encoderFirstReadTest()
   encoderDeg = encoder.lastDegrees();
 
   if (encoderOk) {
-    Serial.print("[OK] AS5048A first read raw=");
-    Serial.print(encoderRaw);
-    Serial.print(" enc_angle=");
-    Serial.print(encoderDeg, 3);
-    Serial.print(" deg joint_unrolled=");
-    Serial.print(jointDeg, 3);
-    Serial.println(" deg");
+    LOG_NFO("AS5048A first read raw=%u enc_angle=%.3f deg joint_unrolled=%.3f deg\r\n",
+            encoderRaw,
+            encoderDeg,
+            jointDeg);
     return true;
   }
 
-  Serial.println("[ERR] AS5048A first read failed");
+  LOG_ERR("AS5048A first read failed\r\n");
   return false;
 }
 
 bool tmcInit()
 {
-  Serial.println("TMC2209 minimal init test");
+  LOG_NFO("TMC2209 minimal init test\r\n");
 
-  Serial.println("Starting communication-only mode...");
+  LOG_NFO("Starting communication-only mode...\r\n");
   if (!tmc.beginCommunicationOnly()) {
-    Serial.println("ERROR: beginCommunicationOnly() failed");
+    LOG_ERR("beginCommunicationOnly() failed\r\n");
     return false;
   }
 
-  Serial.println("Communication-only mode started");
+  LOG_NFO("Communication-only mode started\r\n");
 
-  Serial.println("Probing TMC2209...");
+  LOG_NFO("Probing TMC2209...\r\n");
   if (!tmc.probe()) {
-    Serial.println("ERROR: TMC2209 probe failed");
+    LOG_ERR("TMC2209 probe failed\r\n");
     return false;
   }
 
-  Serial.println("TMC2209 detected");
+  LOG_NFO("TMC2209 detected\r\n");
 
   uint32_t ioin = 0;
   if (tmc.readIoin(ioin)) {
-    Serial.print("IOIN = 0x");
-    Serial.println(ioin, HEX);
+    LOG_DBG("IOIN = 0x%08lX\r\n", static_cast<unsigned long>(ioin));
   } else {
-    Serial.println("ERROR: unable to read IOIN");
+    LOG_ERR("unable to read IOIN\r\n");
   }
 
   uint32_t gstat = 0;
   if (tmc.readGstat(gstat)) {
-    Serial.print("GSTAT = 0x");
-    Serial.println(gstat, HEX);
+    LOG_DBG("GSTAT = 0x%08lX\r\n", static_cast<unsigned long>(gstat));
   } else {
-    Serial.println("ERROR: unable to read GSTAT");
+    LOG_ERR("unable to read GSTAT\r\n");
   }
 
-  Serial.println("Configuring driver registers...");
+  LOG_NFO("Configuring driver registers...\r\n");
   if (!tmc.configure()) {
-    Serial.println("ERROR: configure() failed");
+    LOG_ERR("configure() failed\r\n");
     return false;
   }
 
-  Serial.println("Driver configured, power stage still disabled");
+  LOG_NFO("Driver configured, power stage still disabled\r\n");
 
   uint32_t ifcnt = 0;
   if (tmc.readIfcnt(ifcnt)) {
-    Serial.print("IFCNT = ");
-    Serial.println(ifcnt);
+    LOG_DBG("IFCNT = %lu\r\n", static_cast<unsigned long>(ifcnt));
   } else {
-    Serial.println("ERROR: unable to read IFCNT");
+    LOG_ERR("unable to read IFCNT\r\n");
   }
 
-  Serial.println("Safe init completed");
-  Serial.println("ENN is still HIGH: motor bridge disabled");
+  LOG_NFO("Safe init completed\r\n");
+  LOG_NFO("ENN is still HIGH: motor bridge disabled\r\n");
   return true;
 }
 
@@ -591,7 +595,7 @@ bool jointHasFault()
 bool setMotorVelocityDegPerSecond(float degreesPerSecond)
 {
   if (!tmcReady) {
-    Serial.println("[ERR] TMC not ready");
+    LOG_ERR("TMC not ready\r\n");
     return false;
   }
 
@@ -599,7 +603,7 @@ bool setMotorVelocityDegPerSecond(float degreesPerSecond)
   const float microstepsPerSecond = MOTOR_DIRECTION_SIGN * degreesPerSecond * spd;
 
   if (!tmc.runVelocityMicrostepsPerSecond(microstepsPerSecond)) {
-    Serial.println("[ERR] TMC velocity command failed");
+    LOG_ERR("TMC velocity command failed\r\n");
     return false;
   }
 
@@ -607,10 +611,10 @@ bool setMotorVelocityDegPerSecond(float degreesPerSecond)
   return true;
 }
 
-static bool ensureDriverEnabled()
+bool ensureDriverEnabled()
 {
   if (!tmcReady) {
-    Serial.println("[ERR] TMC not ready");
+    LOG_ERR("TMC not ready\r\n");
     return false;
   }
 
@@ -621,17 +625,17 @@ static bool ensureDriverEnabled()
   }
 
   if (st != Tmc2209Driver::Status::Configured) {
-    Serial.println("[ERR] TMC is not in a configurable state");
+    LOG_ERR("TMC is not in a configurable state\r\n");
     return false;
   }
 
   if (!tmc.armPowerStage()) {
-    Serial.println("[ERR] Unable to arm TMC power stage");
+    LOG_ERR("Unable to arm TMC power stage\r\n");
     return false;
   }
 
   if (!tmc.enableDriver()) {
-    Serial.println("[ERR] Unable to enable TMC driver");
+    LOG_ERR("Unable to enable TMC driver\r\n");
     return false;
   }
 
@@ -657,12 +661,6 @@ void stopMotion()
   wsSetState(LedState::READY);
 }
 
-bool jointStop()
-{
-  stopMotion();
-  return true;
-}
-
 void jointControllerInit(float currentJointDeg)
 {
   applyControllerParamsFromParams();
@@ -671,232 +669,8 @@ void jointControllerInit(float currentJointDeg)
   jointCtrl.disablePositionLimits();
   jointCtrl.reset(currentJointDeg);
 
-  Serial.println("[OK] Joint PID + S-curve controller initialized");
-  Serial.println("[SAFE] Servo parameters are runtime-tunable with 'set <key> <value>'. Keep early tests slow.");
-}
-
-bool jointMoveTo(const JointMoveCommand& cmd)
-{
-  if (motionMode == MotionMode::CALIBRATION) {
-    Serial.println("[ERR] Calibration in progress");
-    return false;
-  }
-
-  if (motionMode == MotionMode::FAULT) {
-    Serial.println("[ERR] Motion fault latched; use stop/reboot after checking hardware");
-    return false;
-  }
-
-  if (!encoderOk) {
-    Serial.println("[ERR] Encoder not OK");
-    return false;
-  }
-
-  if (!isfinite(cmd.targetDeg) || !isfinite(cmd.vmaxDegS) || !isfinite(cmd.amaxDegS2)) {
-    Serial.println("[ERR] Invalid move command: non-finite value");
-    return false;
-  }
-
-  if (cmd.vmaxDegS <= 0.0f || cmd.amaxDegS2 <= 0.0f) {
-    Serial.println("[ERR] Invalid move command: vmax and amax must be > 0");
-    return false;
-  }
-
-  const float safeVmax = constrain(fabsf(cmd.vmaxDegS), 0.01f, PLANNER_HARD_VMAX_LIMIT_DEG_S);
-  const float safeAmax = constrain(fabsf(cmd.amaxDegS2), 0.01f, PLANNER_HARD_AMAX_LIMIT_DEG_S2);
-
-  stopMotion();
-
-  if (!ensureDriverEnabled()) {
-    motionMode = MotionMode::FAULT;
-    wsSetState(LedState::FAULT);
-    return false;
-  }
-
-  jointCtrl.clearFault();
-  jointCtrl.setLimits(safeVmax, safeAmax);
-
-  if (isfinite(cmd.sCurveTimeS) && cmd.sCurveTimeS > 0.0f) {
-    jointCtrl.setSCurveTime(cmd.sCurveTimeS);
-  }
-
-  if (isfinite(cmd.outMaxDegS) && cmd.outMaxDegS > 0.0f) {
-    jointCtrl.setOutputMax(cmd.outMaxDegS);
-  } else {
-    jointCtrl.setOutputMax(safeVmax * 1.25f);
-  }
-
-  // IMPORTANT: controller coordinates are zeroed joint degrees.
-  const float currentZeroedDeg = jointGetPositionDeg();
-  servoTargetZeroedDeg = cmd.targetDeg;
-  jointCtrl.reset(currentZeroedDeg);
-  jointCtrl.setTarget(cmd.targetDeg);
-
-  lastServoUs = micros();
-  motionMode = MotionMode::POSITION;
-
-  Serial.printf("[MOVE] target=%.3f deg current=%.3f deg vmax=%.3f deg/s amax=%.3f deg/s2\r\n",
-                cmd.targetDeg, currentZeroedDeg, safeVmax, safeAmax);
-  return true;
-}
-
-bool jointMoveTo(float targetDeg, float vmaxDegS, float amaxDegS2)
-{
-  JointMoveCommand cmd;
-  cmd.targetDeg = targetDeg;
-  cmd.vmaxDegS = vmaxDegS;
-  cmd.amaxDegS2 = amaxDegS2;
-  return jointMoveTo(cmd);
-}
-
-bool jointMoveTo(float targetDeg, float vmaxDegS, float amaxDegS2, float sCurveTimeS)
-{
-  JointMoveCommand cmd;
-  cmd.targetDeg = targetDeg;
-  cmd.vmaxDegS = vmaxDegS;
-  cmd.amaxDegS2 = amaxDegS2;
-  cmd.sCurveTimeS = sCurveTimeS;
-  return jointMoveTo(cmd);
-}
-
-
-bool jointMoveToBlended(const JointMoveCommand& cmd)
-{
-  if (motionMode == MotionMode::CALIBRATION) {
-    Serial.println("[ERR] Calibration in progress");
-    return false;
-  }
-
-  if (motionMode == MotionMode::FAULT) {
-    Serial.println("[ERR] Motion fault latched; use stop/reboot after checking hardware");
-    return false;
-  }
-
-  if (!encoderOk) {
-    Serial.println("[ERR] Encoder not OK");
-    return false;
-  }
-
-  if (!isfinite(cmd.targetDeg) || !isfinite(cmd.vmaxDegS) || !isfinite(cmd.amaxDegS2)) {
-    Serial.println("[ERR] Invalid blended move command: non-finite value");
-    return false;
-  }
-
-  if (cmd.vmaxDegS <= 0.0f || cmd.amaxDegS2 <= 0.0f) {
-    Serial.println("[ERR] Invalid blended move command: vmax and amax must be > 0");
-    return false;
-  }
-
-  const float safeVmax = constrain(fabsf(cmd.vmaxDegS), 0.01f, PLANNER_HARD_VMAX_LIMIT_DEG_S);
-  const float safeAmax = constrain(fabsf(cmd.amaxDegS2), 0.01f, PLANNER_HARD_AMAX_LIMIT_DEG_S2);
-
-  const bool alreadyPositioning = (motionMode == MotionMode::POSITION);
-  const bool driverAlreadyEnabled = (tmc.status() == Tmc2209Driver::Status::Enabled);
-
-  // If another manual/test mode is running, stop it and start the blended move
-  // from the current zeroed position. If we are already in POSITION mode, do
-  // NOT call stopMotion(), because it intentionally disables the driver and
-  // resets the internal reference velocity.
-  if (!alreadyPositioning) {
-    stopMotion();
-  }
-
-  // If we are already positioning and the TMC is already enabled, this is a
-  // pure re-target operation: do not arm the power stage again.
-  if (!alreadyPositioning || !driverAlreadyEnabled) {
-    if (!ensureDriverEnabled()) {
-      motionMode = MotionMode::FAULT;
-      wsSetState(LedState::FAULT);
-      return false;
-    }
-  }
-
-  if (!alreadyPositioning) {
-    jointCtrl.clearFault();
-  }
-
-  jointCtrl.setLimits(safeVmax, safeAmax);
-
-  if (isfinite(cmd.sCurveTimeS) && cmd.sCurveTimeS > 0.0f) {
-    jointCtrl.setSCurveTime(cmd.sCurveTimeS);
-  }
-
-  if (isfinite(cmd.outMaxDegS) && cmd.outMaxDegS > 0.0f) {
-    jointCtrl.setOutputMax(cmd.outMaxDegS);
-  } else {
-    jointCtrl.setOutputMax(safeVmax * 1.25f);
-  }
-
-  const float currentZeroedDeg = jointGetPositionDeg();
-  servoTargetZeroedDeg = cmd.targetDeg;
-
-  const float refPos = jointCtrl.refPos();
-  const float refVel = jointCtrl.refVel();
-  const float distToNewTarget = cmd.targetDeg - refPos;
-
-  static constexpr float BLEND_MIN_REF_VEL_DEG_S = 0.02f;
-
-  const bool movingReference = fabsf(refVel) > BLEND_MIN_REF_VEL_DEG_S;
-  const bool targetAheadOfVelocity =
-    !movingReference || ((distToNewTarget * refVel) >= 0.0f);
-
-  bool fullBlend = false;
-
-  if (alreadyPositioning && targetAheadOfVelocity) {
-    // Good case: the new target is compatible with the current reference
-    // velocity. Keep ref_pos/ref_vel/ref_acc and only update the target.
-    jointCtrl.setTargetBlended(cmd.targetDeg);
-    fullBlend = true;
-  } else {
-    // First segment, or reversal / ambiguous target.
-    // Safe fallback: replan from the current measured zeroed position.
-    // This intentionally drops the internal reference velocity to zero instead
-    // of carrying a velocity that would push the joint further away.
-    jointCtrl.reset(currentZeroedDeg);
-    jointCtrl.setTarget(cmd.targetDeg);
-    fullBlend = false;
-  }
-
-  lastServoUs = micros();
-  motionMode = MotionMode::POSITION;
-
-  Serial.printf("[MOVEB] target=%.3f deg current=%.3f deg vmax=%.3f deg/s amax=%.3f deg/s2 mode=%s\r\n",
-                cmd.targetDeg,
-                currentZeroedDeg,
-                safeVmax,
-                safeAmax,
-                fullBlend ? "blend" : "safe-replan");
-  return true;
-}
-
-bool jointMoveToBlended(float targetDeg, float vmaxDegS, float amaxDegS2)
-{
-  JointMoveCommand cmd;
-  cmd.targetDeg = targetDeg;
-  cmd.vmaxDegS = vmaxDegS;
-  cmd.amaxDegS2 = amaxDegS2;
-  return jointMoveToBlended(cmd);
-}
-
-bool jointMoveToBlended(float targetDeg, float vmaxDegS, float amaxDegS2, float sCurveTimeS)
-{
-  JointMoveCommand cmd;
-  cmd.targetDeg = targetDeg;
-  cmd.vmaxDegS = vmaxDegS;
-  cmd.amaxDegS2 = amaxDegS2;
-  cmd.sCurveTimeS = sCurveTimeS;
-  return jointMoveToBlended(cmd);
-}
-
-bool moveJointToDeg(float targetZeroedDeg)
-{
-  JointMoveCommand cmd;
-  cmd.targetDeg = targetZeroedDeg;
-  cmd.vmaxDegS = readParamMinOrDefault("vmax", SERVO_VMAX_DEG_S, 0.001f);
-  cmd.amaxDegS2 = readParamMinOrDefault("amax", SERVO_AMAX_DEG_S2, 0.001f);
-  cmd.sCurveTimeS = readParamMinOrDefault("sct", SERVO_SCURVE_TIME_S, 0.001f);
-  cmd.outMaxDegS = readParamMinOrDefault("outmax", SERVO_OUTPUT_MAX_DEG_S, 0.0f);
-  return jointMoveTo(cmd);
+  LOG_NFO("Joint PID + S-curve controller initialized\r\n");
+  LOG_NFO("Servo parameters are runtime-tunable with set <key> <value>. Keep early tests slow.\r\n");
 }
 
 static const char* traceModeName(TraceMode mode)
@@ -1282,7 +1056,7 @@ void servoUpdate()
     tmc.disableDriver(false);
     motionMode = MotionMode::FAULT;
     wsSetState(LedState::FAULT);
-    Serial.println("[FAULT] Encoder read failed during control");
+    LOG_ERR("Encoder read failed during control\r\n");
     return;
   }
 
@@ -1306,7 +1080,7 @@ void servoUpdate()
     tmc.disableDriver(false);
     motionMode = MotionMode::FAULT;
     wsSetState(LedState::FAULT);
-    Serial.printf("[FAULT] Joint controller fault code=%u\r\n", static_cast<unsigned>(jointCtrl.faultCode()));
+    LOG_ERR("Joint controller fault code=%u\r\n", static_cast<unsigned>(jointCtrl.faultCode()));
     return;
   }
 
@@ -1316,7 +1090,7 @@ void servoUpdate()
     motionMode = MotionMode::IDLE;
     servoLastCmdDegS = 0.0f;
     wsSetState(LedState::READY);
-    Serial.printf("[OK] Move complete zeroed=%.3f deg\r\n", jointGetPositionDeg());
+    LOG_NFO("Move complete zeroed=%.3f deg\r\n", jointGetPositionDeg());
   }
 }
 
@@ -1332,21 +1106,20 @@ void setup()
   delay(500);
 
   Serial.println();
-  Serial.println("[BOOT] PlanetJoint ESP32-S3 - AS5048A PID+S-curve build");
-  Serial.println("[BOOT] USB CDC console ready");
+  LOG_NFO("PlanetJoint ESP32-S3 - AS5048A PID+S-curve build\r\n");
+  LOG_NFO("USB CDC console ready\r\n");
 
   paramsInit();
 
-  SerialFuture.begin(UART0_BAUD);
-  Serial.println("[OK] UART0 initialized for future use");
+  planner.begin(UART0_BAUD);
 
   if (!tmcInit()) {
-    Serial.println("[ERR] Failed to initialize TMC2209 driver");
+    LOG_ERR("Failed to initialize TMC2209 driver\r\n");
     wsSetState(LedState::FAULT);
     motionMode = MotionMode::FAULT;
   } else {
     tmcReady = true;
-    Serial.println("[OK] TMC2209 driver initialized");
+    LOG_NFO("TMC2209 driver initialized\r\n");
     applyAllParams();
   }
 
@@ -1361,12 +1134,12 @@ void setup()
     motionMode = MotionMode::FAULT;
   }
 
-  Serial.println("[BOOT] Init complete");
-  Serial.println("[SAFE] First tests: use 'zero', then 'pos 1', 'pos 0', 'pos -1'.");
-  Serial.println("[SAFE] MOTOR_DIRECTION_SIGN=-1.0 from real hardware tests.");
-  Serial.println("[TUNE] Runtime params: kp ki kd ffv ilim vmax amax sct outmax ptol vtol dbent dbext dbvel vtau.");
-  Serial.println("[TRACE] trace toggles on/off; trace 0..4 selects output mode.");
-  Serial.println("[TUNE] Example: set kp 1.0 / set vmax 3.0 / save");
+  LOG_NFO("Init complete\r\n");
+  LOG_NFO("First tests: use zero, then pos 1, pos 0, pos -1.\r\n");
+  LOG_NFO("MOTOR_DIRECTION_SIGN=-1.0 from real hardware tests.\r\n");
+  LOG_NFO("Runtime params: kp ki kd ffv ilim vmax amax sct outmax ptol vtol dbent dbext dbvel vtau loglvl.\r\n");
+  LOG_NFO("trace toggles on/off; trace 0..4 selects output mode.\r\n");
+  LOG_NFO("Example: set kp 1.0 / set vmax 3.0 / save\r\n");
 
   console.setParamSetCallback(onConsoleParamSet);
   console.begin("pj> ");
@@ -1379,6 +1152,7 @@ void loop()
   const uint32_t now = millis();
 
   console.update();
+  planner.update();
   wsLedsUpdate();
   servoUpdate();
 
