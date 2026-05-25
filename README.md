@@ -8,6 +8,7 @@ This project implements a compact closed-loop joint controller based on:
 - a Trinamic TMC2209 stepper motor driver configured over UART
 - a stepper motor driving a planetary gearbox actuator
 - a PID + S-curve position controller running on an ESP32-S3
+- a dedicated motion/planner module separated from the main firmware wiring
 
 The firmware is built with the Arduino framework and PlatformIO.
 
@@ -26,11 +27,15 @@ The firmware is built with the Arduino framework and PlatformIO.
 - `stdeg` calibration routine for estimating motor microsteps per real joint degree
 - Direct velocity test mode in real joint degrees/second
 - Direct STEP/DIR pulse test mode
+- Planner-style position commands: `move` and `moveb`
+- Smart retargeting for `moveb`: blend only when safe, otherwise safe replan
 - USB CDC serial console with interactive commands
+- Dedicated serial interface object passed to the planner constructor for future external planner integration
 - Persistent configuration storage in ESP32 NVS
+- Header-only logger with selectable runtime log level
 - Selectable trace modes for tuning, overshoot analysis and diagnostics
 - WS2812 RGB LED diagnostic state machine
-- Modular source layout
+- Modular source layout with motion/planner logic separated from `main.cpp`
 
 ## Hardware Target
 
@@ -61,25 +66,64 @@ readDegrees()           -> encoder angle modulo 360 degrees
 readContinuousDegrees() -> real unrolled joint angle in degrees
 ```
 
-The closed-loop controller, `pos` command, `zero` command, trace output and `stdeg` calibration all work in **real joint degrees**.
+The closed-loop controller, `pos`, `move`, `moveb`, `zero`, trace output and `stdeg` calibration all work in **real joint degrees**.
 
 ## Project Layout
 
 ```text
 platformio.ini
+README.md
+README_TUNING.md
+README_PLANNER_API_FIX.md
+README_BLENDED_MOVE.md
+README_MOVEB_RETARGET_FIX.md
+README_PLANNER_REFACTOR.md
+
 src/
 ├── main.cpp
+├── JointPlanner.h
+├── JointPlanner.cpp
 ├── SCurvePosVelController.h
 ├── as5048a.h
 ├── as5048a.cpp
 ├── led_status.h
 ├── led_status.cpp
+├── logger.h
 ├── params.h
 ├── SerialConsole.h
 ├── SerialConsole.cpp
 ├── Tmc2209Driver.h
 └── Tmc2209Driver.cpp
 ```
+
+### Main / Planner Split
+
+`main.cpp` remains responsible for low-level firmware ownership and hardware wiring:
+
+- serial ports
+- SPI and encoder instance
+- TMC2209 driver instance
+- PID/S-curve controller instance
+- persistent parameters
+- LED state machine
+- console setup
+- periodic servo loop
+
+The motion/planner-facing API has been moved to:
+
+```text
+src/JointPlanner.h
+src/JointPlanner.cpp
+```
+
+The planner module currently owns the higher-level motion commands:
+
+- `jointMoveTo(...)`
+- `jointMoveToBlended(...)`
+- `moveJointToDeg(...)`
+- `jointStop()`
+
+The current refactor is intentionally conservative: the planner module still binds to the already tested low-level objects through existing firmware symbols instead of taking ownership of all hardware. This keeps the validated hardware behavior stable while making the motion layer easier to extend.
 
 ## Pinout
 
@@ -95,20 +139,36 @@ src/
 | TMC2209 DIR | GPIO5 |
 | TMC2209 EN | GPIO6 |
 | WS2812 DIN | GPIO21 |
-| Reserved / unused | GPIO1, GPIO2, GPIO3 |
+| Reserved / planner serial | GPIO1, GPIO2, GPIO3 |
 
 ## Firmware Behavior
 
 - `Serial` is used for the USB CDC console at 115200 baud
 - `Serial2` is used for TMC2209 UART communication at 115200 baud
 - HSPI is used for AS5048A encoder communication
-- UART0 is initialized for future use
-- Parameters are initialized, loaded from NVS and printed at boot
+- the additional UART/serial object reserved for future use is now passed to the planner constructor
+- parameters are initialized, loaded from NVS and printed at boot
 - TMC2209 is configured safely before motor enable
-- Motor GPIO is initialized in a safe disabled state
-- Encoder reads update the real unrolled joint angle
-- The PID + S-curve controller commands motor velocity in real joint deg/s
+- motor GPIO is initialized in a safe disabled state
+- encoder reads update the real unrolled joint angle
+- the PID + S-curve controller commands motor velocity in real joint deg/s
 - TMC2209 velocity commands are converted using `stdeg`
+- the planner `update()` method is called from the main loop
+- the serial console prompt prints a newline after the prompt in normal mode to keep trace/log output clean
+
+Planner object construction follows this model:
+
+```cpp
+JointPlanner planner(SerialFuture);
+```
+
+and initialization follows:
+
+```cpp
+planner.begin(UART0_BAUD);
+```
+
+The planner serial interface is reserved for future integration with an external planner or upstream motion coordinator.
 
 ## Motor Direction
 
@@ -121,6 +181,35 @@ static constexpr float MOTOR_DIRECTION_SIGN = -1.0f;
 ```
 
 This is important for closed-loop control. A wrong sign would turn negative feedback into positive feedback.
+
+## Logger
+
+The firmware includes a lightweight header-only logger.
+
+Supported log levels:
+
+| Level | Prefix | Meaning |
+|---:|---|---|
+| `0` | none | logging disabled |
+| `1` | `[ERR]` | errors only |
+| `2` | `[NFO]` | errors and informational messages |
+| `3` | `[DBG]` | errors, informational messages and debug messages |
+
+The active level is controlled by the persistent runtime parameter:
+
+```text
+loglvl
+```
+
+Examples:
+
+```text
+set loglvl 0
+set loglvl 2
+save
+```
+
+Trace lines are separate from logger lines. Trace lines remain plotter-friendly and start with `@`.
 
 ## Supported Serial Commands
 
@@ -135,7 +224,9 @@ This is important for closed-loop control. A wrong sign would turn negative feed
 | `import` | Import parameters from serial input |
 | `cancel` | Cancel import mode |
 | `zero` | Set current real joint position as zero |
-| `pos <deg>` | Move to target position relative to zero |
+| `pos <deg>` | Move to target position relative to zero using the default position command |
+| `move <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]` | Planner-style move with explicit motion limits |
+| `moveb <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]` | Planner-style smart retarget move |
 | `stop` | Stop all motion |
 | `servo` | Print controller status |
 | `trace` | Toggle trace output using the current trace mode |
@@ -146,6 +237,61 @@ This is important for closed-loop control. A wrong sign would turn negative feed
 | `step <steps>` | Toggle direct STEP/DIR pulse test |
 | `calstdeg [deg]` | Estimate `stdeg` by moving the joint and measuring encoder feedback |
 | `reboot` | Reboot the board |
+
+## Planner Motion Commands
+
+### `move`
+
+```text
+move <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]
+```
+
+`move` starts a normal planner-style move toward the target using the supplied motion limits.
+
+Example:
+
+```text
+move 20 5 5
+move 0 5 5
+```
+
+This command is appropriate for explicit point-to-point moves where preserving the previous reference velocity is not required.
+
+### `moveb`
+
+```text
+moveb <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]
+```
+
+`moveb` is a smart retarget command.
+
+Important: `moveb` does **not** mean "always blend".
+
+It means:
+
+- blend if the new target is compatible with the current motion direction and can be reached smoothly
+- use safe replan if the target requires braking, reversal, or a retarget behind the current motion
+
+Typical log examples:
+
+```text
+[NFO] MOVEB target=45.000 deg current=-14.496 deg vmax=8.000 deg/s amax=4.000 deg/s2 mode=blend
+[NFO] MOVEB target=-20.000 deg current=20.054 deg vmax=8.000 deg/s amax=4.000 deg/s2 mode=safe-replan
+```
+
+This behavior was validated on real hardware with repeated retargeting tests, including intentionally aggressive `+45/-45` direction changes.
+
+### Stop Behavior
+
+`stop` stops the motion and freezes the internal reference near the current joint position.
+
+After a stop, a new command such as:
+
+```text
+move 0 5 5
+```
+
+starts cleanly from the stopped position.
 
 ## Runtime Parameters
 
@@ -202,6 +348,12 @@ The velocity conversion is:
 microsteps_per_second = joint_deg_per_second * stdeg
 ```
 
+### Logging
+
+| Key | Meaning | Default |
+|---|---|---:|
+| `loglvl` | Runtime logger level: 0 off, 1 error, 2 info, 3 debug | `2` |
+
 ## `stdeg` Calibration
 
 The `calstdeg` command estimates the conversion between real joint degrees and motor microsteps.
@@ -252,6 +404,30 @@ pos -1
 pos 0
 ```
 
+Recommended S-curve and retargeting check:
+
+```text
+stop
+zero
+trace 4
+moveb 30 8 4
+moveb 35 8 4
+moveb 40 8 4
+moveb 45 8 4
+```
+
+Recommended aggressive safe-replan check:
+
+```text
+stop
+zero
+trace 4
+moveb 45 8 4
+moveb -45 8 4
+moveb 45 8 4
+moveb -45 8 4
+```
+
 If the position response looks suspicious, switch to:
 
 ```text
@@ -263,6 +439,32 @@ or:
 ```text
 trace 3
 ```
+
+## Serial Console Output Notes
+
+The console prompt is printed on its own line in normal command mode. This avoids mixing the prompt with trace or logger lines.
+
+Current behavior:
+
+```cpp
+void SerialConsole::printPrompt()
+{
+  if (_mode == Mode::Import) {
+    _serial.print("import> ");
+  } else {
+    _serial.print(_prompt);
+    _serial.println();
+  }
+}
+```
+
+Import mode intentionally keeps the prompt on the same line:
+
+```text
+import>
+```
+
+This is useful for manual parameter import and keeps the import workflow compact.
 
 ## Encoder Output and Angle Tracking
 
@@ -408,6 +610,29 @@ Only after stable tests:
 save
 ```
 
+Recommended planner validation sequence:
+
+```text
+stop
+zero
+trace 4
+moveb -45 8 4
+moveb 45 8 4
+moveb -45 8 4
+moveb 45 8 4
+stop
+move 0 5 5
+```
+
+Expected behavior:
+
+- repeated direction changes should use `mode=safe-replan`
+- compatible forward retargets may use `mode=blend`
+- `ref_deg` should remain continuous
+- `joint_zeroed_deg` should track `ref_deg`
+- after `stop`, `target_deg` should be frozen near the current reference position
+- a subsequent `move 0 5 5` should return cleanly to zero
+
 ## Development Roadmap
 
 Completed:
@@ -429,9 +654,16 @@ Completed:
 - [x] Add closed-loop PID + S-curve position control
 - [x] Add runtime PID and motion parameter tuning
 - [x] Add selectable trace modes
+- [x] Add header-only runtime logger with `loglvl`
+- [x] Add planner-style `move` command
+- [x] Add smart retarget `moveb` command
+- [x] Refactor motion/planner logic from `main.cpp` into `JointPlanner.h/.cpp`
+- [x] Validate `moveb` blend and safe-replan behavior on real hardware
+- [x] Adjust console prompt formatting to avoid dirty trace/log output
 
 Planned:
 
+- [ ] Extend the planner serial protocol for external planner integration
 - [ ] Add encoder offset calibration workflow
 - [ ] Add configurable software position limits
 - [ ] Add hard fault latch and reset workflow
@@ -443,7 +675,15 @@ Planned:
 
 Work in progress.
 
-The current firmware is a functional closed-loop prototype. It supports real joint position control using AS5048A feedback, TMC2209 velocity control, persistent runtime tuning, trace-based analysis and conservative safe defaults for hardware bring-up.
+The current firmware is a functional closed-loop prototype. It supports real joint position control using AS5048A feedback, TMC2209 velocity control, persistent runtime tuning, trace-based analysis, conservative safe defaults for hardware bring-up, runtime logging, and a separated motion/planner module ready to be extended toward external planner integration.
+
+The planner refactor has been compiled and tested on real hardware. The currently validated behavior includes:
+
+- normal point-to-point move
+- smart retarget move
+- blend when the new target is compatible with the current motion
+- safe replan when the target requires braking or direction reversal
+- clean stop and restart from the stopped position
 
 ## License
 
