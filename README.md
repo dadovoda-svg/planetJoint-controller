@@ -23,7 +23,7 @@ The firmware is built with the Arduino framework and PlatformIO.
 - STEP/DIR motor velocity control
 - Closed-loop joint position control
 - PID + S-curve motion controller
-- Runtime tunable PID, feed-forward, motion profile and settling parameters
+- Runtime tunable PID, feed-forward, motion profile, settling and motor hold parameters
 - `stdeg` calibration routine for estimating motor microsteps per real joint degree
 - Direct velocity test mode in real joint degrees/second
 - Direct STEP/DIR pulse test mode
@@ -33,6 +33,7 @@ The firmware is built with the Arduino framework and PlatformIO.
 - Dedicated serial interface object passed to the planner constructor for future external planner integration
 - Persistent configuration storage in ESP32 NVS
 - Header-only logger with selectable runtime log level
+- Optional motor hold at target using TMC2209 `IHOLD` current
 - Selectable trace modes for tuning, overshoot analysis and diagnostics
 - WS2812 RGB LED diagnostic state machine
 - Modular source layout with motion/planner logic separated from `main.cpp`
@@ -227,7 +228,7 @@ Trace lines are separate from logger lines. Trace lines remain plotter-friendly 
 | `pos <deg>` | Move to target position relative to zero using the default position command |
 | `move <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]` | Planner-style move with explicit motion limits |
 | `moveb <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]` | Planner-style smart retarget move |
-| `stop` | Stop all motion |
+| `stop` | Stop all motion and disable the motor bridge |
 | `servo` | Print controller status |
 | `trace` | Toggle trace output using the current trace mode |
 | `trace on` | Enable trace output |
@@ -333,20 +334,55 @@ Normally `outmax` should be slightly higher than `vmax`, so the controller has a
 | `dbvel` | Deadband velocity threshold, deg/s | `0.20` |
 | `vtau` | Measured velocity low-pass filter tau, seconds | `0.050` |
 
-### Motor and Driver
+### Motor, Driver and Hold Behavior
 
-| Key | Meaning |
-|---|---|
-| `stdeg` | Motor microsteps per real joint degree |
-| `ustep` | TMC2209 microstep setting |
-| `irun` | TMC2209 run current scale |
-| `ihold` | TMC2209 hold current scale |
+| Key | Meaning | Default |
+|---|---|---:|
+| `stdeg` | Motor microsteps per real joint degree | `100.0` |
+| `ustep` | TMC2209 microstep setting | `16` |
+| `irun` | TMC2209 run current scale | `10` |
+| `ihold` | TMC2209 hold current scale | `4` |
+| `mhold` | Motor behavior after a completed position move: `0` disables the bridge, `1` keeps the driver enabled at hold current | `0` |
 
 The velocity conversion is:
 
 ```text
 microsteps_per_second = joint_deg_per_second * stdeg
 ```
+
+### Motor Hold at Target
+
+The default behavior remains conservative:
+
+```text
+set mhold 0
+```
+
+With `mhold = 0`, a position command enables the TMC2209 driver at the start of the move and disables the motor bridge when the target is reached.
+
+For a loaded joint, this may not be acceptable because the axis may not be able to hold its position with the motor disabled. In that case enable hold mode:
+
+```text
+set mhold 1
+save
+```
+
+With `mhold = 1`, when the target is reached the firmware commands zero velocity and leaves the TMC2209 driver enabled. The TMC2209 then drops to the configured hold current through its `IHOLD/TPOWERDOWN` behavior, so the joint remains energized without staying at full run current.
+
+In this mode the motor is intentionally disabled with:
+
+```text
+stop
+```
+
+Fault conditions still disable the driver for safety.
+
+| Situation | `mhold=0` | `mhold=1` |
+|---|---|---|
+| Position move starts | Driver enabled | Driver enabled |
+| Target reached | Driver disabled | Driver remains enabled and transitions to hold current |
+| `stop` command | Driver disabled | Driver disabled |
+| Encoder/controller fault | Driver disabled | Driver disabled |
 
 ### Logging
 
@@ -610,6 +646,15 @@ Only after stable tests:
 save
 ```
 
+If the mechanical load requires the joint to remain energized at the target:
+
+```text
+set mhold 1
+save
+```
+
+Use `stop` when you intentionally want to disable the motor.
+
 Recommended planner validation sequence:
 
 ```text
@@ -660,6 +705,7 @@ Completed:
 - [x] Refactor motion/planner logic from `main.cpp` into `JointPlanner.h/.cpp`
 - [x] Validate `moveb` blend and safe-replan behavior on real hardware
 - [x] Adjust console prompt formatting to avoid dirty trace/log output
+- [x] Add configurable motor hold at target with `mhold`
 
 Planned:
 

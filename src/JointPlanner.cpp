@@ -203,7 +203,12 @@ bool JointPlanner::moveTo(const JointMoveCommand& cmd)
   const float safeVmax = constrain(fabsf(cmd.vmaxDegS), 0.01f, PLANNER_HARD_VMAX_LIMIT_DEG_S);
   const float safeAmax = constrain(fabsf(cmd.amaxDegS2), 0.01f, PLANNER_HARD_AMAX_LIMIT_DEG_S2);
 
-  stopMotion();
+  // If another motion/test mode is active, stop it first.
+  // If we are already IDLE but the driver is intentionally holding position,
+  // do not briefly disable/re-enable the bridge before the next move.
+  if (motionMode != MotionMode::IDLE) {
+    stopMotion();
+  }
 
   if (!ensureDriverEnabled()) {
     motionMode = MotionMode::FAULT;
@@ -293,8 +298,9 @@ bool JointPlanner::moveToBlended(const JointMoveCommand& cmd)
   // If another manual/test mode is running, stop it and start the blended move
   // from the current zeroed position. If we are already in POSITION mode, do
   // NOT call stopMotion(), because it intentionally disables the driver and
-  // resets the internal reference velocity.
-  if (!alreadyPositioning) {
+  // resets the internal reference velocity. If we are IDLE but holding the
+  // motor enabled at target, keep the bridge enabled for a clean restart.
+  if (!alreadyPositioning && motionMode != MotionMode::IDLE) {
     stopMotion();
   }
 

@@ -227,6 +227,12 @@ static float stepsPerDegree()
   return value;
 }
 
+static bool motorHoldEnabled()
+{
+  const float value = readParamFloatOrDefault("mhold", 0.0f);
+  return isfinite(value) && value >= 0.5f;
+}
+
 
 static void applyLogLevelFromParams(bool announce)
 {
@@ -264,6 +270,7 @@ void paramsInit()
   params.initKey("ihold", 4.0f);
   params.initKey("stdeg", 100.0f); // motor microsteps per real joint degree
   params.initKey("loglvl", 2.0f); // 0=OFF, 1=ERR, 2=NFO, 3=DBG
+  params.initKey("mhold", 0.0f); // 0=disable driver at target, 1=keep driver enabled at IHOLD
 
   // PID + S-curve controller parameters.
   // Key names are intentionally short because PersistentParams allows max 6 chars.
@@ -429,6 +436,11 @@ void onConsoleParamSet(const char* key)
 
   if (strcmp(key, "loglvl") == 0) {
     applyLogLevelFromParams(true);
+    return;
+  }
+
+  if (strcmp(key, "mhold") == 0) {
+    LOG_NFO("motor hold at target %s\r\n", motorHoldEnabled() ? "enabled" : "disabled");
     return;
   }
 
@@ -969,7 +981,9 @@ void setZero()
   servoLastCmdDegS = 0.0f;
 
   tmc.stopInternalMotion();
-  tmc.disableDriver(false);
+  if (!motorHoldEnabled()) {
+    tmc.disableDriver(false);
+  }
 
   // Reset continuous tracking so the current physical position becomes a clean software origin.
   encoder.resetContinuousTracking();
@@ -1002,8 +1016,10 @@ void setZero()
 void printServoStatus()
 {
   const float zeroed = jointGetPositionDeg();
-  Serial.printf("mode=%s enc=%.3f joint=%.3f zeroed=%.3f target=%.3f ref=%.3f refv=%.3f measv=%.3f cmd=%.3f stdeg=%.6f fault=%u\r\n",
+  Serial.printf("mode=%s tmc=%u hold=%u enc=%.3f joint=%.3f zeroed=%.3f target=%.3f ref=%.3f refv=%.3f measv=%.3f cmd=%.3f stdeg=%.6f fault=%u\r\n",
                 motionModeName(motionMode),
+                static_cast<unsigned>(tmc.status()),
+                motorHoldEnabled() ? 1u : 0u,
                 encoderDeg,
                 jointDeg,
                 zeroed,
@@ -1086,11 +1102,18 @@ void servoUpdate()
 
   if (jointCtrl.isSettled()) {
     setMotorVelocityDegPerSecond(0.0f);
-    tmc.disableDriver(false);
+    tmc.stopInternalMotion();
+
+    if (!motorHoldEnabled()) {
+      tmc.disableDriver(false);
+    }
+
     motionMode = MotionMode::IDLE;
     servoLastCmdDegS = 0.0f;
     wsSetState(LedState::READY);
-    LOG_NFO("Move complete zeroed=%.3f deg\r\n", jointGetPositionDeg());
+    LOG_NFO("Move complete zeroed=%.3f deg motor=%s\r\n",
+            jointGetPositionDeg(),
+            motorHoldEnabled() ? "hold" : "disabled");
   }
 }
 
@@ -1137,7 +1160,7 @@ void setup()
   LOG_NFO("Init complete\r\n");
   LOG_NFO("First tests: use zero, then pos 1, pos 0, pos -1.\r\n");
   LOG_NFO("MOTOR_DIRECTION_SIGN=-1.0 from real hardware tests.\r\n");
-  LOG_NFO("Runtime params: kp ki kd ffv ilim vmax amax sct outmax ptol vtol dbent dbext dbvel vtau loglvl.\r\n");
+  LOG_NFO("Runtime params: kp ki kd ffv ilim vmax amax sct outmax ptol vtol dbent dbext dbvel vtau loglvl mhold.\r\n");
   LOG_NFO("trace toggles on/off; trace 0..4 selects output mode.\r\n");
   LOG_NFO("Example: set kp 1.0 / set vmax 3.0 / save\r\n");
 

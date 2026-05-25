@@ -130,7 +130,7 @@ const SerialConsole::Command SerialConsole::_commands[] = {
   {
     "stop",
     "stop",
-    "ferma immediatamente ogni movimento",
+    "ferma ogni movimento e disabilita il motore",
     &SerialConsole::cmdStop
   },
   {
