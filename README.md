@@ -4,7 +4,7 @@ Firmware for a planetary gearbox actuator using an ESP32-S3 controller board.
 
 This project implements a compact closed-loop joint controller based on:
 
-- an AS5048A 14-bit magnetic absolute encoder over SPI
+- a compile-time selectable magnetic absolute encoder: AS5048A 14-bit SPI or AS5600 12-bit I2C
 - a Trinamic TMC2209 stepper motor driver configured over UART
 - a stepper motor driving a planetary gearbox actuator
 - a PID + S-curve position controller running on an ESP32-S3
@@ -14,7 +14,7 @@ The firmware is built with the Arduino framework and PlatformIO.
 
 ## Key Features
 
-- AS5048A 14-bit SPI encoder support
+- compile-time selectable AS5048A 14-bit SPI or AS5600 12-bit I2C encoder support
 - Raw encoder angle reading
 - Continuous multi-turn angle tracking
 - Mechanical angle scaling between encoder rotation and real joint motion

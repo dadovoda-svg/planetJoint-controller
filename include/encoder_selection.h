@@ -1,0 +1,15 @@
+#pragma once
+
+// Compile-time magnetic encoder selection.
+// Set MAGNETIC_ENCODER_TYPE from PlatformIO build_flags.
+#define MAGNETIC_ENCODER_AS5048A 1
+#define MAGNETIC_ENCODER_AS5600  2
+
+#ifndef MAGNETIC_ENCODER_TYPE
+#define MAGNETIC_ENCODER_TYPE MAGNETIC_ENCODER_AS5048A
+#endif
+
+#if (MAGNETIC_ENCODER_TYPE != MAGNETIC_ENCODER_AS5048A) && \
+    (MAGNETIC_ENCODER_TYPE != MAGNETIC_ENCODER_AS5600)
+#error "Unsupported MAGNETIC_ENCODER_TYPE"
+#endif

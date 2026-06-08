@@ -1,9 +1,18 @@
 #include <Arduino.h>
 #include <SPI.h>
+#include <Wire.h>
 #include <math.h>
 
 #include "led_status.h"
+#include "encoder_selection.h"
+
+#if MAGNETIC_ENCODER_TYPE == MAGNETIC_ENCODER_AS5048A
 #include "as5048a.h"
+using MagneticEncoder = AS5048A;
+#elif MAGNETIC_ENCODER_TYPE == MAGNETIC_ENCODER_AS5600
+#include "as5600.h"
+using MagneticEncoder = AS5600;
+#endif
 #include "params.h"
 #include "SerialConsole.h"
 #include "Tmc2209Driver.h"
@@ -19,10 +28,13 @@ static constexpr uint32_t TMC_BAUD    = 230400;
 
 // ===================== PIN MAP =====================
 
-static constexpr int PIN_AS5048_SCK  = 12;  // SCK = CLK
-static constexpr int PIN_AS5048_MISO = 13;  // MISO = DOUT
-static constexpr int PIN_AS5048_MOSI = 11;  // MOSI = DIN
-static constexpr int PIN_AS5048_CS   = 10;  // CS
+static constexpr int PIN_ENCODER_SCK  = 12;  // AS5048A SCK = CLK
+static constexpr int PIN_ENCODER_MISO = 13;  // AS5048A MISO = DOUT;  AS5600 SDA (white)
+static constexpr int PIN_ENCODER_MOSI = 11;  // AS5048A MOSI = DIN;   AS5600 SCL (yellow)
+static constexpr int PIN_ENCODER_CS   = 10;  // AS5048A CS;           unused by AS5600
+
+static constexpr uint32_t AS5600_I2C_CLOCK_HZ = 400000;
+static constexpr uint8_t AS5600_I2C_ADDRESS = 0x36;
 
 static constexpr int PIN_TMC_TX   = 7;  // ESP32 TX -> PDN_UART through 1k
 static constexpr int PIN_TMC_RX   = 8;  // ESP32 RX -> PDN_UART
@@ -116,12 +128,17 @@ Tmc2209Driver::Config tmcConfig {
 
 // ===================== OBJECTS =====================
 
+#if MAGNETIC_ENCODER_TYPE == MAGNETIC_ENCODER_AS5048A
 SPIClass EncoderSPI(HSPI);
+MagneticEncoder encoder(EncoderSPI, PIN_ENCODER_CS);
+#elif MAGNETIC_ENCODER_TYPE == MAGNETIC_ENCODER_AS5600
+TwoWire EncoderI2C(0);
+MagneticEncoder encoder(EncoderI2C, AS5600_I2C_ADDRESS);
+#endif
 
 HardwareSerial SerialFuture(0);
 HardwareSerial SerialTMC(2);
 
-AS5048A encoder(EncoderSPI, PIN_AS5048_CS);
 Tmc2209Driver tmc(SerialTMC, tmcPins, tmcConfig);
 SCurvePosVelController jointCtrl;
 
@@ -624,13 +641,23 @@ void onConsoleParamSet(const char* key)
 
 void encoderInit()
 {
-  EncoderSPI.begin(PIN_AS5048_SCK, PIN_AS5048_MISO, PIN_AS5048_MOSI, PIN_AS5048_CS);
+#if MAGNETIC_ENCODER_TYPE == MAGNETIC_ENCODER_AS5048A
+  EncoderSPI.begin(PIN_ENCODER_SCK, PIN_ENCODER_MISO, PIN_ENCODER_MOSI, PIN_ENCODER_CS);
+  LOG_NFO("HSPI initialized for AS5048A\r\n");
+#elif MAGNETIC_ENCODER_TYPE == MAGNETIC_ENCODER_AS5600
+  EncoderI2C.begin(PIN_ENCODER_MISO, PIN_ENCODER_MOSI, AS5600_I2C_CLOCK_HZ);
+  LOG_NFO("I2C initialized for AS5600: SDA=%d SCL=%d clock=%lu Hz address=0x%02X\r\n",
+          PIN_ENCODER_MISO,
+          PIN_ENCODER_MOSI,
+          static_cast<unsigned long>(AS5600_I2C_CLOCK_HZ),
+          AS5600_I2C_ADDRESS);
+#endif
+
   encoder.begin();
   encoder.setOutputDegreesPerEncoderRevolution(jointDegreesPerEncoderRevolution());
 
-  LOG_NFO("HSPI initialized for AS5048A\r\n");
   LOG_NFO("Encoder scale: 360.000 encoder deg = %.6f joint deg\r\n",
-                encoder.outputDegreesPerEncoderRevolution());
+          encoder.outputDegreesPerEncoderRevolution());
 }
 
 bool encoderFirstReadTest()
@@ -640,14 +667,24 @@ bool encoderFirstReadTest()
   encoderDeg = encoder.lastDegrees();
 
   if (encoderOk) {
-    LOG_NFO("AS5048A first read raw=%u enc_angle=%.3f deg joint_unrolled=%.3f deg\r\n",
+#if MAGNETIC_ENCODER_TYPE == MAGNETIC_ENCODER_AS5048A
+    const char* encoderName = "AS5048A";
+#else
+    const char* encoderName = "AS5600";
+#endif
+    LOG_NFO("%s first read raw14=%u enc_angle=%.3f deg joint_unrolled=%.3f deg\r\n",
+            encoderName,
             encoderRaw,
             encoderDeg,
             jointDeg);
     return true;
   }
 
+#if MAGNETIC_ENCODER_TYPE == MAGNETIC_ENCODER_AS5048A
   LOG_ERR("AS5048A first read failed\r\n");
+#else
+  LOG_ERR("AS5600 first read failed\r\n");
+#endif
   return false;
 }
 
@@ -1333,7 +1370,11 @@ void setup()
   delay(500);
 
   Serial.println();
+  #if MAGNETIC_ENCODER_TYPE == MAGNETIC_ENCODER_AS5048A
   LOG_NFO("PlanetJoint ESP32-S3 - AS5048A PID+S-curve build\r\n");
+#else
+  LOG_NFO("PlanetJoint ESP32-S3 - AS5600 PID+S-curve build\r\n");
+#endif
   LOG_NFO("USB CDC console ready\r\n");
 
   paramsInit();
