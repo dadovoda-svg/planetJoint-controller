@@ -23,7 +23,7 @@ The firmware is built with the Arduino framework and PlatformIO.
 - STEP/DIR motor velocity control
 - Closed-loop joint position control
 - PID + S-curve motion controller
-- Runtime tunable PID, feed-forward, motion profile, settling and motor hold parameters
+- Runtime tunable PID, feed-forward, motion profile, settling, encoder scale, motor hold and joint travel limit parameters
 - `stdeg` calibration routine for estimating motor microsteps per real joint degree
 - Direct velocity test mode in real joint degrees/second
 - Direct STEP/DIR pulse test mode
@@ -34,6 +34,7 @@ The firmware is built with the Arduino framework and PlatformIO.
 - Persistent configuration storage in ESP32 NVS
 - Header-only logger with selectable runtime log level
 - Optional motor hold at target using TMC2209 `IHOLD` current
+- Configurable joint travel window with target clipping and out-of-range fault latch
 - Selectable trace modes for tuning, overshoot analysis and diagnostics
 - WS2812 RGB LED diagnostic state machine
 - Modular source layout with motion/planner logic separated from `main.cpp`
@@ -49,11 +50,29 @@ The firmware is built with the Arduino framework and PlatformIO.
 
 The encoder does not map 1:1 to real joint movement.
 
-In the current mechanism:
+In the reference mechanism the default scale is:
 
 ```text
 360 encoder degrees = 15.6 real joint degrees
 ```
+
+This value is no longer hardcoded as the only usable mechanical ratio. It is now exposed as the persistent runtime parameter:
+
+```text
+jrev
+```
+
+`jrev` means **real joint degrees per one full encoder revolution**.
+
+Examples:
+
+```text
+get jrev
+set jrev 15.6
+save
+```
+
+Changing `jrev` lets the same firmware adapt to different planetary joint mechanical configurations.
 
 Therefore the firmware distinguishes between:
 
@@ -79,6 +98,7 @@ README_PLANNER_API_FIX.md
 README_BLENDED_MOVE.md
 README_MOVEB_RETARGET_FIX.md
 README_PLANNER_REFACTOR.md
+README_JOINT_LIMITS.md
 
 src/
 ├── main.cpp
@@ -323,6 +343,34 @@ All parameter keys are limited to 6 characters.
 
 Normally `outmax` should be slightly higher than `vmax`, so the controller has a small correction margin without being overly aggressive.
 
+### Joint Travel Limits
+
+All joint limit parameters are expressed in zeroed real joint degrees.
+
+| Key | Meaning | Default |
+|---|---|---:|
+| `jmin` | Minimum allowed target position | `-170.0` |
+| `jmax` | Maximum allowed target position | `170.0` |
+| `jtol` | Allowed measured overshoot outside `jmin`/`jmax` before fault latch | `1.0` |
+
+The interval `[jmin, jmax]` is a clipping window for commanded targets. If a command asks for a target below `jmin` or above `jmax`, the firmware does not reject the move; it emits an informational warning and clips the target to the nearest limit.
+
+Example:
+
+```text
+set jmin -90
+set jmax 90
+set jtol 1
+save
+
+move 120 5 5     # target is clipped to +90 deg
+moveb -120 5 5   # target is clipped to -90 deg
+```
+
+During motion, a small PID ringing overshoot is allowed. With the default `jtol=1.0`, the measured zeroed joint position may temporarily reach `jmin - 1.0` or `jmax + 1.0`. If the measured position goes beyond that fault window, the firmware latches `MotionMode::FAULT`, commands zero velocity, disables the driver bridge, and blocks further movement commands.
+
+`stop` still disables the motor, but it does not hide a real out-of-range condition. After a limit fault, check the mechanics before continuing.
+
 ### Settling, Deadband and Velocity Estimate
 
 | Key | Meaning | Default |
@@ -343,12 +391,34 @@ Normally `outmax` should be slightly higher than `vmax`, so the controller has a
 | `irun` | TMC2209 run current scale | `10` |
 | `ihold` | TMC2209 hold current scale | `4` |
 | `mhold` | Motor behavior after a completed position move: `0` disables the bridge, `1` keeps the driver enabled at hold current | `0` |
+| `jrev` | Real joint degrees per one complete encoder revolution | `15.6` |
 
 The velocity conversion is:
 
 ```text
 microsteps_per_second = joint_deg_per_second * stdeg
 ```
+
+The encoder-to-joint scale conversion is:
+
+```text
+joint_degrees = continuous_encoder_revolutions * jrev
+```
+
+For the current reference mechanics:
+
+```text
+jrev = 15.6
+```
+
+If the mechanical ratio changes, update `jrev`, then save it:
+
+```text
+set jrev <joint_degrees_per_encoder_revolution>
+save
+```
+
+`jrev` must be greater than zero. Invalid values are rejected at runtime. When `jrev` is changed from the console, the firmware stops current motion, applies the new scale, and preserves the current zeroed position as much as possible to avoid a sudden coordinate jump. For a mechanically meaningful setup, it is still recommended to run `zero` after changing the mechanical scale.
 
 ### Motor Hold at Target
 
@@ -389,6 +459,39 @@ Fault conditions still disable the driver for safety.
 | Key | Meaning | Default |
 |---|---|---:|
 | `loglvl` | Runtime logger level: 0 off, 1 error, 2 info, 3 debug | `2` |
+
+## Encoder Scale Parameter `jrev`
+
+`jrev` configures the mechanical relationship between the AS5048A encoder and the real joint output.
+
+```text
+jrev = real joint degrees per one full 360° encoder revolution
+```
+
+Default:
+
+```text
+jrev = 15.6
+```
+
+This parameter replaces the previous hardcoded internal constant used for:
+
+```text
+360 encoder degrees = 15.6 real joint degrees
+```
+
+Use it when the same firmware is installed on a joint with a different encoder/magnet/gearbox relationship.
+
+Typical setup sequence:
+
+```text
+stop
+set jrev 15.6
+zero
+save
+```
+
+After changing `jrev`, review `stdeg` as well: `jrev` changes the measured joint angle scale, while `stdeg` converts commanded joint velocity to motor microsteps. They represent two different parts of the mechanism and both must be coherent.
 
 ## `stdeg` Calibration
 
@@ -522,7 +625,7 @@ continuous angle:  350° -> 355° -> 362° -> 368°
 Then the firmware scales encoder revolutions to real joint movement:
 
 ```text
-joint_degrees = continuous_encoder_counts * 15.6 / 16384
+joint_degrees = continuous_encoder_counts * jrev / 16384
 ```
 
 ### Important Reliability Notes
@@ -564,7 +667,7 @@ Current supported environment:
 
 ```ini
 [env:esp32-s3-fh4r2]
-platform = https://github.com/pioarduino/platform-espressif32/releases/download/55.03.30-2/platform-espressif32.zip
+platform = https://github.com/pioarduino/platform-espressif32/releases/download/55.03.38-1/platform-espressif32.zip
 framework = arduino
 board = esp32-s3-fh4r2
 
@@ -706,12 +809,13 @@ Completed:
 - [x] Validate `moveb` blend and safe-replan behavior on real hardware
 - [x] Adjust console prompt formatting to avoid dirty trace/log output
 - [x] Add configurable motor hold at target with `mhold`
+- [x] Replace hardcoded encoder-to-joint mechanical scale with persistent `jrev` parameter
+- [x] Add configurable software joint travel limits with target clipping and fault latch
 
 Planned:
 
 - [ ] Extend the planner serial protocol for external planner integration
 - [ ] Add encoder offset calibration workflow
-- [ ] Add configurable software position limits
 - [ ] Add hard fault latch and reset workflow
 - [ ] Add more complete safety handling
 - [ ] Add homing/calibration procedures if required by the final mechanics
@@ -721,7 +825,7 @@ Planned:
 
 Work in progress.
 
-The current firmware is a functional closed-loop prototype. It supports real joint position control using AS5048A feedback, TMC2209 velocity control, persistent runtime tuning, trace-based analysis, conservative safe defaults for hardware bring-up, runtime logging, and a separated motion/planner module ready to be extended toward external planner integration.
+The current firmware is a functional closed-loop prototype. It supports real joint position control using AS5048A feedback, TMC2209 velocity control, persistent runtime tuning, trace-based analysis, conservative safe defaults for hardware bring-up, runtime logging, configurable encoder-to-joint scaling through `jrev`, configurable joint limits through `jmin`/`jmax`/`jtol`, and a separated motion/planner module ready to be extended toward external planner integration.
 
 The planner refactor has been compiled and tested on real hardware. The currently validated behavior includes:
 

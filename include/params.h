@@ -166,10 +166,10 @@ public:
         }
 
         /*
-        * Merge implicita:
-        * - aggiorna solo le chiavi già dichiarate con initKey()
-        * - ignora le chiavi obsolete presenti in NVS
-        * - mantiene i default delle chiavi nuove
+        * Implicit merge:
+        * - update only keys already declared with initKey()
+        * - ignore obsolete keys stored in NVS
+        * - keep default values for newly added keys
         */
         for (uint8_t i = 0; i < image.count; i++) {
             int ramIndex = findIndex(image.items[i].key);

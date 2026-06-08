@@ -27,6 +27,7 @@ extern void stopMotion();
 extern float jointGetPositionDeg();
 extern float readParamMinOrDefault(const char* key, float fallback, float minValue);
 extern void printServoStatus();
+extern bool jointClipTargetToLimits(float requestedDeg, float& clippedDeg);
 
 static constexpr float SERVO_VMAX_DEG_S       = 2.0f;
 static constexpr float SERVO_AMAX_DEG_S2      = 6.0f;
@@ -203,6 +204,12 @@ bool JointPlanner::moveTo(const JointMoveCommand& cmd)
   const float safeVmax = constrain(fabsf(cmd.vmaxDegS), 0.01f, PLANNER_HARD_VMAX_LIMIT_DEG_S);
   const float safeAmax = constrain(fabsf(cmd.amaxDegS2), 0.01f, PLANNER_HARD_AMAX_LIMIT_DEG_S2);
 
+  float clippedTargetDeg = cmd.targetDeg;
+  if (!jointClipTargetToLimits(cmd.targetDeg, clippedTargetDeg)) {
+    Serial.println("[ERR] Invalid joint limit configuration");
+    return false;
+  }
+
   // If another motion/test mode is active, stop it first.
   // If we are already IDLE but the driver is intentionally holding position,
   // do not briefly disable/re-enable the bridge before the next move.
@@ -231,15 +238,15 @@ bool JointPlanner::moveTo(const JointMoveCommand& cmd)
 
   // IMPORTANT: controller coordinates are zeroed joint degrees.
   const float currentZeroedDeg = jointGetPositionDeg();
-  servoTargetZeroedDeg = cmd.targetDeg;
+  servoTargetZeroedDeg = clippedTargetDeg;
   jointCtrl.reset(currentZeroedDeg);
-  jointCtrl.setTarget(cmd.targetDeg);
+  jointCtrl.setTarget(clippedTargetDeg);
 
   lastServoUs = micros();
   motionMode = MotionMode::POSITION;
 
-  LOG_NFO("MOVE target=%.3f deg current=%.3f deg vmax=%.3f deg/s amax=%.3f deg/s2\r\n",
-                cmd.targetDeg, currentZeroedDeg, safeVmax, safeAmax);
+  LOG_NFO("MOVE target=%.3f deg requested=%.3f deg current=%.3f deg vmax=%.3f deg/s amax=%.3f deg/s2\r\n",
+                clippedTargetDeg, cmd.targetDeg, currentZeroedDeg, safeVmax, safeAmax);
   return true;
 }
 
@@ -292,6 +299,12 @@ bool JointPlanner::moveToBlended(const JointMoveCommand& cmd)
   const float safeVmax = constrain(fabsf(cmd.vmaxDegS), 0.01f, PLANNER_HARD_VMAX_LIMIT_DEG_S);
   const float safeAmax = constrain(fabsf(cmd.amaxDegS2), 0.01f, PLANNER_HARD_AMAX_LIMIT_DEG_S2);
 
+  float clippedTargetDeg = cmd.targetDeg;
+  if (!jointClipTargetToLimits(cmd.targetDeg, clippedTargetDeg)) {
+    Serial.println("[ERR] Invalid joint limit configuration");
+    return false;
+  }
+
   const bool alreadyPositioning = (motionMode == MotionMode::POSITION);
   const bool driverAlreadyEnabled = (tmc.status() == Tmc2209Driver::Status::Enabled);
 
@@ -331,11 +344,11 @@ bool JointPlanner::moveToBlended(const JointMoveCommand& cmd)
   }
 
   const float currentZeroedDeg = jointGetPositionDeg();
-  servoTargetZeroedDeg = cmd.targetDeg;
+  servoTargetZeroedDeg = clippedTargetDeg;
 
   const float refPos = jointCtrl.refPos();
   const float refVel = jointCtrl.refVel();
-  const float distToNewTarget = cmd.targetDeg - refPos;
+  const float distToNewTarget = clippedTargetDeg - refPos;
 
   static constexpr float BLEND_MIN_REF_VEL_DEG_S = 0.02f;
 
@@ -348,7 +361,7 @@ bool JointPlanner::moveToBlended(const JointMoveCommand& cmd)
   if (alreadyPositioning && targetAheadOfVelocity) {
     // Good case: the new target is compatible with the current reference
     // velocity. Keep ref_pos/ref_vel/ref_acc and only update the target.
-    jointCtrl.setTargetBlended(cmd.targetDeg);
+    jointCtrl.setTargetBlended(clippedTargetDeg);
     fullBlend = true;
   } else {
     // First segment, or reversal / ambiguous target.
@@ -356,14 +369,15 @@ bool JointPlanner::moveToBlended(const JointMoveCommand& cmd)
     // This intentionally drops the internal reference velocity to zero instead
     // of carrying a velocity that would push the joint further away.
     jointCtrl.reset(currentZeroedDeg);
-    jointCtrl.setTarget(cmd.targetDeg);
+    jointCtrl.setTarget(clippedTargetDeg);
     fullBlend = false;
   }
 
   lastServoUs = micros();
   motionMode = MotionMode::POSITION;
 
-  LOG_NFO("MOVEB target=%.3f deg current=%.3f deg vmax=%.3f deg/s amax=%.3f deg/s2 mode=%s\r\n",
+  LOG_NFO("MOVEB target=%.3f deg requested=%.3f deg current=%.3f deg vmax=%.3f deg/s amax=%.3f deg/s2 mode=%s\r\n",
+                clippedTargetDeg,
                 cmd.targetDeg,
                 currentZeroedDeg,
                 safeVmax,

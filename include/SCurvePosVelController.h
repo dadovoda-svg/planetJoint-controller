@@ -8,13 +8,13 @@ public:
     float v_max = 0.0f;     // [deg/s]
     float a_max = 0.0f;     // [deg/s^2]
     float j_max = 0.0f;     // [deg/s^3]
-    float out_max = -1.0f;   // [deg/s] clamp finale (default = v_max)
+    float out_max = -1.0f;   // [deg/s] final clamp (default = v_max)
   };
 
   struct Gains {
     float kp = 0.0f;
     float ki = 0.0f;
-    float kd = 0.0f;        // usato come D su misura (consigliato)
+    float kd = 0.0f;        // used as derivative on measurement (recommended)
     float ff_vel = 1.0f;
   };
 
@@ -71,11 +71,12 @@ public:
   }
 
   // Hard mechanical limits: must NEVER be exceeded.
-  // stop_margin_deg: zona di guardia interna dove blocchiamo i comandi che spingono "verso fuori"
-  void setPositionLimits(float pos_min_deg, float pos_max_deg, float stop_margin_deg = 0.5f) {
+  // stop_margin_deg: internal guard band where commands pushing outward are blocked
+  void setPositionLimits(float pos_min_deg, float pos_max_deg, float stop_margin_deg = 0.5f, float fault_margin_deg = 0.0f) {
     _pos_min = pos_min_deg;
     _pos_max = pos_max_deg;
     _stop_margin = fabsf(stop_margin_deg);
+    _fault_margin = fabsf(fault_margin_deg);
     _limits_enabled = true;
 
     if (_pos_max <= _pos_min) {
@@ -98,6 +99,21 @@ public:
     _i_term = 0.0f;
     _ref_vel = 0.0f;
     _ref_acc = 0.0f;
+  }
+
+  void latchPositionLimitFault(float measured_pos) {
+    _fault = FaultCode::PositionLimitExceeded;
+    _fault_latched = true;
+    _i_term = 0.0f;
+    _ref_vel = 0.0f;
+    _ref_acc = 0.0f;
+    _ref_pos = _limits_enabled ? clampf(measured_pos, _pos_min, _pos_max) : measured_pos;
+    _target = _ref_pos;
+    _prev_meas = _ref_pos;
+    _has_prev = false;
+    _meas_vel_f = 0.0f;
+    _last_meas_pos = _ref_pos;
+    _last_meas_vel = 0.0f;
   }
 
   // ---------- Lifecycle ----------
@@ -136,7 +152,7 @@ public:
     }
 
     _target_gen++;          // NEW: target changed
-    _db_active = false;     // consigliato: esci dalla deadband quando cambia target
+    _db_active = false;     // recommended: leave deadband when the target changes
   }
 
   // Blended target update: keeps the current internal reference state
@@ -170,7 +186,7 @@ public:
 
     // 0) HARD SAFETY CHECK: measured position must be inside limits.
     if (_limits_enabled) {
-      if (measured_pos < _pos_min || measured_pos > _pos_max) {
+      if (measured_pos < (_pos_min - _fault_margin) || measured_pos > (_pos_max + _fault_margin)) {
         // Immediate stop + latch fault
         _fault = FaultCode::PositionLimitExceeded;
         _fault_latched = true;
@@ -278,7 +294,7 @@ public:
     //const float d = -_g.kd * meas_vel;
     const float d = -_g.kd * meas_vel_used;
 
-    // e solo qui aggiorni lo stato "prev"
+    // update the previous-measurement state only here
     _prev_meas = measured_pos;
     _has_prev = true;
 
@@ -321,9 +337,9 @@ public:
   }
 
   // Deadband (position) with hysteresis:
-  // - enter_deg: quando |target - measured| <= enter_deg e la velocità è bassa, fermo e latched
-  // - exit_deg : soglia più alta per uscire (se 0 => exit = enter)
-  // - vel_deg_s: condizione aggiuntiva: serve che la velocità misurata sia bassa per entrare/restare in deadband
+  // - enter_deg: when |target - measured| <= enter_deg and velocity is low, stop and latch
+  // - exit_deg : higher threshold used to leave deadband (if 0 => exit = enter)
+  // - vel_deg_s: additional condition; measured velocity must be low to enter/stay in deadband
   void setDeadband(float enter_deg, float exit_deg = 0.0f, float vel_deg_s = 0.5f) {
     _db_enabled = (enter_deg > 0.0f);
     _db_enter = fabsf(enter_deg);
@@ -351,10 +367,10 @@ public:
 
     if (_meas_gen != _target_gen) return false;   // NEW
 
-    // Se la deadband è attiva, per definizione siamo "fermi a target"
+    // If deadband is active, by definition the controller is stopped at target
     if (_db_enabled && _db_active) return true;
 
-    // Serve una definizione di "settled": usiamo le tolleranze
+    // Settled state definition: use the configured tolerances
     if (_tol.pos <= 0.0f || _tol.vel <= 0.0f) return false;
 
     float tgt = _target;
@@ -393,6 +409,7 @@ private:
   float _pos_min = -INFINITY;
   float _pos_max = +INFINITY;
   float _stop_margin = 0.5f;
+  float _fault_margin = 0.0f;
 
   // fault state
   FaultCode _fault = FaultCode::None;

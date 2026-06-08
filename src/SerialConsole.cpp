@@ -82,61 +82,61 @@ const SerialConsole::Command SerialConsole::_commands[] = {
   {
     "reboot",
     "reboot",
-    "Forza reboot completo del micro",
+    "Force a full MCU reboot",
     &SerialConsole::cmdReboot
   },
   {
     "trace",
     "trace [0..4|on|off]",
-    "abilita/disabilita trace o seleziona il set di valori esportati",
+    "Enable/disable trace or select the exported value set",
     &SerialConsole::cmdTrace
   },
   {
     "go",
     "go <deg/s>",
-    "abilita/disabilita test velocità motore in gradi/sec giunto",
+    "Enable/disable motor velocity test in real joint deg/s",
     &SerialConsole::cmdGo
   },
   {
     "step",
     "step <steps>",
-    "abilita/disabilita test step motore <steps>",
+    "Enable/disable motor STEP/DIR pulse test <steps>",
     &SerialConsole::cmdStep
   },
   {
     "calstdeg",
     "calstdeg [deg]",
-    "stima stdeg muovendo il giunto e misurando l'encoder",
+    "Estimate stdeg by moving the joint and measuring encoder feedback",
     &SerialConsole::cmdCalStdeg
   },
   {
     "pos",
     "pos <deg>",
-    "muove il giunto alla posizione indicata, relativa allo zero",
+    "Move the joint to the requested position, relative to zero",
     &SerialConsole::cmdPos
   },
   {
     "move",
     "move <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]",
-    "planner-style move con target, velocita e accelerazione espliciti",
+    "Planner-style move with explicit target, velocity and acceleration",
     &SerialConsole::cmdMove
   },
   {
     "moveb",
     "moveb <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]",
-    "planner-style blended move senza azzerare la velocita di riferimento",
+    "Planner-style blended move without resetting reference velocity",
     &SerialConsole::cmdMoveBlended
   },
   {
     "stop",
     "stop",
-    "ferma ogni movimento e disabilita il motore",
+    "Stop all motion and disable the motor",
     &SerialConsole::cmdStop
   },
   {
     "servo",
     "servo",
-    "stampa stato controller posizione",
+    "Print position controller status",
     &SerialConsole::cmdServo
   }
 };

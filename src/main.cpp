@@ -32,9 +32,10 @@ static constexpr int PIN_TMC_ENN  = 6;
 
 // ===================== MECHANICAL SCALE =====================
 
-// Real hardware note:
-// one full 360-degree encoder revolution corresponds to 15.6 degrees of real joint motion.
-static constexpr float JOINT_DEGREES_PER_ENCODER_REV = 15.6f;
+// Default mechanical scale.
+// Runtime parameter `jrev` overrides this value:
+// one full 360-degree encoder revolution corresponds to `jrev` degrees of real joint motion.
+static constexpr float DEFAULT_JOINT_DEGREES_PER_ENCODER_REV = 15.6f;
 
 // Direction correction between positive controller output and real positive joint motion.
 // If the first low-speed test moves away from the target, change this to -1.0f.
@@ -63,6 +64,16 @@ static constexpr float SERVO_DEADBAND_EXIT    = 0.12f;
 static constexpr float SERVO_DEADBAND_VEL     = 0.20f;
 static constexpr float SERVO_VEL_FILTER_TAU_S = 0.050f;
 
+// ===================== JOINT POSITION LIMIT DEFAULTS =====================
+
+// All limits are expressed in zeroed real joint degrees.
+// jmin/jmax clip requested targets; jtol is the extra measured overshoot
+// allowed before the firmware latches a fault.
+static constexpr float JOINT_MIN_DEG_DEFAULT = -170.0f;
+static constexpr float JOINT_MAX_DEG_DEFAULT = +170.0f;
+static constexpr float JOINT_LIMIT_TOL_DEFAULT = 1.0f;
+static constexpr float JOINT_LIMIT_STOP_MARGIN_DEG = 0.5f;
+
 
 // ===================== STDEG CALIBRATION =====================
 
@@ -75,10 +86,6 @@ static constexpr uint32_t STDEG_CALIBRATION_STEP_PERIOD_US = 1000;
 static constexpr uint16_t STDEG_CALIBRATION_SETTLE_MS = 300;
 static constexpr uint32_t STDEG_CALIBRATION_ENCODER_SAMPLE_EVERY_STEPS = 20;
 static constexpr float STDEG_CALIBRATION_MIN_DELTA_DEG = 0.25f;
-
-// Disabled for the first build. Enable later when mechanical range is known.
-// static constexpr float SERVO_MIN_DEG = -170.0f;
-// static constexpr float SERVO_MAX_DEG = +170.0f;
 
 // ===================== TMC CONFIG =====================
 
@@ -159,6 +166,10 @@ bool tmcReady = false;
 
 MotionMode motionMode = MotionMode::IDLE;
 
+// Forward declarations for helpers used by parameter callbacks.
+float jointGetPositionDeg();
+void stopMotion();
+
 // ===================== PARAMS =====================
 
 static bool readParamU8(const char* key, uint8_t& out)
@@ -233,6 +244,134 @@ static bool motorHoldEnabled()
   return isfinite(value) && value >= 0.5f;
 }
 
+static float jointDegreesPerEncoderRevolution()
+{
+  float value = readParamFloatOrDefault("jrev", DEFAULT_JOINT_DEGREES_PER_ENCODER_REV);
+
+  if (!isfinite(value) || value <= 0.0f) {
+    value = DEFAULT_JOINT_DEGREES_PER_ENCODER_REV;
+  }
+
+  return value;
+}
+
+static bool readJointLimitParams(float& jmin, float& jmax, float& jtol)
+{
+  jmin = readParamFloatOrDefault("jmin", JOINT_MIN_DEG_DEFAULT);
+  jmax = readParamFloatOrDefault("jmax", JOINT_MAX_DEG_DEFAULT);
+  jtol = readParamFloatOrDefault("jtol", JOINT_LIMIT_TOL_DEFAULT);
+
+  if (!isfinite(jmin) || !isfinite(jmax) || !isfinite(jtol)) {
+    LOG_ERR("Invalid joint limit parameter: non-finite value\r\n");
+    return false;
+  }
+
+  if (jmax <= jmin) {
+    LOG_ERR("Invalid joint limits: jmin=%.3f must be lower than jmax=%.3f\r\n", jmin, jmax);
+    return false;
+  }
+
+  if (jtol < 0.0f) {
+    LOG_ERR("Invalid joint limit tolerance: jtol=%.3f must be >= 0\r\n", jtol);
+    return false;
+  }
+
+  return true;
+}
+
+static bool isJointPositionOutsideFaultWindow(float zeroedDeg)
+{
+  float jmin = 0.0f;
+  float jmax = 0.0f;
+  float jtol = 0.0f;
+
+  if (!readJointLimitParams(jmin, jmax, jtol)) {
+    return true;
+  }
+
+  return zeroedDeg < (jmin - jtol) || zeroedDeg > (jmax + jtol);
+}
+
+bool jointClipTargetToLimits(float requestedDeg, float& clippedDeg)
+{
+  float jmin = 0.0f;
+  float jmax = 0.0f;
+  float jtol = 0.0f;
+
+  if (!readJointLimitParams(jmin, jmax, jtol)) {
+    motionMode = MotionMode::FAULT;
+    wsSetState(LedState::FAULT);
+    clippedDeg = requestedDeg;
+    return false;
+  }
+
+  clippedDeg = constrain(requestedDeg, jmin, jmax);
+
+  if (clippedDeg != requestedDeg) {
+    LOG_NFO("WARNING: requested target %.3f deg clipped to %.3f deg by limits [%.3f, %.3f]\r\n",
+            requestedDeg, clippedDeg, jmin, jmax);
+  }
+
+  return true;
+}
+
+static bool applyJointLimitsFromParams(bool announce)
+{
+  float jmin = 0.0f;
+  float jmax = 0.0f;
+  float jtol = 0.0f;
+
+  if (!readJointLimitParams(jmin, jmax, jtol)) {
+    motionMode = MotionMode::FAULT;
+    wsSetState(LedState::FAULT);
+    jointCtrl.setPositionLimits(JOINT_MIN_DEG_DEFAULT,
+                                JOINT_MAX_DEG_DEFAULT,
+                                JOINT_LIMIT_STOP_MARGIN_DEG,
+                                JOINT_LIMIT_TOL_DEFAULT);
+    LOG_ERR("Joint limit configuration invalid: motion fault latched\r\n");
+    return false;
+  }
+
+  jointCtrl.setPositionLimits(jmin, jmax, JOINT_LIMIT_STOP_MARGIN_DEG, jtol);
+
+  if (announce) {
+    LOG_NFO("Joint limits: jmin=%.3f jmax=%.3f jtol=%.3f deg\r\n", jmin, jmax, jtol);
+  }
+
+  if (encoderOk && isJointPositionOutsideFaultWindow(jointGetPositionDeg())) {
+    motionMode = MotionMode::FAULT;
+    wsSetState(LedState::FAULT);
+    LOG_ERR("Current joint position %.3f deg is outside limits [%.3f, %.3f] with jtol=%.3f\r\n",
+            jointGetPositionDeg(), jmin, jmax, jtol);
+    return false;
+  }
+
+  return true;
+}
+
+static void applyEncoderScaleFromParams(bool preserveZeroedPosition)
+{
+  const float oldZeroed = jointGetPositionDeg();
+  const float jrev = jointDegreesPerEncoderRevolution();
+
+  encoder.setOutputDegreesPerEncoderRevolution(jrev);
+
+  // Recompute the current absolute joint angle from the already unwrapped
+  // encoder angle using the new scale. This avoids waiting for the next
+  // encoder sample and keeps status/trace coherent immediately after set jrev.
+  const float continuousEncoderDeg = encoder.lastContinuousEncoderDegrees();
+  jointDeg = (continuousEncoderDeg * jrev) / 360.0f;
+
+  if (preserveZeroedPosition) {
+    encoderZero = jointDeg - oldZeroed;
+    jointCtrl.reset(oldZeroed);
+    jointCtrl.setTarget(oldZeroed);
+    servoTargetZeroedDeg = oldZeroed;
+  }
+
+  LOG_NFO("Encoder scale: 360.000 encoder deg = %.6f joint deg\r\n",
+          encoder.outputDegreesPerEncoderRevolution());
+}
 
 static void applyLogLevelFromParams(bool announce)
 {
@@ -269,8 +408,14 @@ void paramsInit()
   params.initKey("irun", 10.0f);
   params.initKey("ihold", 4.0f);
   params.initKey("stdeg", 100.0f); // motor microsteps per real joint degree
+  params.initKey("jrev", DEFAULT_JOINT_DEGREES_PER_ENCODER_REV); // real joint degrees per encoder revolution
   params.initKey("loglvl", 2.0f); // 0=OFF, 1=ERR, 2=NFO, 3=DBG
   params.initKey("mhold", 0.0f); // 0=disable driver at target, 1=keep driver enabled at IHOLD
+
+  // Joint safety limits in zeroed real joint degrees.
+  params.initKey("jmin", JOINT_MIN_DEG_DEFAULT);
+  params.initKey("jmax", JOINT_MAX_DEG_DEFAULT);
+  params.initKey("jtol", JOINT_LIMIT_TOL_DEFAULT); // allowed measured overshoot beyond jmin/jmax before fault
 
   // PID + S-curve controller parameters.
   // Key names are intentionally short because PersistentParams allows max 6 chars.
@@ -396,6 +541,7 @@ void applyAllParams()
   applyCurrentScaleFromParams();
   applyMicrostepResolutionFromParams();
   applyControllerParamsFromParams();
+  applyJointLimitsFromParams(true);
 }
 
 void onConsoleParamSet(const char* key)
@@ -444,6 +590,28 @@ void onConsoleParamSet(const char* key)
     return;
   }
 
+  if (strcmp(key, "jmin") == 0 || strcmp(key, "jmax") == 0 || strcmp(key, "jtol") == 0) {
+    applyJointLimitsFromParams(true);
+    LOG_NFO("Use 'save' to persist joint limit changes.\r\n");
+    return;
+  }
+
+  if (strcmp(key, "jrev") == 0) {
+    float requested = 0.0f;
+    if (!params.get("jrev", requested) || !isfinite(requested) || requested <= 0.0f) {
+      params.set("jrev", encoder.outputDegreesPerEncoderRevolution());
+      LOG_ERR("Invalid jrev value rejected. It must be > 0. Current jrev remains %.6f\r\n",
+              encoder.outputDegreesPerEncoderRevolution());
+      return;
+    }
+
+    stopMotion();
+    applyEncoderScaleFromParams(true);
+    LOG_NFO("jrev now %.6f joint deg / encoder rev. Use 'save' to persist it.\r\n",
+            encoder.outputDegreesPerEncoderRevolution());
+    return;
+  }
+
   if (strcmp(key, "stdeg") == 0) {
     LOG_NFO("steps/degree now %.6f microsteps/deg\r\n", stepsPerDegree());
     return;
@@ -458,7 +626,7 @@ void encoderInit()
 {
   EncoderSPI.begin(PIN_AS5048_SCK, PIN_AS5048_MISO, PIN_AS5048_MOSI, PIN_AS5048_CS);
   encoder.begin();
-  encoder.setOutputDegreesPerEncoderRevolution(JOINT_DEGREES_PER_ENCODER_REV);
+  encoder.setOutputDegreesPerEncoderRevolution(jointDegreesPerEncoderRevolution());
 
   LOG_NFO("HSPI initialized for AS5048A\r\n");
   LOG_NFO("Encoder scale: 360.000 encoder deg = %.6f joint deg\r\n",
@@ -654,6 +822,28 @@ bool ensureDriverEnabled()
   return true;
 }
 
+static void latchJointLimitFault(float zeroedDeg)
+{
+  float jmin = 0.0f;
+  float jmax = 0.0f;
+  float jtol = 0.0f;
+  readJointLimitParams(jmin, jmax, jtol);
+
+  if (tmcReady) {
+    setMotorVelocityDegPerSecond(0.0f);
+    tmc.stopInternalMotion();
+    tmc.disableDriver(false);
+  }
+
+  motionMode = MotionMode::FAULT;
+  jointCtrl.setPositionLimits(jmin, jmax, JOINT_LIMIT_STOP_MARGIN_DEG, jtol);
+  jointCtrl.latchPositionLimitFault(zeroedDeg);
+  wsSetState(LedState::FAULT);
+
+  LOG_ERR("Joint limit fault: zeroed=%.3f deg outside allowed window [%.3f, %.3f] plus jtol=%.3f\r\n",
+          zeroedDeg, jmin, jmax, jtol);
+}
+
 void stopMotion()
 {
   testEnabled = false;
@@ -677,8 +867,7 @@ void jointControllerInit(float currentJointDeg)
 {
   applyControllerParamsFromParams();
 
-  // First closed-loop firmware: no hard position limits until the mechanical range is confirmed.
-  jointCtrl.disablePositionLimits();
+  applyJointLimitsFromParams(true);
   jointCtrl.reset(currentJointDeg);
 
   LOG_NFO("Joint PID + S-curve controller initialized\r\n");
@@ -1016,7 +1205,12 @@ void setZero()
 void printServoStatus()
 {
   const float zeroed = jointGetPositionDeg();
-  Serial.printf("mode=%s tmc=%u hold=%u enc=%.3f joint=%.3f zeroed=%.3f target=%.3f ref=%.3f refv=%.3f measv=%.3f cmd=%.3f stdeg=%.6f fault=%u\r\n",
+  float jmin = 0.0f;
+  float jmax = 0.0f;
+  float jtol = 0.0f;
+  readJointLimitParams(jmin, jmax, jtol);
+
+  Serial.printf("mode=%s tmc=%u hold=%u enc=%.3f joint=%.3f zeroed=%.3f target=%.3f ref=%.3f refv=%.3f measv=%.3f cmd=%.3f stdeg=%.6f jrev=%.6f jmin=%.3f jmax=%.3f jtol=%.3f fault=%u\r\n",
                 motionModeName(motionMode),
                 static_cast<unsigned>(tmc.status()),
                 motorHoldEnabled() ? 1u : 0u,
@@ -1029,6 +1223,10 @@ void printServoStatus()
                 jointCtrl.getLastMeasuredVel(),
                 servoLastCmdDegS,
                 stepsPerDegree(),
+                encoder.outputDegreesPerEncoderRevolution(),
+                jmin,
+                jmax,
+                jtol,
                 static_cast<unsigned>(jointCtrl.faultCode()));
 
   Serial.printf("pid kp=%.4f ki=%.4f kd=%.4f ffv=%.4f ilim=%.4f | motion vmax=%.4f amax=%.4f sct=%.4f outmax=%.4f | settle ptol=%.4f vtol=%.4f dbent=%.4f dbext=%.4f dbvel=%.4f vtau=%.4f\r\n",
@@ -1077,6 +1275,12 @@ void servoUpdate()
   }
 
   jointDeg = measured;
+
+  const float currentZeroedDegForLimits = jointGetPositionDeg();
+  if (motionMode != MotionMode::FAULT && isJointPositionOutsideFaultWindow(currentZeroedDegForLimits)) {
+    latchJointLimitFault(currentZeroedDegForLimits);
+    return;
+  }
 
   if (motionMode != MotionMode::POSITION) {
     return;
@@ -1160,7 +1364,7 @@ void setup()
   LOG_NFO("Init complete\r\n");
   LOG_NFO("First tests: use zero, then pos 1, pos 0, pos -1.\r\n");
   LOG_NFO("MOTOR_DIRECTION_SIGN=-1.0 from real hardware tests.\r\n");
-  LOG_NFO("Runtime params: kp ki kd ffv ilim vmax amax sct outmax ptol vtol dbent dbext dbvel vtau loglvl mhold.\r\n");
+  LOG_NFO("Runtime params: kp ki kd ffv ilim vmax amax sct outmax ptol vtol dbent dbext dbvel vtau stdeg jrev jmin jmax jtol loglvl mhold.\r\n");
   LOG_NFO("trace toggles on/off; trace 0..4 selects output mode.\r\n");
   LOG_NFO("Example: set kp 1.0 / set vmax 3.0 / save\r\n");
 
@@ -1189,6 +1393,10 @@ void loop()
     const float measVel = jointCtrl.getLastMeasuredVel();
     const float refVel = jointCtrl.refVel();
     const uint8_t settled = jointCtrl.isSettled() ? 1 : 0;
+    float traceJmin = 0.0f;
+    float traceJmax = 0.0f;
+    float traceJtol = 0.0f;
+    readJointLimitParams(traceJmin, traceJmax, traceJtol);
 
     switch (traceMode) {
       case TraceMode::FULL:
@@ -1224,6 +1432,18 @@ void loop()
 
         Serial.print(",stdeg:");
         Serial.print(stepsPerDegree(), 6);
+
+        Serial.print(",jrev:");
+        Serial.print(encoder.outputDegreesPerEncoderRevolution(), 6);
+
+        Serial.print(",jmin:");
+        Serial.print(traceJmin, 3);
+
+        Serial.print(",jmax:");
+        Serial.print(traceJmax, 3);
+
+        Serial.print(",jtol:");
+        Serial.print(traceJtol, 3);
 
         Serial.print(",mode:");
         Serial.print(motionModeName(motionMode));
