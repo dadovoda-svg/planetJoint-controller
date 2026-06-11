@@ -64,6 +64,7 @@ private:
   void cmdImport(int argc, char* argv[]);
   void cmdCancel(int argc, char* argv[]);
   void cmdZero(int argc, char* argv[]);
+  void cmdPark(int argc, char* argv[]);
   void cmdTrace(int argc, char* argv[]);
   void cmdGo(int argc, char* argv[]);
   void cmdStep(int argc, char* argv[]);

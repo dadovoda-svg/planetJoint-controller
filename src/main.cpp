@@ -29,9 +29,9 @@ static constexpr uint32_t TMC_BAUD    = 230400;
 // ===================== PIN MAP =====================
 
 static constexpr int PIN_ENCODER_SCK  = 12;  // AS5048A SCK = CLK
-static constexpr int PIN_ENCODER_MISO = 13;  // AS5048A MISO = DOUT;  AS5600 SDA (white)
-static constexpr int PIN_ENCODER_MOSI = 11;  // AS5048A MOSI = DIN;   AS5600 SCL (yellow)
-static constexpr int PIN_ENCODER_CS   = 10;  // AS5048A CS;           unused by AS5600
+static constexpr int PIN_ENCODER_MISO = 13;  // AS5048A MISO = DOUT; AS5600 SDA
+static constexpr int PIN_ENCODER_MOSI = 11;  // AS5048A MOSI = DIN; AS5600 SCL
+static constexpr int PIN_ENCODER_CS   = 10;  // AS5048A CS; unused by AS5600
 
 static constexpr uint32_t AS5600_I2C_CLOCK_HZ = 400000;
 static constexpr uint8_t AS5600_I2C_ADDRESS = 0x36;
@@ -41,6 +41,7 @@ static constexpr int PIN_TMC_RX   = 8;  // ESP32 RX -> PDN_UART
 static constexpr int PIN_TMC_STEP = 4;
 static constexpr int PIN_TMC_DIR  = 5;
 static constexpr int PIN_TMC_ENN  = 6;
+static constexpr int PIN_PARK_SENSOR = 3; // active LOW, external pull-up
 
 // ===================== MECHANICAL SCALE =====================
 
@@ -86,6 +87,15 @@ static constexpr float JOINT_MAX_DEG_DEFAULT = +170.0f;
 static constexpr float JOINT_LIMIT_TOL_DEFAULT = 1.0f;
 static constexpr float JOINT_LIMIT_STOP_MARGIN_DEG = 0.5f;
 
+
+// ===================== PARK / MULTI-TURN REFERENCE =====================
+
+static constexpr float PARK_ACCEL_DEG_S2 = 2.0f;
+static constexpr float PARK_DEFAULT_VELOCITY_DEG_S = 0.5f;
+static constexpr float PARK_DEFAULT_ENCODER_ANGLE_DEG = 0.0f;
+static constexpr float PARK_DEFAULT_JOINT_POSITION_DEG = 0.0f;
+static constexpr float PARK_ENCODER_TOLERANCE_DEG = 0.15f;
+static constexpr uint32_t PARK_TIMEOUT_MS = 120000;
 
 // ===================== STDEG CALIBRATION =====================
 
@@ -161,6 +171,18 @@ static float jointDeg = 0.0f;            // real unrolled joint angle
 static float encoderZero = 0.0f;         // real unrolled joint zero
 bool encoderOk = false;
 static bool traceEnabled = false;
+static bool jointReferenced = false;
+
+enum class ParkPhase : uint8_t {
+  IDLE,
+  SEARCH_FALLING_EDGE,
+  ALIGN_ENCODER
+};
+
+static ParkPhase parkPhase = ParkPhase::IDLE;
+static uint32_t parkStartedMs = 0;
+static bool parkPrevSensorActive = false;
+static float parkCommandVelocityDegS = 0.0f;
 
 enum class TraceMode : uint8_t {
   FULL = 0,
@@ -186,6 +208,9 @@ MotionMode motionMode = MotionMode::IDLE;
 // Forward declarations for helpers used by parameter callbacks.
 float jointGetPositionDeg();
 void stopMotion();
+static void applyZeroOffsetFromParams(bool rebaseController);
+static void parkUpdate(float dt);
+static void abortPark(const char* reason);
 
 // ===================== PARAMS =====================
 
@@ -355,7 +380,7 @@ static bool applyJointLimitsFromParams(bool announce)
     LOG_NFO("Joint limits: jmin=%.3f jmax=%.3f jtol=%.3f deg\r\n", jmin, jmax, jtol);
   }
 
-  if (encoderOk && isJointPositionOutsideFaultWindow(jointGetPositionDeg())) {
+  if (jointReferenced && encoderOk && isJointPositionOutsideFaultWindow(jointGetPositionDeg())) {
     motionMode = MotionMode::FAULT;
     wsSetState(LedState::FAULT);
     LOG_ERR("Current joint position %.3f deg is outside limits [%.3f, %.3f] with jtol=%.3f\r\n",
@@ -428,6 +453,11 @@ void paramsInit()
   params.initKey("jrev", DEFAULT_JOINT_DEGREES_PER_ENCODER_REV); // real joint degrees per encoder revolution
   params.initKey("loglvl", 2.0f); // 0=OFF, 1=ERR, 2=NFO, 3=DBG
   params.initKey("mhold", 0.0f); // 0=disable driver at target, 1=keep driver enabled at IHOLD
+  params.initKey("zoff", 0.0f); // persistent absolute encoder position used as logical joint zero
+  params.initKey("pkdir", 0.0f); // 0=absolute encoder, +1/-1=park search direction
+  params.initKey("pkvel", PARK_DEFAULT_VELOCITY_DEG_S); // park speed in joint deg/s
+  params.initKey("pkenc", PARK_DEFAULT_ENCODER_ANGLE_DEG); // final encoder modulo angle in deg
+  params.initKey("pkpos", PARK_DEFAULT_JOINT_POSITION_DEG); // known logical joint position at park
 
   // Joint safety limits in zeroed real joint degrees.
   params.initKey("jmin", JOINT_MIN_DEG_DEFAULT);
@@ -456,6 +486,7 @@ void paramsInit()
 
   params.load();
   applyLogLevelFromParams(false);
+  applyZeroOffsetFromParams(false);
 
   LOG_DBG("Loaded parameters:\r\n");
   for (uint8_t i = 0; i < params.count(); i++) {
@@ -553,12 +584,37 @@ static void applyControllerParamsFromParams()
   applyControllerSettlingParamsFromParams();
 }
 
+static void applyZeroOffsetFromParams(bool rebaseController)
+{
+  float value = 0.0f;
+  if (!params.get("zoff", value) || !isfinite(value)) {
+    value = 0.0f;
+    params.set("zoff", value);
+    LOG_ERR("Invalid zoff value replaced with 0.000000 deg\r\n");
+  }
+
+  encoderZero = value;
+
+  if (rebaseController && encoderOk) {
+    stopMotion();
+    const float currentZeroedDeg = jointGetPositionDeg();
+    jointCtrl.reset(currentZeroedDeg);
+    jointCtrl.setTarget(currentZeroedDeg);
+    servoTargetZeroedDeg = currentZeroedDeg;
+  }
+
+  LOG_NFO("Logical zero offset zoff=%.6f deg%s\r\n",
+          encoderZero,
+          rebaseController ? "; target rebased to current position" : "");
+}
+
 void applyAllParams()
 {
   applyCurrentScaleFromParams();
   applyMicrostepResolutionFromParams();
   applyControllerParamsFromParams();
   applyJointLimitsFromParams(true);
+  applyZeroOffsetFromParams(encoderOk);
 }
 
 void onConsoleParamSet(const char* key)
@@ -604,6 +660,40 @@ void onConsoleParamSet(const char* key)
 
   if (strcmp(key, "mhold") == 0) {
     LOG_NFO("motor hold at target %s\r\n", motorHoldEnabled() ? "enabled" : "disabled");
+    return;
+  }
+
+  if (strcmp(key, "zoff") == 0) {
+    applyZeroOffsetFromParams(true);
+    LOG_NFO("Use 'save' to persist the logical zero offset.\r\n");
+    return;
+  }
+
+  if (strcmp(key, "pkdir") == 0) {
+    const float directionValue = readParamFloatOrDefault("pkdir", 0.0f);
+    stopMotion();
+    if (directionValue == 0.0f) {
+      jointReferenced = true;
+      const float currentPosition = jointGetPositionDeg();
+      jointCtrl.reset(currentPosition);
+      jointCtrl.setTarget(currentPosition);
+      servoTargetZeroedDeg = currentPosition;
+      wsSetState(LedState::READY);
+      LOG_NFO("pkdir=0: absolute-encoder mode enabled; park is not required. Use 'save' to persist it.\r\n");
+    } else if (directionValue == 1.0f || directionValue == -1.0f) {
+      jointReferenced = false;
+      wsSetState(LedState::BOOT);
+      LOG_NFO("pkdir=%+.0f: multi-turn park mode enabled; execute park before motion. Use 'save' to persist it.\r\n",
+              directionValue);
+    } else {
+      LOG_ERR("Invalid pkdir: use -1, 0, or +1\r\n");
+    }
+    return;
+  }
+
+  if (strcmp(key, "pkvel") == 0 || strcmp(key, "pkenc") == 0 ||
+      strcmp(key, "pkpos") == 0) {
+    LOG_NFO("Park parameter %s updated in RAM. Use 'save' to persist it.\r\n", key);
     return;
   }
 
@@ -752,6 +842,7 @@ static const char* motionModeName(MotionMode mode)
     case MotionMode::STEP_TEST: return "STEP_TEST";
     case MotionMode::POSITION: return "POSITION";
     case MotionMode::CALIBRATION: return "CALIBRATION";
+    case MotionMode::PARK: return "PARK";
     case MotionMode::FAULT: return "FAULT";
   }
   return "UNKNOWN";
@@ -762,6 +853,11 @@ float jointGetPositionDeg()
   // Public/planner-facing coordinate system:
   // real joint degrees, relative to the logical zero set by the `zero` command.
   return jointDeg - encoderZero;
+}
+
+bool jointIsReferenced()
+{
+  return jointReferenced;
 }
 
 float jointGetTargetDeg()
@@ -883,6 +979,8 @@ static void latchJointLimitFault(float zeroedDeg)
 
 void stopMotion()
 {
+  parkPhase = ParkPhase::IDLE;
+  parkCommandVelocityDegS = 0.0f;
   testEnabled = false;
   testStepEnabled = false;
   stepNum = 0;
@@ -897,7 +995,7 @@ void stopMotion()
 
   // The position controller always works in zeroed joint coordinates.
   jointCtrl.reset(jointGetPositionDeg());
-  wsSetState(LedState::READY);
+  wsSetState(jointReferenced ? LedState::READY : LedState::BOOT);
 }
 
 void jointControllerInit(float currentJointDeg)
@@ -963,6 +1061,10 @@ const char* getTraceModeName()
 
 bool toggleTest(float degreesPerSecond = 0.5f)
 {
+  if (!jointReferenced) {
+    Serial.println("[ERR] Motion rejected: execute park first");
+    return false;
+  }
   if (motionMode == MotionMode::POSITION || motionMode == MotionMode::CALIBRATION) {
     Serial.println("[ERR] Stop position/calibration mode before velocity test");
     return false;
@@ -990,6 +1092,10 @@ bool toggleTest(float degreesPerSecond = 0.5f)
 
 bool moveStep(float steps = 1.0f)
 {
+  if (!jointReferenced) {
+    Serial.println("[ERR] Motion rejected: execute park first");
+    return false;
+  }
   if (motionMode == MotionMode::POSITION || motionMode == MotionMode::CALIBRATION) {
     Serial.println("[ERR] Stop position/calibration mode before step test");
     return false;
@@ -1069,6 +1175,10 @@ static bool updateStdegParameter(float newStepsPerDegree)
 
 bool calibrateStepsPerDegree(float targetDegrees = STDEG_CALIBRATION_TARGET_DEG)
 {
+  if (!jointReferenced) {
+    Serial.println("[CAL] Calibration rejected: execute park first");
+    return false;
+  }
   if (motionMode == MotionMode::CALIBRATION) {
     Serial.println("[CAL] Calibration already running");
     return false;
@@ -1201,6 +1311,10 @@ bool calibrateStepsPerDegree(float targetDegrees = STDEG_CALIBRATION_TARGET_DEG)
 
 void setZero()
 {
+  if (!jointReferenced) {
+    Serial.println("[ERR] Zero rejected: execute park first");
+    return;
+  }
   testEnabled = false;
   testStepEnabled = false;
   stepNum = 0;
@@ -1211,9 +1325,8 @@ void setZero()
     tmc.disableDriver(false);
   }
 
-  // Reset continuous tracking so the current physical position becomes a clean software origin.
-  encoder.resetContinuousTracking();
-
+  // Keep the multi-turn unwrap established by park. Zero only changes the
+  // persistent logical offset; it must never destroy the referenced turn count.
   float tmp = 0.0f;
   if (encoder.readContinuousDegrees(tmp)) {
     encoderOk = true;
@@ -1228,6 +1341,7 @@ void setZero()
   }
 
   encoderZero = jointDeg;
+  params.set("zoff", encoderZero);
   servoTargetZeroedDeg = 0.0f;
 
   // After zeroing, the controller coordinate system is zeroed too.
@@ -1236,7 +1350,8 @@ void setZero()
 
   motionMode = MotionMode::IDLE;
   wsSetState(LedState::READY);
-  Serial.printf("Zero set at joint_abs=%.3f deg; zeroed position is now 0.000 deg\r\n", encoderZero);
+  Serial.printf("Zero set at joint_abs=%.3f deg; zoff updated in RAM; use 'save' to persist it\r\n",
+                encoderZero);
 }
 
 void printServoStatus()
@@ -1247,8 +1362,10 @@ void printServoStatus()
   float jtol = 0.0f;
   readJointLimitParams(jmin, jmax, jtol);
 
-  Serial.printf("mode=%s tmc=%u hold=%u enc=%.3f joint=%.3f zeroed=%.3f target=%.3f ref=%.3f refv=%.3f measv=%.3f cmd=%.3f stdeg=%.6f jrev=%.6f jmin=%.3f jmax=%.3f jtol=%.3f fault=%u\r\n",
+  Serial.printf("mode=%s referenced=%u park_sensor=%u tmc=%u hold=%u enc=%.3f joint=%.3f zeroed=%.3f target=%.3f ref=%.3f refv=%.3f measv=%.3f cmd=%.3f stdeg=%.6f jrev=%.6f zoff=%.6f jmin=%.3f jmax=%.3f jtol=%.3f fault=%u\r\n",
                 motionModeName(motionMode),
+                jointReferenced ? 1u : 0u,
+                digitalRead(PIN_PARK_SENSOR) == LOW ? 1u : 0u,
                 static_cast<unsigned>(tmc.status()),
                 motorHoldEnabled() ? 1u : 0u,
                 encoderDeg,
@@ -1261,6 +1378,7 @@ void printServoStatus()
                 servoLastCmdDegS,
                 stepsPerDegree(),
                 encoder.outputDegreesPerEncoderRevolution(),
+                encoderZero,
                 jmin,
                 jmax,
                 jtol,
@@ -1282,6 +1400,209 @@ void printServoStatus()
                 readParamFloatOrDefault("dbext", SERVO_DEADBAND_EXIT),
                 readParamFloatOrDefault("dbvel", SERVO_DEADBAND_VEL),
                 readParamFloatOrDefault("vtau", SERVO_VEL_FILTER_TAU_S));
+
+  Serial.printf("park pkdir=%.0f pkvel=%.4f pkenc=%.4f pkpos=%.4f accel=%.4f\r\n",
+                readParamFloatOrDefault("pkdir", 0.0f),
+                readParamFloatOrDefault("pkvel", PARK_DEFAULT_VELOCITY_DEG_S),
+                readParamFloatOrDefault("pkenc", PARK_DEFAULT_ENCODER_ANGLE_DEG),
+                readParamFloatOrDefault("pkpos", PARK_DEFAULT_JOINT_POSITION_DEG),
+                PARK_ACCEL_DEG_S2);
+}
+
+// ===================== PARK REFERENCE =====================
+
+static float normalizeEncoderAngle(float degrees)
+{
+  float out = fmodf(degrees, 360.0f);
+  if (out < 0.0f) {
+    out += 360.0f;
+  }
+  return out;
+}
+
+static float directedEncoderDistance(float currentDeg, float targetDeg, int direction)
+{
+  const float current = normalizeEncoderAngle(currentDeg);
+  const float target = normalizeEncoderAngle(targetDeg);
+
+  if (direction > 0) {
+    return normalizeEncoderAngle(target - current);
+  }
+  return normalizeEncoderAngle(current - target);
+}
+
+static void abortPark(const char* reason)
+{
+  setMotorVelocityDegPerSecond(0.0f);
+  tmc.stopInternalMotion();
+  tmc.disableDriver(false);
+  parkPhase = ParkPhase::IDLE;
+  parkCommandVelocityDegS = 0.0f;
+  jointReferenced = false;
+  motionMode = MotionMode::IDLE;
+  jointCtrl.reset(jointGetPositionDeg());
+  jointCtrl.setTarget(jointGetPositionDeg());
+  servoTargetZeroedDeg = jointGetPositionDeg();
+  wsSetState(LedState::BOOT);
+  LOG_ERR("Park aborted: %s\r\n", reason != nullptr ? reason : "unknown reason");
+}
+
+bool startPark()
+{
+  if (motionMode == MotionMode::PARK) {
+    LOG_NFO("Park already running\r\n");
+    return false;
+  }
+
+  if (motionMode == MotionMode::FAULT || jointCtrl.fault()) {
+    LOG_ERR("Park rejected: motion fault is latched\r\n");
+    return false;
+  }
+
+  const float directionValue = readParamFloatOrDefault("pkdir", 0.0f);
+  const float velocity = readParamFloatOrDefault("pkvel", PARK_DEFAULT_VELOCITY_DEG_S);
+  const float encoderTarget = readParamFloatOrDefault("pkenc", PARK_DEFAULT_ENCODER_ANGLE_DEG);
+  const float parkPosition = readParamFloatOrDefault("pkpos", PARK_DEFAULT_JOINT_POSITION_DEG);
+
+  if (!isfinite(directionValue) ||
+      (directionValue != -1.0f && directionValue != 0.0f && directionValue != 1.0f)) {
+    LOG_ERR("Park rejected: pkdir must be -1, 0, or +1\r\n");
+    return false;
+  }
+  if (directionValue == 0.0f) {
+    LOG_NFO("Park not required: pkdir=0 selects absolute-encoder mode\r\n");
+    return false;
+  }
+  if (!isfinite(velocity) || velocity <= 0.0f) {
+    LOG_ERR("Park rejected: pkvel must be > 0\r\n");
+    return false;
+  }
+  if (!isfinite(encoderTarget) || encoderTarget < 0.0f || encoderTarget >= 360.0f) {
+    LOG_ERR("Park rejected: pkenc must be in [0, 360) degrees\r\n");
+    return false;
+  }
+  if (!isfinite(parkPosition)) {
+    LOG_ERR("Park rejected: pkpos must be finite\r\n");
+    return false;
+  }
+
+  stopMotion();
+  if (!ensureDriverEnabled()) {
+    LOG_ERR("Park rejected: unable to enable TMC power stage\r\n");
+    return false;
+  }
+
+  jointReferenced = false;
+  parkStartedMs = millis();
+  parkCommandVelocityDegS = 0.0f;
+  parkPrevSensorActive = digitalRead(PIN_PARK_SENSOR) == LOW;
+  // If the sensor is already active, moving farther in the search direction
+  // could cause severe mechanical damage. The active window already identifies
+  // the correct encoder revolution, so align directly to pkenc.
+  parkPhase = parkPrevSensorActive
+      ? ParkPhase::ALIGN_ENCODER
+      : ParkPhase::SEARCH_FALLING_EDGE;
+  motionMode = MotionMode::PARK;
+  lastServoUs = micros();
+  wsSetState(LedState::TEST);
+
+  LOG_NFO("Park started: direction=%+.0f velocity=%.3f joint deg/s pkenc=%.3f encoder deg pkpos=%.3f joint deg sensor=%s\r\n",
+          directionValue,
+          velocity,
+          encoderTarget,
+          parkPosition,
+          parkPrevSensorActive ? "ACTIVE; aligning directly to pkenc" : "inactive; searching falling edge");
+  return true;
+}
+
+static void completePark()
+{
+  const float parkPosition = readParamFloatOrDefault("pkpos", PARK_DEFAULT_JOINT_POSITION_DEG);
+  const float absoluteJointAtPark = encoderZero + parkPosition;
+
+  setMotorVelocityDegPerSecond(0.0f);
+  tmc.stopInternalMotion();
+  if (!motorHoldEnabled()) {
+    tmc.disableDriver(false);
+  }
+
+  encoder.setContinuousOutputDegrees(absoluteJointAtPark);
+  jointDeg = encoder.lastContinuousDegrees();
+  jointReferenced = true;
+  parkPhase = ParkPhase::IDLE;
+  parkCommandVelocityDegS = 0.0f;
+  motionMode = MotionMode::IDLE;
+
+  const float referencedPosition = jointGetPositionDeg();
+  jointCtrl.clearFault();
+  jointCtrl.reset(referencedPosition);
+  jointCtrl.setTarget(referencedPosition);
+  servoTargetZeroedDeg = referencedPosition;
+  wsSetState(LedState::READY);
+
+  LOG_NFO("Park complete: encoder=%.3f deg joint=%.6f deg zeroed=%.6f deg target rebased\r\n",
+          encoderDeg,
+          jointDeg,
+          referencedPosition);
+}
+
+static void parkUpdate(float dt)
+{
+  if (parkPhase == ParkPhase::IDLE) {
+    abortPark("invalid internal state");
+    return;
+  }
+
+  if (millis() - parkStartedMs > PARK_TIMEOUT_MS) {
+    abortPark("timeout waiting for park reference");
+    return;
+  }
+
+  const int direction = readParamFloatOrDefault("pkdir", 0.0f) >= 0.0f ? 1 : -1;
+  const float parkVelocity = readParamMinOrDefault("pkvel", PARK_DEFAULT_VELOCITY_DEG_S, 0.001f);
+  const bool sensorActive = digitalRead(PIN_PARK_SENSOR) == LOW;
+
+  float requestedSpeedMagnitude = parkVelocity;
+
+  if (parkPhase == ParkPhase::SEARCH_FALLING_EDGE) {
+    if (!parkPrevSensorActive && sensorActive) {
+      parkPhase = ParkPhase::ALIGN_ENCODER;
+      LOG_NFO("Park falling edge detected at encoder %.3f deg; aligning to pkenc\r\n", encoderDeg);
+    }
+  }
+
+  if (parkPhase == ParkPhase::ALIGN_ENCODER) {
+    const float encoderTarget = readParamFloatOrDefault("pkenc", PARK_DEFAULT_ENCODER_ANGLE_DEG);
+    const float remainingEncoderDeg = directedEncoderDistance(encoderDeg, encoderTarget, direction);
+
+    if (remainingEncoderDeg <= PARK_ENCODER_TOLERANCE_DEG) {
+      completePark();
+      return;
+    }
+
+    // Convert the remaining modulo-encoder distance into real joint degrees.
+    // This allows a fixed park acceleration to provide both ramp-up and a
+    // controlled deceleration toward the precise encoder target.
+    const float remainingJointDeg =
+        remainingEncoderDeg * encoder.outputDegreesPerEncoderRevolution() / 360.0f;
+    const float brakingSpeed = sqrtf(fmaxf(0.0f, 2.0f * PARK_ACCEL_DEG_S2 * remainingJointDeg));
+    requestedSpeedMagnitude = fminf(parkVelocity, brakingSpeed);
+  }
+
+  const float targetVelocity = static_cast<float>(direction) * requestedSpeedMagnitude;
+  const float maxVelocityDelta = PARK_ACCEL_DEG_S2 * dt;
+
+  if (parkCommandVelocityDegS < targetVelocity) {
+    parkCommandVelocityDegS = fminf(parkCommandVelocityDegS + maxVelocityDelta, targetVelocity);
+  } else if (parkCommandVelocityDegS > targetVelocity) {
+    parkCommandVelocityDegS = fmaxf(parkCommandVelocityDegS - maxVelocityDelta, targetVelocity);
+  }
+
+  parkPrevSensorActive = sensorActive;
+
+  if (!setMotorVelocityDegPerSecond(parkCommandVelocityDegS)) {
+    abortPark("motor velocity command failed");
+  }
 }
 
 // ===================== SERVO UPDATE =====================
@@ -1312,6 +1633,11 @@ void servoUpdate()
   }
 
   jointDeg = measured;
+
+  if (motionMode == MotionMode::PARK) {
+    parkUpdate(dt);
+    return;
+  }
 
   const float currentZeroedDegForLimits = jointGetPositionDeg();
   if (motionMode != MotionMode::FAULT && isJointPositionOutsideFaultWindow(currentZeroedDegForLimits)) {
@@ -1363,6 +1689,8 @@ void servoUpdate()
 void setup()
 {
   wsLedsInit();
+  pinMode(PIN_PARK_SENSOR, INPUT_PULLUP);
+  jointReferenced = false;
   wsSetState(LedState::BOOT);
   wsLedsUpdate();
 
@@ -1394,18 +1722,38 @@ void setup()
   encoderInit();
 
   if (encoderFirstReadTest()) {
-    encoderZero = jointDeg;
-    jointControllerInit(jointGetPositionDeg());
-    wsSetState(LedState::READY);
+    // Keep the persisted logical zero. Initialize the controller and its target
+    // at the actual measured position so boot never requests an unsolicited move.
+    const float startupPositionDeg = jointGetPositionDeg();
+    jointControllerInit(startupPositionDeg);
+    jointCtrl.setTarget(startupPositionDeg);
+    servoTargetZeroedDeg = startupPositionDeg;
+    const float parkDirection = readParamFloatOrDefault("pkdir", 0.0f);
+    if (parkDirection == 0.0f) {
+      jointReferenced = true;
+      wsSetState(LedState::READY);
+      LOG_NFO("Startup encoder sample %.3f deg; pkdir=0 absolute-encoder mode, park is not required\r\n",
+              startupPositionDeg);
+    } else {
+      jointReferenced = false;
+      wsSetState(LedState::BOOT);
+      LOG_NFO("Startup encoder sample %.3f deg; controller target initialized, but motion remains locked until park\r\n",
+              startupPositionDeg);
+    }
   } else {
     wsSetState(LedState::ENCODER_ERROR);
     motionMode = MotionMode::FAULT;
   }
 
   LOG_NFO("Init complete\r\n");
-  LOG_NFO("First tests: use zero, then pos 1, pos 0, pos -1.\r\n");
+  if (readParamFloatOrDefault("pkdir", 0.0f) == 0.0f) {
+    LOG_NFO("Absolute-encoder mode active: park command is not required.\r\n");
+  } else {
+    LOG_NFO("Multi-turn position is not valid after boot: execute park before any motion.\r\n");
+  }
+  LOG_NFO("Use zero, then save, to store a new logical zero.\r\n");
   LOG_NFO("MOTOR_DIRECTION_SIGN=-1.0 from real hardware tests.\r\n");
-  LOG_NFO("Runtime params: kp ki kd ffv ilim vmax amax sct outmax ptol vtol dbent dbext dbvel vtau stdeg jrev jmin jmax jtol loglvl mhold.\r\n");
+  LOG_NFO("Runtime params: kp ki kd ffv ilim vmax amax sct outmax ptol vtol dbent dbext dbvel vtau stdeg jrev jmin jmax jtol loglvl mhold zoff pkdir pkvel pkenc pkpos.\r\n");
   LOG_NFO("trace toggles on/off; trace 0..4 selects output mode.\r\n");
   LOG_NFO("Example: set kp 1.0 / set vmax 3.0 / save\r\n");
 

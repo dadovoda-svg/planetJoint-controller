@@ -25,6 +25,9 @@ public:
 
   void resetContinuousTracking();
 
+  // Rebase the continuous output position at the current raw encoder angle.
+  void setContinuousOutputDegrees(float outputDegrees);
+
   void setOutputDegreesPerEncoderRevolution(float degreesPerEncoderRev);
   float outputDegreesPerEncoderRevolution() const;
 

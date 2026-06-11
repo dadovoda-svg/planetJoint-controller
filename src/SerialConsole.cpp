@@ -15,6 +15,7 @@ extern bool moveStep(float steps);
 extern bool calibrateStepsPerDegree(float targetDegrees);
 extern float getStdegCalibrationDefaultTargetDeg();
 extern void setZero();
+extern bool startPark();
 extern bool moveJointToDeg(float targetDeg);
 extern bool jointMoveTo(float targetDeg, float vmaxDegS, float amaxDegS2);
 extern bool jointMoveTo(float targetDeg, float vmaxDegS, float amaxDegS2, float sCurveTimeS);
@@ -74,9 +75,15 @@ const SerialConsole::Command SerialConsole::_commands[] = {
     &SerialConsole::cmdCancel
   },
   {
+    "park",
+    "park",
+    "Reference the multi-turn position using the park sensor",
+    &SerialConsole::cmdPark
+  },
+  {
     "zero",
     "zero",
-    "Set current encoder position as zero",
+    "Set current encoder position as zero and update zoff in RAM",
     &SerialConsole::cmdZero
   },
   {
@@ -483,7 +490,15 @@ void SerialConsole::cmdLoad(int argc, char* argv[])
     return;
   }
 
-  _serial.println("OK parameters loaded");
+  for (uint8_t i = 0; i < _params.count(); i++) {
+    const char* key = nullptr;
+    float value = 0.0f;
+    if (_params.getByIndex(i, key, value)) {
+      notifyParamSet(key);
+    }
+  }
+
+  _serial.println("OK parameters loaded and applied");
 }
 
 
@@ -558,6 +573,16 @@ void SerialConsole::cmdCancel(int argc, char* argv[])
   } else {
     _serial.println("OK nothing to cancel");
   }
+}
+
+void SerialConsole::cmdPark(int argc, char* argv[])
+{
+  (void)argv;
+  if (argc != 1) {
+    _serial.println("ERR usage: park");
+    return;
+  }
+  _serial.println(startPark() ? "OK park started" : "ERR park rejected");
 }
 
 void SerialConsole::cmdZero(int argc, char* argv[])

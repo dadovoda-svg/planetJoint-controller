@@ -9,6 +9,8 @@
 #include "led_status.h"
 #include "logger.h"
 
+extern bool jointIsReferenced();
+
 // The first refactoring step keeps hardware ownership in main.cpp and moves
 // planner/move orchestration here. This keeps the tested bring-up sequence
 // unchanged while making the planner independently extensible.
@@ -34,8 +36,8 @@ static constexpr float SERVO_AMAX_DEG_S2      = 6.0f;
 static constexpr float SERVO_SCURVE_TIME_S    = 0.150f;
 static constexpr float SERVO_OUTPUT_MAX_DEG_S = 2.5f;
 
-static constexpr float PLANNER_HARD_VMAX_LIMIT_DEG_S = 12.0f;
-static constexpr float PLANNER_HARD_AMAX_LIMIT_DEG_S2 = 100.0f;
+static constexpr float PLANNER_HARD_VMAX_LIMIT_DEG_S = 90.0f;
+static constexpr float PLANNER_HARD_AMAX_LIMIT_DEG_S2 = 180.0f;
 
 JointPlanner::JointPlanner(HardwareSerial& plannerSerial)
 : _serial(plannerSerial)
@@ -176,6 +178,10 @@ bool JointPlanner::stop()
 
 bool JointPlanner::moveTo(const JointMoveCommand& cmd)
 {
+  if (!jointIsReferenced()) {
+    LOG_ERR("Motion rejected: execute park first\r\n");
+    return false;
+  }
   if (motionMode == MotionMode::CALIBRATION) {
     Serial.println("[ERR] Calibration in progress");
     return false;
@@ -271,6 +277,10 @@ bool JointPlanner::moveTo(float targetDeg, float vmaxDegS, float amaxDegS2, floa
 
 bool JointPlanner::moveToBlended(const JointMoveCommand& cmd)
 {
+  if (!jointIsReferenced()) {
+    LOG_ERR("Motion rejected: execute park first\r\n");
+    return false;
+  }
   if (motionMode == MotionMode::CALIBRATION) {
     Serial.println("[ERR] Calibration in progress");
     return false;

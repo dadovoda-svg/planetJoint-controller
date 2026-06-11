@@ -838,3 +838,20 @@ The planner refactor has been compiled and tested on real hardware. The currentl
 ## License
 
 MIT
+
+## Persistent logical zero
+
+See `README_PERSISTENT_ZERO.md` for the `zoff` parameter, `zero`/`save` workflow, and startup target behavior.
+
+
+## Multi-turn park reference
+
+This build requires a successful `park` command after every boot before normal motion is accepted. GPIO3 is the active-low park sensor input. See `README_PARK_REFERENCE.md` for the state machine and parameters `pkdir`, `pkvel`, `pkenc`, and `pkpos`.
+
+## Park reference safety update
+
+`pkdir=0` selects absolute-encoder mode and does not require `park`. With
+`pkdir=+1` or `pkdir=-1`, a park reference is required after every boot. If the
+GPIO3 park sensor is already active when `park` starts, the firmware never
+continues the search movement; it aligns directly to `pkenc`. See
+`README_PARK_REFERENCE.md`.

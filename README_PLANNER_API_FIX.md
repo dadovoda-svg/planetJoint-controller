@@ -52,7 +52,7 @@ move 5 4 10 0.150
 The planner API clamps requested speed to a conservative hard limit:
 
 ```cpp
-PLANNER_HARD_VMAX_LIMIT_DEG_S = 12.0f
+PLANNER_HARD_VMAX_LIMIT_DEG_S = 90.0f
 ```
 
 This remains below the observed step-loss region around 15 deg/s.

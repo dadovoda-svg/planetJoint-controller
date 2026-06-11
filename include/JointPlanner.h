@@ -9,6 +9,7 @@ enum class MotionMode : uint8_t {
   STEP_TEST,
   POSITION,
   CALIBRATION,
+  PARK,
   FAULT
 };
 

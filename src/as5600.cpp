@@ -24,6 +24,26 @@ void AS5600::resetContinuousTracking() {
   _lastContinuousDeg = 0.0f;
 }
 
+void AS5600::setContinuousOutputDegrees(float outputDegrees) {
+  if (!isfinite(outputDegrees) || !isfinite(_outputDegreesPerEncoderRev) ||
+      _outputDegreesPerEncoderRev <= 0.0f) {
+    return;
+  }
+
+  const float countsFloat = (outputDegrees * static_cast<float>(COUNTS_PER_REV)) /
+                            _outputDegreesPerEncoderRev;
+  const int64_t requestedCounts = static_cast<int64_t>(llroundf(countsFloat));
+  const int64_t raw = static_cast<int64_t>(_lastRaw & 0x3FFF);
+  const int64_t nearestTurn = static_cast<int64_t>(llroundf(
+      static_cast<float>(requestedCounts - raw) / static_cast<float>(COUNTS_PER_REV)));
+
+  _turnCount = nearestTurn;
+  _continuousCounts = (_turnCount * static_cast<int64_t>(COUNTS_PER_REV)) + raw;
+  _prevRawAngle = static_cast<uint16_t>(raw);
+  _continuousInitialized = true;
+  _lastContinuousDeg = continuousCountsToOutputDegrees(_continuousCounts);
+}
+
 void AS5600::setOutputDegreesPerEncoderRevolution(float degreesPerEncoderRev) {
   if (isfinite(degreesPerEncoderRev) && degreesPerEncoderRev > 0.0f) {
     _outputDegreesPerEncoderRev = degreesPerEncoderRev;
