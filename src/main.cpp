@@ -95,7 +95,9 @@ static constexpr float PARK_DEFAULT_VELOCITY_DEG_S = 0.5f;
 static constexpr float PARK_DEFAULT_ENCODER_ANGLE_DEG = 0.0f;
 static constexpr float PARK_DEFAULT_JOINT_POSITION_DEG = 0.0f;
 static constexpr float PARK_ENCODER_TOLERANCE_DEG = 0.15f;
-static constexpr uint32_t PARK_TIMEOUT_MS = 120000;
+static constexpr uint32_t PARK_RELEASE_TIMEOUT_MS = 60000;
+static constexpr uint32_t PARK_SEARCH_TIMEOUT_MS = 120000;
+static constexpr uint32_t PARK_ALIGN_TIMEOUT_MS = 60000;
 
 // ===================== STDEG CALIBRATION =====================
 
@@ -175,12 +177,14 @@ static bool jointReferenced = false;
 
 enum class ParkPhase : uint8_t {
   IDLE,
+  RELEASE_SENSOR,
   SEARCH_FALLING_EDGE,
   ALIGN_ENCODER
 };
 
 static ParkPhase parkPhase = ParkPhase::IDLE;
 static uint32_t parkStartedMs = 0;
+static uint32_t parkPhaseStartedMs = 0;
 static bool parkPrevSensorActive = false;
 static float parkCommandVelocityDegS = 0.0f;
 
@@ -201,6 +205,7 @@ static int32_t stepNum = 0;
 
 float servoTargetZeroedDeg = 0.0f;
 static float servoLastCmdDegS = 0.0f;
+static bool servoHoldActive = false;
 bool tmcReady = false;
 
 MotionMode motionMode = MotionMode::IDLE;
@@ -283,6 +288,12 @@ static float stepsPerDegree()
 static bool motorHoldEnabled()
 {
   const float value = readParamFloatOrDefault("mhold", 0.0f);
+  return isfinite(value) && value >= 0.5f;
+}
+
+static bool servoHoldEnabled()
+{
+  const float value = readParamFloatOrDefault("shold", 0.0f);
   return isfinite(value) && value >= 0.5f;
 }
 
@@ -453,6 +464,7 @@ void paramsInit()
   params.initKey("jrev", DEFAULT_JOINT_DEGREES_PER_ENCODER_REV); // real joint degrees per encoder revolution
   params.initKey("loglvl", 2.0f); // 0=OFF, 1=ERR, 2=NFO, 3=DBG
   params.initKey("mhold", 0.0f); // 0=disable driver at target, 1=keep driver enabled at IHOLD
+  params.initKey("shold", 0.0f); // 0=stop control at target, 1=active servo hold at target
   params.initKey("zoff", 0.0f); // persistent absolute encoder position used as logical joint zero
   params.initKey("pkdir", 0.0f); // 0=absolute encoder, +1/-1=park search direction
   params.initKey("pkvel", PARK_DEFAULT_VELOCITY_DEG_S); // park speed in joint deg/s
@@ -660,6 +672,13 @@ void onConsoleParamSet(const char* key)
 
   if (strcmp(key, "mhold") == 0) {
     LOG_NFO("motor hold at target %s\r\n", motorHoldEnabled() ? "enabled" : "disabled");
+    return;
+  }
+
+  if (strcmp(key, "shold") == 0) {
+    servoHoldActive = false;
+    LOG_NFO("servo hold at target %s. Use 'save' to persist it.\r\n",
+            servoHoldEnabled() ? "enabled" : "disabled");
     return;
   }
 
@@ -985,6 +1004,7 @@ void stopMotion()
   testStepEnabled = false;
   stepNum = 0;
   servoLastCmdDegS = 0.0f;
+  servoHoldActive = false;
 
   tmc.stopInternalMotion();
   tmc.disableDriver(false); // keep configured chopper state; hardware bridge disabled
@@ -1319,6 +1339,7 @@ void setZero()
   testStepEnabled = false;
   stepNum = 0;
   servoLastCmdDegS = 0.0f;
+  servoHoldActive = false;
 
   tmc.stopInternalMotion();
   if (!motorHoldEnabled()) {
@@ -1362,12 +1383,13 @@ void printServoStatus()
   float jtol = 0.0f;
   readJointLimitParams(jmin, jmax, jtol);
 
-  Serial.printf("mode=%s referenced=%u park_sensor=%u tmc=%u hold=%u enc=%.3f joint=%.3f zeroed=%.3f target=%.3f ref=%.3f refv=%.3f measv=%.3f cmd=%.3f stdeg=%.6f jrev=%.6f zoff=%.6f jmin=%.3f jmax=%.3f jtol=%.3f fault=%u\r\n",
+  Serial.printf("mode=%s referenced=%u park_sensor=%u tmc=%u hold=%u shold=%u enc=%.3f joint=%.3f zeroed=%.3f target=%.3f ref=%.3f refv=%.3f measv=%.3f cmd=%.3f stdeg=%.6f jrev=%.6f zoff=%.6f jmin=%.3f jmax=%.3f jtol=%.3f fault=%u\r\n",
                 motionModeName(motionMode),
                 jointReferenced ? 1u : 0u,
                 digitalRead(PIN_PARK_SENSOR) == LOW ? 1u : 0u,
                 static_cast<unsigned>(tmc.status()),
                 motorHoldEnabled() ? 1u : 0u,
+                servoHoldEnabled() ? 1u : 0u,
                 encoderDeg,
                 jointDeg,
                 zeroed,
@@ -1401,12 +1423,15 @@ void printServoStatus()
                 readParamFloatOrDefault("dbvel", SERVO_DEADBAND_VEL),
                 readParamFloatOrDefault("vtau", SERVO_VEL_FILTER_TAU_S));
 
-  Serial.printf("park pkdir=%.0f pkvel=%.4f pkenc=%.4f pkpos=%.4f accel=%.4f\r\n",
+  Serial.printf("park pkdir=%.0f pkvel=%.4f pkenc=%.4f pkpos=%.4f accel=%.4f rel_to=%lu search_to=%lu align_to=%lu\r\n",
                 readParamFloatOrDefault("pkdir", 0.0f),
                 readParamFloatOrDefault("pkvel", PARK_DEFAULT_VELOCITY_DEG_S),
                 readParamFloatOrDefault("pkenc", PARK_DEFAULT_ENCODER_ANGLE_DEG),
                 readParamFloatOrDefault("pkpos", PARK_DEFAULT_JOINT_POSITION_DEG),
-                PARK_ACCEL_DEG_S2);
+                PARK_ACCEL_DEG_S2,
+                static_cast<unsigned long>(PARK_RELEASE_TIMEOUT_MS),
+                static_cast<unsigned long>(PARK_SEARCH_TIMEOUT_MS),
+                static_cast<unsigned long>(PARK_ALIGN_TIMEOUT_MS));
 }
 
 // ===================== PARK REFERENCE =====================
@@ -1494,13 +1519,15 @@ bool startPark()
 
   jointReferenced = false;
   parkStartedMs = millis();
+  parkPhaseStartedMs = parkStartedMs;
   parkCommandVelocityDegS = 0.0f;
   parkPrevSensorActive = digitalRead(PIN_PARK_SENSOR) == LOW;
-  // If the sensor is already active, moving farther in the search direction
-  // could cause severe mechanical damage. The active window already identifies
-  // the correct encoder revolution, so align directly to pkenc.
+
+  // If the sensor is already active, first back out in the opposite direction.
+  // This guarantees that the following reference capture always uses the same
+  // falling edge and avoids relying on the sensor active-window hysteresis.
   parkPhase = parkPrevSensorActive
-      ? ParkPhase::ALIGN_ENCODER
+      ? ParkPhase::RELEASE_SENSOR
       : ParkPhase::SEARCH_FALLING_EDGE;
   motionMode = MotionMode::PARK;
   lastServoUs = micros();
@@ -1511,7 +1538,7 @@ bool startPark()
           velocity,
           encoderTarget,
           parkPosition,
-          parkPrevSensorActive ? "ACTIVE; aligning directly to pkenc" : "inactive; searching falling edge");
+          parkPrevSensorActive ? "ACTIVE; releasing opposite to pkdir" : "inactive; searching falling edge");
   return true;
 }
 
@@ -1553,27 +1580,52 @@ static void parkUpdate(float dt)
     return;
   }
 
-  if (millis() - parkStartedMs > PARK_TIMEOUT_MS) {
-    abortPark("timeout waiting for park reference");
-    return;
-  }
-
-  const int direction = readParamFloatOrDefault("pkdir", 0.0f) >= 0.0f ? 1 : -1;
+  const uint32_t nowMs = millis();
+  const int searchDirection = readParamFloatOrDefault("pkdir", 0.0f) >= 0.0f ? 1 : -1;
+  int motionDirection = searchDirection;
   const float parkVelocity = readParamMinOrDefault("pkvel", PARK_DEFAULT_VELOCITY_DEG_S, 0.001f);
   const bool sensorActive = digitalRead(PIN_PARK_SENSOR) == LOW;
 
   float requestedSpeedMagnitude = parkVelocity;
 
+  if (parkPhase == ParkPhase::RELEASE_SENSOR) {
+    motionDirection = -searchDirection;
+    if (nowMs - parkPhaseStartedMs > PARK_RELEASE_TIMEOUT_MS) {
+      abortPark("timeout releasing park sensor");
+      return;
+    }
+    if (!sensorActive) {
+      parkPhase = ParkPhase::SEARCH_FALLING_EDGE;
+      parkPhaseStartedMs = nowMs;
+      parkPrevSensorActive = false;
+      parkCommandVelocityDegS = 0.0f;
+      LOG_NFO("Park sensor released; searching falling edge in pkdir\r\n");
+    }
+  }
+
   if (parkPhase == ParkPhase::SEARCH_FALLING_EDGE) {
+    motionDirection = searchDirection;
+    if (nowMs - parkPhaseStartedMs > PARK_SEARCH_TIMEOUT_MS) {
+      abortPark("timeout searching park falling edge");
+      return;
+    }
     if (!parkPrevSensorActive && sensorActive) {
       parkPhase = ParkPhase::ALIGN_ENCODER;
+      parkPhaseStartedMs = nowMs;
+      parkCommandVelocityDegS = 0.0f;
       LOG_NFO("Park falling edge detected at encoder %.3f deg; aligning to pkenc\r\n", encoderDeg);
     }
   }
 
   if (parkPhase == ParkPhase::ALIGN_ENCODER) {
+    motionDirection = searchDirection;
+    if (nowMs - parkPhaseStartedMs > PARK_ALIGN_TIMEOUT_MS) {
+      abortPark("timeout aligning to park encoder angle");
+      return;
+    }
+
     const float encoderTarget = readParamFloatOrDefault("pkenc", PARK_DEFAULT_ENCODER_ANGLE_DEG);
-    const float remainingEncoderDeg = directedEncoderDistance(encoderDeg, encoderTarget, direction);
+    const float remainingEncoderDeg = directedEncoderDistance(encoderDeg, encoderTarget, searchDirection);
 
     if (remainingEncoderDeg <= PARK_ENCODER_TOLERANCE_DEG) {
       completePark();
@@ -1589,7 +1641,7 @@ static void parkUpdate(float dt)
     requestedSpeedMagnitude = fminf(parkVelocity, brakingSpeed);
   }
 
-  const float targetVelocity = static_cast<float>(direction) * requestedSpeedMagnitude;
+  const float targetVelocity = static_cast<float>(motionDirection) * requestedSpeedMagnitude;
   const float maxVelocityDelta = PARK_ACCEL_DEG_S2 * dt;
 
   if (parkCommandVelocityDegS < targetVelocity) {
@@ -1670,17 +1722,29 @@ void servoUpdate()
   if (jointCtrl.isSettled()) {
     setMotorVelocityDegPerSecond(0.0f);
     tmc.stopInternalMotion();
+    servoLastCmdDegS = 0.0f;
+    wsSetState(LedState::READY);
+
+    if (servoHoldEnabled()) {
+      if (!servoHoldActive) {
+        servoHoldActive = true;
+        LOG_NFO("Move complete zeroed=%.3f deg servo-hold active\r\n",
+                jointGetPositionDeg());
+      }
+      return;
+    }
 
     if (!motorHoldEnabled()) {
       tmc.disableDriver(false);
     }
 
     motionMode = MotionMode::IDLE;
-    servoLastCmdDegS = 0.0f;
-    wsSetState(LedState::READY);
+    servoHoldActive = false;
     LOG_NFO("Move complete zeroed=%.3f deg motor=%s\r\n",
             jointGetPositionDeg(),
             motorHoldEnabled() ? "hold" : "disabled");
+  } else {
+    servoHoldActive = false;
   }
 }
 
@@ -1753,7 +1817,7 @@ void setup()
   }
   LOG_NFO("Use zero, then save, to store a new logical zero.\r\n");
   LOG_NFO("MOTOR_DIRECTION_SIGN=-1.0 from real hardware tests.\r\n");
-  LOG_NFO("Runtime params: kp ki kd ffv ilim vmax amax sct outmax ptol vtol dbent dbext dbvel vtau stdeg jrev jmin jmax jtol loglvl mhold zoff pkdir pkvel pkenc pkpos.\r\n");
+  LOG_NFO("Runtime params: kp ki kd ffv ilim vmax amax sct outmax ptol vtol dbent dbext dbvel vtau stdeg jrev jmin jmax jtol loglvl mhold shold zoff pkdir pkvel pkenc pkpos.\r\n");
   LOG_NFO("trace toggles on/off; trace 0..4 selects output mode.\r\n");
   LOG_NFO("Example: set kp 1.0 / set vmax 3.0 / save\r\n");
 

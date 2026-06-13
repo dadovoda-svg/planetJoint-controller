@@ -391,6 +391,7 @@ During motion, a small PID ringing overshoot is allowed. With the default `jtol=
 | `irun` | TMC2209 run current scale | `10` |
 | `ihold` | TMC2209 hold current scale | `4` |
 | `mhold` | Motor behavior after a completed position move: `0` disables the bridge, `1` keeps the driver enabled at hold current | `0` |
+| `shold` | Active servo hold at target: `0` stops position control when settled, `1` keeps the controller active and corrects external disturbances | `0` |
 | `jrev` | Real joint degrees per one complete encoder revolution | `15.6` |
 
 The velocity conversion is:
@@ -453,6 +454,21 @@ Fault conditions still disable the driver for safety.
 | Target reached | Driver disabled | Driver remains enabled and transitions to hold current |
 | `stop` command | Driver disabled | Driver disabled |
 | Encoder/controller fault | Driver disabled | Driver disabled |
+
+### Active Servo Hold at Target
+
+`mhold` only keeps the motor electrically energized after a move. It does not actively return the joint to target if the joint is disturbed.
+
+For active correction at target, enable:
+
+```text
+set shold 1
+save
+```
+
+With `shold = 1`, after the target is reached the firmware keeps the position loop active. The commanded velocity is zero while the joint remains settled; if an external force moves the joint away from target, the controller drives it back.
+
+`stop` still stops all motion and disables the motor bridge.
 
 ### Logging
 
