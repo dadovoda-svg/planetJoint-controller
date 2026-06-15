@@ -52,3 +52,16 @@ The AS5600 has no parity bit. Therefore:
 - `lastParityOk()` returns `true`;
 - `lastErrorFlag()` reports an I2C transport/read error;
 - `lastReadOk()` reports the result of the latest complete angle read.
+
+## AS5600 runtime filter configuration
+
+When the firmware is built for the AS5600 encoder, the driver now applies a deterministic volatile `CONF` register setup at startup:
+
+```text
+PM  = nominal
+WD  = off
+FTH = off
+SF  = 4x slow filter
+```
+
+The configuration is written via I2C at each boot and does not burn AS5600 OTP settings.

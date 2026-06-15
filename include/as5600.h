@@ -12,6 +12,11 @@ public:
 
   void begin();
 
+  // Configure AS5600 volatile CONF register for deterministic runtime behavior.
+  // The default project configuration is PM=NOM, WD=OFF, FTH=OFF, SF=4x.
+  bool configureDefaultFilter();
+
+
   bool readRaw(uint16_t& rawAngle);
 
   // Raw encoder angle, modulo one encoder revolution, in encoder degrees.
@@ -62,6 +67,8 @@ private:
   int64_t _continuousCounts = 0;
 
   bool readNative12(uint16_t& raw12);
+  bool readRegister8(uint8_t reg, uint8_t& value);
+  bool writeRegister8(uint8_t reg, uint8_t value);
   int64_t updateContinuousCounts(uint16_t rawAngle);
   float continuousCountsToOutputDegrees(int64_t counts) const;
   float continuousCountsToEncoderDegrees(int64_t counts) const;

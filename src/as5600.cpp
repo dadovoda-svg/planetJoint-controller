@@ -1,8 +1,26 @@
 #include "as5600.h"
 #include <math.h>
 
+static constexpr uint8_t AS5600_REG_CONF_H = 0x07;
+static constexpr uint8_t AS5600_REG_CONF_L = 0x08;
 static constexpr uint8_t AS5600_REG_RAW_ANGLE_H = 0x0C;
 static constexpr uint16_t AS5600_NATIVE_MASK = 0x0FFF;
+
+// AS5600 CONF register layout is split across two bytes at 0x07/0x08.
+// For this project we preserve HYST/OUTS/PWMF and explicitly force:
+//   PM  = NOMINAL (0)
+//   SF  = 4x      (2)
+//   FTH = OFF     (0)
+//   WD  = OFF     (0)
+// This keeps the I2C angle path deterministic without changing analog/PWM output settings.
+static constexpr uint8_t AS5600_CONF_L_PM_MASK = 0x03;
+static constexpr uint8_t AS5600_CONF_H_SF_MASK = 0x03;
+static constexpr uint8_t AS5600_CONF_H_FTH_MASK = 0x1C;
+static constexpr uint8_t AS5600_CONF_H_WD_MASK = 0x20;
+static constexpr uint8_t AS5600_CONF_PM_NOMINAL = 0x00;
+static constexpr uint8_t AS5600_CONF_SF_4X = 0x02;
+static constexpr uint8_t AS5600_CONF_FTH_OFF = 0x00;
+static constexpr uint8_t AS5600_CONF_WD_OFF = 0x00;
 
 AS5600::AS5600(TwoWire& wire, uint8_t address)
   : _wire(wire), _address(address) {}
@@ -13,7 +31,68 @@ void AS5600::begin() {
   _lastParityOk = true;
   _lastErrorFlag = false;
   _lastContinuousDeg = 0.0f;
+  _lastErrorFlag = !configureDefaultFilter();
   resetContinuousTracking();
+}
+
+
+bool AS5600::readRegister8(uint8_t reg, uint8_t& value) {
+  _wire.beginTransmission(_address);
+  _wire.write(reg);
+
+  if (_wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  const uint8_t requested = 1;
+  const uint8_t received = _wire.requestFrom(_address, requested);
+  if (received != requested || _wire.available() < requested) {
+    while (_wire.available()) {
+      _wire.read();
+    }
+    return false;
+  }
+
+  value = static_cast<uint8_t>(_wire.read());
+  return true;
+}
+
+bool AS5600::writeRegister8(uint8_t reg, uint8_t value) {
+  _wire.beginTransmission(_address);
+  _wire.write(reg);
+  _wire.write(value);
+  return _wire.endTransmission() == 0;
+}
+
+bool AS5600::configureDefaultFilter() {
+  uint8_t confHigh = 0;
+  uint8_t confLow = 0;
+
+  if (!readRegister8(AS5600_REG_CONF_H, confHigh)) {
+    return false;
+  }
+  if (!readRegister8(AS5600_REG_CONF_L, confLow)) {
+    return false;
+  }
+
+  confLow &= static_cast<uint8_t>(~AS5600_CONF_L_PM_MASK);
+  confLow |= AS5600_CONF_PM_NOMINAL;
+
+  confHigh &= static_cast<uint8_t>(~(AS5600_CONF_H_SF_MASK |
+                                     AS5600_CONF_H_FTH_MASK |
+                                     AS5600_CONF_H_WD_MASK));
+  confHigh |= AS5600_CONF_SF_4X;
+  confHigh |= AS5600_CONF_FTH_OFF;
+  confHigh |= AS5600_CONF_WD_OFF;
+
+  if (!writeRegister8(AS5600_REG_CONF_H, confHigh)) {
+    return false;
+  }
+  if (!writeRegister8(AS5600_REG_CONF_L, confLow)) {
+    return false;
+  }
+
+  return true;
 }
 
 void AS5600::resetContinuousTracking() {

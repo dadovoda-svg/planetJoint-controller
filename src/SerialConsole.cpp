@@ -14,7 +14,7 @@ extern bool toggleTest(float microstepsPerSecond);
 extern bool moveStep(float steps);
 extern bool calibrateStepsPerDegree(float targetDegrees);
 extern float getStdegCalibrationDefaultTargetDeg();
-extern void setZero();
+extern bool setZero();
 extern bool startPark();
 extern bool moveJointToDeg(float targetDeg);
 extern bool jointMoveTo(float targetDeg, float vmaxDegS, float amaxDegS2);

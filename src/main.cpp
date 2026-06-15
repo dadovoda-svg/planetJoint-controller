@@ -19,12 +19,13 @@ using MagneticEncoder = AS5600;
 #include "SCurvePosVelController.h"
 #include "JointPlanner.h"
 #include "logger.h"
+#include "JointBusSlave.h"
 
 // ===================== BAUDRATE =====================
 
-static constexpr uint32_t USB_BAUD    = 115200;
-static constexpr uint32_t UART0_BAUD  = 115200;
-static constexpr uint32_t TMC_BAUD    = 230400;
+static constexpr uint32_t USB_BAUD      = 115200;
+static constexpr uint32_t JOINTBUS_BAUD = 500000;
+static constexpr uint32_t TMC_BAUD      = 230400;
 
 // ===================== PIN MAP =====================
 
@@ -42,6 +43,7 @@ static constexpr int PIN_TMC_STEP = 4;
 static constexpr int PIN_TMC_DIR  = 5;
 static constexpr int PIN_TMC_ENN  = 6;
 static constexpr int PIN_PARK_SENSOR = 3; // active LOW, external pull-up
+static constexpr int PIN_RS485_RTS   = 9; // UART0 RTS -> SP3485 DE, hardware RS485 half-duplex
 
 // ===================== MECHANICAL SCALE =====================
 
@@ -52,7 +54,7 @@ static constexpr float DEFAULT_JOINT_DEGREES_PER_ENCODER_REV = 15.6f;
 
 // Direction correction between positive controller output and real positive joint motion.
 // If the first low-speed test moves away from the target, change this to -1.0f.
-static constexpr float MOTOR_DIRECTION_SIGN = -1.0f;
+static constexpr float MOTOR_DIRECTION_SIGN = 1.0f;
 
 // ===================== VERY CONSERVATIVE SERVO DEFAULTS =====================
 
@@ -98,6 +100,16 @@ static constexpr float PARK_ENCODER_TOLERANCE_DEG = 0.15f;
 static constexpr uint32_t PARK_RELEASE_TIMEOUT_MS = 60000;
 static constexpr uint32_t PARK_SEARCH_TIMEOUT_MS = 120000;
 static constexpr uint32_t PARK_ALIGN_TIMEOUT_MS = 60000;
+
+// ===================== JOINTBUS HOME COMMAND =====================
+
+// HOME is a JointBus command that moves the already-referenced joint to the
+// logical zero position. It never runs the park procedure implicitly: if this
+// firmware is configured for multi-turn park mode, HOME is accepted only after
+// park has completed and jointReferenced is true.
+static constexpr float JOINTBUS_HOME_TARGET_DEG = 0.0f;
+static constexpr float JOINTBUS_HOME_VMAX_DEG_S = 8.0f;
+static constexpr float JOINTBUS_HOME_AMAX_DEG_S2 = 15.0f;
 
 // ===================== STDEG CALIBRATION =====================
 
@@ -148,7 +160,7 @@ TwoWire EncoderI2C(0);
 MagneticEncoder encoder(EncoderI2C, AS5600_I2C_ADDRESS);
 #endif
 
-HardwareSerial SerialFuture(0);
+HardwareSerial SerialJointBus(0);
 HardwareSerial SerialTMC(2);
 
 Tmc2209Driver tmc(SerialTMC, tmcPins, tmcConfig);
@@ -156,7 +168,10 @@ SCurvePosVelController jointCtrl;
 
 PersistentParams params;
 SerialConsole console(Serial, params);
-JointPlanner planner(SerialFuture);
+JointPlanner planner(SerialJointBus);
+
+static JointBus::SlaveHooks jointBusHooks;
+static JointBus::Slave jointBus(SerialJointBus, 0, jointBusHooks, PIN_RS485_RTS);
 
 // ===================== STATE =====================
 
@@ -208,6 +223,10 @@ static float servoLastCmdDegS = 0.0f;
 static bool servoHoldActive = false;
 bool tmcReady = false;
 
+static bool jointBusLastLimitClipped = false;
+static bool jointBusRebootPending = false;
+static uint32_t jointBusRebootRequestedMs = 0;
+
 MotionMode motionMode = MotionMode::IDLE;
 
 // Forward declarations for helpers used by parameter callbacks.
@@ -216,6 +235,9 @@ void stopMotion();
 static void applyZeroOffsetFromParams(bool rebaseController);
 static void parkUpdate(float dt);
 static void abortPark(const char* reason);
+static void setupJointBusHooks();
+static uint8_t readJointBusAddressFromParams();
+bool startPark();
 
 // ===================== PARAMS =====================
 
@@ -496,6 +518,8 @@ void paramsInit()
   params.initKey("dbvel", SERVO_DEADBAND_VEL);
   params.initKey("vtau", SERVO_VEL_FILTER_TAU_S);
 
+  params.initKey("addr", 0.0f); // JointBus slave address, 0..15
+
   params.load();
   applyLogLevelFromParams(false);
   applyZeroOffsetFromParams(false);
@@ -740,6 +764,13 @@ void onConsoleParamSet(const char* key)
 
   if (strcmp(key, "stdeg") == 0) {
     LOG_NFO("steps/degree now %.6f microsteps/deg\r\n", stepsPerDegree());
+    return;
+  }
+
+  if (strcmp(key, "addr") == 0) {
+    const uint8_t newAddress = readJointBusAddressFromParams();
+    jointBus.setAddress(newAddress);
+    LOG_NFO("JointBus address set to %u. Use 'save' to persist it.\r\n", static_cast<unsigned>(newAddress));
     return;
   }
 
@@ -1329,11 +1360,11 @@ bool calibrateStepsPerDegree(float targetDegrees = STDEG_CALIBRATION_TARGET_DEG)
   return updated;
 }
 
-void setZero()
+bool setZero()
 {
   if (!jointReferenced) {
     Serial.println("[ERR] Zero rejected: execute park first");
-    return;
+    return false;
   }
   testEnabled = false;
   testStepEnabled = false;
@@ -1358,7 +1389,7 @@ void setZero()
     encoderOk = false;
     Serial.println("[ERR] Encoder read failed while setting zero");
     wsSetState(LedState::ENCODER_ERROR);
-    return;
+    return false;
   }
 
   encoderZero = jointDeg;
@@ -1373,6 +1404,7 @@ void setZero()
   wsSetState(LedState::READY);
   Serial.printf("Zero set at joint_abs=%.3f deg; zoff updated in RAM; use 'save' to persist it\r\n",
                 encoderZero);
+  return true;
 }
 
 void printServoStatus()
@@ -1432,6 +1464,327 @@ void printServoStatus()
                 static_cast<unsigned long>(PARK_RELEASE_TIMEOUT_MS),
                 static_cast<unsigned long>(PARK_SEARCH_TIMEOUT_MS),
                 static_cast<unsigned long>(PARK_ALIGN_TIMEOUT_MS));
+}
+
+
+// ===================== JOINTBUS SLAVE HOOKS =====================
+
+static int16_t jointBusDegToCdeg(float valueDeg)
+{
+  if (!isfinite(valueDeg)) {
+    return 0;
+  }
+
+  const float clipped = constrain(valueDeg, -327.68f, 327.67f);
+  return static_cast<int16_t>(lroundf(clipped * 100.0f));
+}
+
+static float jointBusCdegToDeg(int16_t valueCdeg)
+{
+  return static_cast<float>(valueCdeg) * 0.01f;
+}
+
+static uint16_t jointBusCdegSToUInt(uint16_t valueCdegS)
+{
+  return valueCdegS;
+}
+
+static uint8_t readJointBusAddressFromParams()
+{
+  float value = 0.0f;
+  if (!params.get("addr", value) || !isfinite(value)) {
+    value = 0.0f;
+  }
+
+  if (value < 0.0f) {
+    value = 0.0f;
+  }
+  if (value > 15.0f) {
+    value = 15.0f;
+  }
+
+  return static_cast<uint8_t>(lroundf(value)) & 0x0F;
+}
+
+static JointBus::AckCode jointBusMoveAckForRequestedTarget(float requestedDeg)
+{
+  float clippedDeg = requestedDeg;
+  if (!jointClipTargetToLimits(requestedDeg, clippedDeg)) {
+    return JointBus::AckCode::Accepted;
+  }
+
+  const float eps = 0.005f;
+  if (clippedDeg < requestedDeg - eps) {
+    jointBusLastLimitClipped = true;
+    return JointBus::AckCode::ClippedToMax;
+  }
+  if (clippedDeg > requestedDeg + eps) {
+    jointBusLastLimitClipped = true;
+    return JointBus::AckCode::ClippedToMin;
+  }
+
+  jointBusLastLimitClipped = false;
+  return JointBus::AckCode::Accepted;
+}
+
+static JointBus::CommandResult jointBusMove(void* context,
+                                            int16_t targetCdeg,
+                                            uint16_t vmaxCdegS,
+                                            uint16_t amaxCdegS2)
+{
+  (void)context;
+
+  const float targetDeg = jointBusCdegToDeg(targetCdeg);
+  const float vmaxDegS = static_cast<float>(jointBusCdegSToUInt(vmaxCdegS)) * 0.01f;
+  const float amaxDegS2 = static_cast<float>(jointBusCdegSToUInt(amaxCdegS2)) * 0.01f;
+  const JointBus::AckCode ack = jointBusMoveAckForRequestedTarget(targetDeg);
+
+  if (!jointMoveTo(targetDeg, vmaxDegS, amaxDegS2)) {
+    if (jointHasFault()) {
+      return JointBus::CommandResult::fail(JointBus::NackCode::FaultActive);
+    }
+    if (!jointReferenced) {
+      return JointBus::CommandResult::fail(JointBus::NackCode::NotHomed);
+    }
+    return JointBus::CommandResult::fail(JointBus::NackCode::RejectedByState);
+  }
+
+  return JointBus::CommandResult::ok(ack);
+}
+
+static JointBus::CommandResult jointBusMoveB(void* context,
+                                             int16_t targetCdeg,
+                                             uint16_t vmaxCdegS,
+                                             uint16_t amaxCdegS2)
+{
+  (void)context;
+
+  const float targetDeg = jointBusCdegToDeg(targetCdeg);
+  const float vmaxDegS = static_cast<float>(jointBusCdegSToUInt(vmaxCdegS)) * 0.01f;
+  const float amaxDegS2 = static_cast<float>(jointBusCdegSToUInt(amaxCdegS2)) * 0.01f;
+  const JointBus::AckCode ack = jointBusMoveAckForRequestedTarget(targetDeg);
+
+  if (!jointMoveToBlended(targetDeg, vmaxDegS, amaxDegS2)) {
+    if (jointHasFault()) {
+      return JointBus::CommandResult::fail(JointBus::NackCode::FaultActive);
+    }
+    if (!jointReferenced) {
+      return JointBus::CommandResult::fail(JointBus::NackCode::NotHomed);
+    }
+    return JointBus::CommandResult::fail(JointBus::NackCode::RejectedByState);
+  }
+
+  return JointBus::CommandResult::ok(ack);
+}
+
+static JointBus::CommandResult jointBusHome(void* context)
+{
+  (void)context;
+
+  // HOME is intentionally not an implicit PARK. In multi-turn mode the joint
+  // must already be referenced by a completed park cycle before HOME can move
+  // to the logical zero position.
+  if (!jointReferenced) {
+    LOG_NFO("JointBus HOME rejected: execute park first\r\n");
+    return JointBus::CommandResult::fail(JointBus::NackCode::NotHomed);
+  }
+
+  const JointBus::AckCode ack = jointBusMoveAckForRequestedTarget(JOINTBUS_HOME_TARGET_DEG);
+  if (!jointMoveTo(JOINTBUS_HOME_TARGET_DEG,
+                   JOINTBUS_HOME_VMAX_DEG_S,
+                   JOINTBUS_HOME_AMAX_DEG_S2)) {
+    if (jointHasFault()) {
+      return JointBus::CommandResult::fail(JointBus::NackCode::FaultActive);
+    }
+    if (!jointReferenced) {
+      return JointBus::CommandResult::fail(JointBus::NackCode::NotHomed);
+    }
+    return JointBus::CommandResult::fail(JointBus::NackCode::RejectedByState);
+  }
+
+  LOG_NFO("JointBus HOME accepted: target=%.3f deg vmax=%.3f deg/s amax=%.3f deg/s2\r\n",
+          JOINTBUS_HOME_TARGET_DEG,
+          JOINTBUS_HOME_VMAX_DEG_S,
+          JOINTBUS_HOME_AMAX_DEG_S2);
+  return JointBus::CommandResult::ok(ack);
+}
+
+static JointBus::CommandResult jointBusZero(void* context)
+{
+  (void)context;
+
+  if (!jointReferenced) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::NotHomed);
+  }
+
+  if (!setZero()) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::InternalError);
+  }
+
+  return JointBus::CommandResult::ok(JointBus::AckCode::Accepted);
+}
+
+static JointBus::CommandResult jointBusPark(void* context)
+{
+  (void)context;
+
+  if (startPark()) {
+    return JointBus::CommandResult::ok(JointBus::AckCode::Accepted);
+  }
+
+  if (jointHasFault()) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::FaultActive);
+  }
+  return JointBus::CommandResult::fail(JointBus::NackCode::RejectedByState);
+}
+
+static JointBus::CommandResult jointBusStop(void* context)
+{
+  (void)context;
+  return jointStop()
+      ? JointBus::CommandResult::ok(JointBus::AckCode::Accepted)
+      : JointBus::CommandResult::fail(JointBus::NackCode::InternalError);
+}
+
+static JointBus::CommandResult jointBusReboot(void* context, uint16_t magic)
+{
+  (void)context;
+
+  if (magic != JointBus::REBOOT_MAGIC) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::BadPayload);
+  }
+
+  jointBusRebootPending = true;
+  jointBusRebootRequestedMs = millis();
+  return JointBus::CommandResult::ok(JointBus::AckCode::Accepted);
+}
+
+static JointBus::JointState jointBusCurrentState()
+{
+  if (jointHasFault() || motionMode == MotionMode::FAULT) {
+    return JointBus::JointState::Fault;
+  }
+
+  if (motionMode == MotionMode::PARK) {
+    return JointBus::JointState::Parking;
+  }
+
+  if (motionMode == MotionMode::POSITION) {
+    // In servo-hold mode the position controller intentionally remains armed
+    // after the target has been reached, so it can correct small disturbances.
+    // This must not be reported as SETTLING/BUSY to the external JointBus
+    // master: once isSettled() is true, the commanded move is complete.
+    if (jointCtrl.isSettled()) {
+      return JointBus::JointState::Holding;
+    }
+    return JointBus::JointState::Moving;
+  }
+
+  if (motionMode == MotionMode::CALIBRATION ||
+      motionMode == MotionMode::VELOCITY_TEST ||
+      motionMode == MotionMode::STEP_TEST) {
+    return JointBus::JointState::Moving;
+  }
+
+  if (!jointReferenced) {
+    return JointBus::JointState::Init;
+  }
+
+  const Tmc2209Driver::Status driverStatus = tmc.status();
+  if (servoHoldActive || driverStatus == Tmc2209Driver::Status::Enabled) {
+    return JointBus::JointState::Holding;
+  }
+
+  return JointBus::JointState::Ready;
+}
+
+static JointBus::JointFault jointBusCurrentFault()
+{
+  if (!encoderOk) {
+    return JointBus::JointFault::EncoderError;
+  }
+
+  if (motionMode == MotionMode::FAULT || jointCtrl.fault()) {
+    if (jointCtrl.faultCode() == SCurvePosVelController::FaultCode::PositionLimitExceeded) {
+      return JointBus::JointFault::PositionLimit;
+    }
+    if (jointCtrl.faultCode() == SCurvePosVelController::FaultCode::BadLimits) {
+      return JointBus::JointFault::PlannerError;
+    }
+    return JointBus::JointFault::InternalError;
+  }
+
+  if (!tmcReady) {
+    return JointBus::JointFault::DriverError;
+  }
+
+  return JointBus::JointFault::None;
+}
+
+static bool jointBusStatus(void* context, JointBus::Status& outStatus)
+{
+  (void)context;
+
+  outStatus.posCdeg = jointBusDegToCdeg(jointGetPositionDeg());
+  outStatus.targetCdeg = jointBusDegToCdeg(jointGetTargetDeg());
+  outStatus.velCdegS = jointBusDegToCdeg(jointGetMeasuredVelocityDegS());
+  outStatus.state = jointBusCurrentState();
+  outStatus.fault = jointBusCurrentFault();
+  return true;
+}
+
+static bool jointBusQuickStatus(void* context, uint8_t& outQuickStatus)
+{
+  (void)context;
+
+  uint8_t flags = 0;
+  const bool fault = jointHasFault() || motionMode == MotionMode::FAULT || !encoderOk || !tmcReady;
+  const bool positionCommandBusy = (motionMode == MotionMode::POSITION) && !jointCtrl.isSettled();
+  const bool busy = positionCommandBusy ||
+                    motionMode == MotionMode::PARK ||
+                    motionMode == MotionMode::CALIBRATION ||
+                    motionMode == MotionMode::VELOCITY_TEST ||
+                    motionMode == MotionMode::STEP_TEST;
+
+  if (busy) {
+    flags |= JointBus::QSTAT_BUSY;
+  }
+  if (!busy && !fault) {
+    flags |= JointBus::QSTAT_DONE;
+  }
+  if (fault) {
+    flags |= JointBus::QSTAT_FAULT;
+  }
+  if (tmc.status() == Tmc2209Driver::Status::Enabled) {
+    flags |= JointBus::QSTAT_ENABLED;
+  }
+  if (jointReferenced) {
+    flags |= JointBus::QSTAT_HOMED;
+  }
+  if (jointBusLastLimitClipped) {
+    flags |= JointBus::QSTAT_WARNING;
+    flags |= JointBus::QSTAT_LIMIT_CLIPPED;
+  }
+
+  outQuickStatus = flags;
+  return true;
+}
+
+static void setupJointBusHooks()
+{
+  JointBus::SlaveHooks hooks;
+  hooks.context = nullptr;
+  hooks.move = jointBusMove;
+  hooks.moveb = jointBusMoveB;
+  hooks.home = jointBusHome;
+  hooks.zero = jointBusZero;
+  hooks.park = jointBusPark;
+  hooks.stop = jointBusStop;
+  hooks.reboot = jointBusReboot;
+  hooks.status = jointBusStatus;
+  hooks.quickStatus = jointBusQuickStatus;
+
+  jointBus.setHooks(hooks);
 }
 
 // ===================== PARK REFERENCE =====================
@@ -1752,6 +2105,8 @@ void servoUpdate()
 
 void setup()
 {
+  JointBus::Slave::forceRs485Inactive(PIN_RS485_RTS);
+
   wsLedsInit();
   pinMode(PIN_PARK_SENSOR, INPUT_PULLUP);
   jointReferenced = false;
@@ -1771,7 +2126,18 @@ void setup()
 
   paramsInit();
 
-  planner.begin(UART0_BAUD);
+  setupJointBusHooks();
+  jointBus.setAddress(readJointBusAddressFromParams());
+  if (jointBus.begin(JOINTBUS_BAUD)) {
+    jointBus.flushRx();
+    LOG_NFO("JointBus slave initialized on UART0, baud=%lu, addr=%u, RTS/DE GPIO=%d, hw_rs485=%u\r\n",
+            static_cast<unsigned long>(JOINTBUS_BAUD),
+            static_cast<unsigned>(jointBus.address()),
+            PIN_RS485_RTS,
+            jointBus.hardwareRs485Enabled() ? 1u : 0u);
+  } else {
+    LOG_ERR("JointBus slave initialization failed\r\n");
+  }
 
   if (!tmcInit()) {
     LOG_ERR("Failed to initialize TMC2209 driver\r\n");
@@ -1816,8 +2182,8 @@ void setup()
     LOG_NFO("Multi-turn position is not valid after boot: execute park before any motion.\r\n");
   }
   LOG_NFO("Use zero, then save, to store a new logical zero.\r\n");
-  LOG_NFO("MOTOR_DIRECTION_SIGN=-1.0 from real hardware tests.\r\n");
-  LOG_NFO("Runtime params: kp ki kd ffv ilim vmax amax sct outmax ptol vtol dbent dbext dbvel vtau stdeg jrev jmin jmax jtol loglvl mhold shold zoff pkdir pkvel pkenc pkpos.\r\n");
+  LOG_NFO("MOTOR_DIRECTION_SIGN=1.0 from updated hardware configuration.\r\n");
+  LOG_NFO("Runtime params: kp ki kd ffv ilim vmax amax sct outmax ptol vtol dbent dbext dbvel vtau stdeg jrev jmin jmax jtol loglvl mhold shold zoff pkdir pkvel pkenc pkpos addr.\r\n");
   LOG_NFO("trace toggles on/off; trace 0..4 selects output mode.\r\n");
   LOG_NFO("Example: set kp 1.0 / set vmax 3.0 / save\r\n");
 
@@ -1832,7 +2198,13 @@ void loop()
   const uint32_t now = millis();
 
   console.update();
-  planner.update();
+  jointBus.update();
+
+  if (jointBusRebootPending && static_cast<uint32_t>(now - jointBusRebootRequestedMs) >= 150U) {
+    Serial.flush();
+    ESP.restart();
+  }
+
   wsLedsUpdate();
   servoUpdate();
 

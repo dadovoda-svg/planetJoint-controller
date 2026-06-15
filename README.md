@@ -871,3 +871,38 @@ This build requires a successful `park` command after every boot before normal m
 GPIO3 park sensor is already active when `park` starts, the firmware never
 continues the search movement; it aligns directly to `pkenc`. See
 `README_PARK_REFERENCE.md`.
+
+---
+
+## JointBus binary protocol slave
+
+This baseline integrates the JointBus binary protocol on UART0 as an RS485 slave endpoint.
+
+Summary:
+
+- UART0 / `Serial0`
+- 500000 bps, 8N1
+- ESP32-S3 hardware RS485 half-duplex mode
+- GPIO9 used as UART RTS to drive the SP3485 `DE` input
+- persistent slave address parameter: `addr`, range `0..15`
+- `HOME` command currently exists as a protocol stub and returns `NACK REJECTED_BY_STATE`
+
+The integrated firmware-side files are:
+
+```text
+src/JointBusProtocol.h
+src/JointBusSlave.h
+src/JointBusSlave.cpp
+```
+
+The PC debug tool is included in:
+
+```text
+examples/rs485_debug_tool/
+```
+
+See `README_JOINTBUS_SLAVE_INTEGRATION.md` for details.
+
+## Additional documentation
+
+- `README_NVM_PARAM_LIMIT_48.md` - NVM parameter table capacity increased to 48 items and manual export/import migration note.

@@ -6,7 +6,7 @@
 class PersistentParams {
 public:
     static constexpr uint8_t MAX_KEY_LEN = 6;
-    static constexpr uint8_t MAX_PARAMS  = 32;
+    static constexpr uint8_t MAX_PARAMS  = 48;
 
     enum class LoadResult {
         Ok,
