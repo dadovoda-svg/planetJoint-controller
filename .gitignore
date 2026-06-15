@@ -39,3 +39,7 @@ ControllerV7.0-backups/
 
 # --- Archive path
 archive/
+
+#  ---python
+.venv/
+__pycache__/
