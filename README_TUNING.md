@@ -136,4 +136,5 @@ set shold 1   # keep servo-position hold active at target
 save
 ```
 
+
 With `shold = 1`, an external disturbance that moves the joint away from the target will be corrected automatically. Keep gains and `outmax` conservative during the first tests.
