@@ -26,7 +26,8 @@ public:
   enum class FaultCode : uint8_t {
     None = 0,
     PositionLimitExceeded = 1,
-    BadLimits = 2
+    BadLimits = 2,
+    EmergencyStop = 3
   };
 
   SCurvePosVelController() = default;
@@ -103,6 +104,21 @@ public:
 
   void latchPositionLimitFault(float measured_pos) {
     _fault = FaultCode::PositionLimitExceeded;
+    _fault_latched = true;
+    _i_term = 0.0f;
+    _ref_vel = 0.0f;
+    _ref_acc = 0.0f;
+    _ref_pos = _limits_enabled ? clampf(measured_pos, _pos_min, _pos_max) : measured_pos;
+    _target = _ref_pos;
+    _prev_meas = _ref_pos;
+    _has_prev = false;
+    _meas_vel_f = 0.0f;
+    _last_meas_pos = _ref_pos;
+    _last_meas_vel = 0.0f;
+  }
+
+  void latchEmergencyStop(float measured_pos) {
+    _fault = FaultCode::EmergencyStop;
     _fault_latched = true;
     _i_term = 0.0f;
     _ref_vel = 0.0f;

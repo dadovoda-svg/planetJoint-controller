@@ -8,6 +8,8 @@ namespace JointBus {
 
 static constexpr uint8_t PROTOCOL_VERSION = 0;
 static constexpr uint8_t SOF = 0xA5;
+static constexpr uint8_t BROADCAST_ADDRESS = 0x0F;
+static constexpr uint8_t NO_SEGMENT_ID = 0xFF;
 static constexpr size_t MAX_PAYLOAD = 16;
 static constexpr size_t MAX_FRAME_SIZE = 1 + 1 + 1 + 1 + 1 + MAX_PAYLOAD + 2;
 
@@ -39,12 +41,18 @@ enum class Command : uint8_t {
     QuickStatus= 0x07,
     Zero       = 0x08,
     Park       = 0x09,
+    PrepareMoveB = 0x0A,
+    StartSegment = 0x0B,
+    AbortSegment = 0x0C,
+    QueueStatus  = 0x0D,
+    EmergencyStop = 0x0E,
     Ping       = 0x7F,
 
     Ack        = 0x80,
     Nack       = 0x81,
     StatusRsp  = 0x86,
     QuickStatusRsp = 0x87,
+    QueueStatusRsp = 0x8D,
     ErrorRsp   = 0xFF
 };
 
@@ -55,7 +63,11 @@ enum class AckCode : uint8_t {
     SafeReplan         = 0x03,
     AlreadyDone        = 0x04,
     BlendAccepted      = 0x05,
-    NopAccepted        = 0x06
+    NopAccepted        = 0x06,
+    SegmentPrepared    = 0x07,
+    SegmentStarted     = 0x08,
+    SegmentAborted     = 0x09,
+    EmergencyStopped   = 0x0A
 };
 
 enum class NackCode : uint8_t {
@@ -69,7 +81,10 @@ enum class NackCode : uint8_t {
     RejectedByState    = 0x08,
     UnsupportedVersion = 0x09,
     InternalError      = 0x0A,
-    Timeout            = 0x0B
+    Timeout            = 0x0B,
+    QueueFull          = 0x0C,
+    NoPreparedSegment  = 0x0D,
+    SegmentMismatch    = 0x0E
 };
 
 enum class JointState : uint8_t {
@@ -94,7 +109,8 @@ enum class JointFault : uint8_t {
     BadCommand    = 0x06,
     BadPayload    = 0x07,
     NotHomed      = 0x09,
-    InternalError = 0x0A
+    InternalError = 0x0A,
+    EmergencyStop = 0x0B
 };
 
 enum QuickStatusFlags : uint8_t {
@@ -115,6 +131,26 @@ struct Status {
     int16_t velCdegS = 0;
     JointState state = JointState::Init;
     JointFault fault = JointFault::None;
+};
+
+// QueueStatusRsp payload layout (5 bytes):
+//   byte 0: queue capacity, including the active slot (currently 2)
+//   byte 1: free prepared slots (0 or 1 in the current implementation)
+//   byte 2: active segment id, or NO_SEGMENT_ID
+//   byte 3: prepared segment id, or NO_SEGMENT_ID
+//   byte 4: flags: bit0 active_valid, bit1 prepared_valid, bit2 active_busy
+enum QueueStatusFlags : uint8_t {
+    QQUEUE_ACTIVE_VALID   = 0x01,
+    QQUEUE_PREPARED_VALID = 0x02,
+    QQUEUE_ACTIVE_BUSY    = 0x04
+};
+
+struct QueueStatus {
+    uint8_t capacity = 2;
+    uint8_t freePreparedSlots = 1;
+    uint8_t activeSegmentId = NO_SEGMENT_ID;
+    uint8_t preparedSegmentId = NO_SEGMENT_ID;
+    uint8_t flags = 0;
 };
 
 struct Frame {

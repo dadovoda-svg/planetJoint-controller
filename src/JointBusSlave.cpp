@@ -88,13 +88,27 @@ void Slave::update() {
 }
 
 void Slave::handleFrame(const Frame& request) {
-    if (request.address != _address) {
+    const bool isBroadcast = (request.address == BROADCAST_ADDRESS);
+
+    if (request.address != _address && !isBroadcast) {
         ++_ignoredFrames;
         return;
     }
 
     if (request.type != FrameType::Request) {
-        sendNack(request.seq, NackCode::RejectedByState);
+        if (!isBroadcast) {
+            sendNack(request.seq, NackCode::RejectedByState);
+        }
+        return;
+    }
+
+    // Broadcast frames are intentionally no-reply to avoid RS485 collisions.
+    // Only segment-start/abort and emergency-stop are accepted as broadcast commands in this
+    // protocol revision. Addressed use remains available for debugging.
+    if (isBroadcast && request.command != Command::StartSegment &&
+        request.command != Command::AbortSegment &&
+        request.command != Command::EmergencyStop) {
+        ++_ignoredFrames;
         return;
     }
 
@@ -116,6 +130,58 @@ void Slave::handleFrame(const Frame& request) {
     case Command::MoveB: {
         const CommandResult r = dispatchMoveLike(request, true);
         r.accepted ? sendAck(request.seq, r.ack, r.detail) : sendNack(request.seq, r.nack, r.detail);
+        break;
+    }
+
+    case Command::PrepareMoveB: {
+        const CommandResult r = dispatchPrepareMoveB(request);
+        r.accepted ? sendAck(request.seq, r.ack, r.detail) : sendNack(request.seq, r.nack, r.detail);
+        break;
+    }
+
+    case Command::StartSegment: {
+        if (request.payloadLen != 1) {
+            if (!isBroadcast) {
+                sendNack(request.seq, NackCode::BadLength);
+            }
+            break;
+        }
+        const uint8_t segmentId = request.payload[0];
+        const CommandResult r = _hooks.startSegment ? _hooks.startSegment(_hooks.context, segmentId)
+                                                    : CommandResult::fail(NackCode::BadCommand);
+        if (!isBroadcast) {
+            r.accepted ? sendAck(request.seq, r.ack, r.detail) : sendNack(request.seq, r.nack, r.detail);
+        }
+        break;
+    }
+
+    case Command::AbortSegment: {
+        if (request.payloadLen != 1) {
+            if (!isBroadcast) {
+                sendNack(request.seq, NackCode::BadLength);
+            }
+            break;
+        }
+        const uint8_t segmentId = request.payload[0];
+        const CommandResult r = _hooks.abortSegment ? _hooks.abortSegment(_hooks.context, segmentId)
+                                                    : CommandResult::fail(NackCode::BadCommand);
+        if (!isBroadcast) {
+            r.accepted ? sendAck(request.seq, r.ack, r.detail) : sendNack(request.seq, r.nack, r.detail);
+        }
+        break;
+    }
+
+    case Command::QueueStatus: {
+        if (request.payloadLen != 0) {
+            sendNack(request.seq, NackCode::BadLength);
+            break;
+        }
+        QueueStatus status;
+        if (_hooks.queueStatus && _hooks.queueStatus(_hooks.context, status)) {
+            sendQueueStatus(request.seq, status);
+        } else {
+            sendNack(request.seq, NackCode::InternalError);
+        }
         break;
     }
 
@@ -160,6 +226,21 @@ void Slave::handleFrame(const Frame& request) {
         const CommandResult r = _hooks.stop ? _hooks.stop(_hooks.context)
                                             : CommandResult::fail(NackCode::BadCommand);
         r.accepted ? sendAck(request.seq, r.ack, r.detail) : sendNack(request.seq, r.nack, r.detail);
+        break;
+    }
+
+    case Command::EmergencyStop: {
+        if (request.payloadLen != 0) {
+            if (!isBroadcast) {
+                sendNack(request.seq, NackCode::BadLength);
+            }
+            break;
+        }
+        const CommandResult r = _hooks.emergencyStop ? _hooks.emergencyStop(_hooks.context)
+                                                     : CommandResult::fail(NackCode::BadCommand);
+        if (!isBroadcast) {
+            r.accepted ? sendAck(request.seq, r.ack, r.detail) : sendNack(request.seq, r.nack, r.detail);
+        }
         break;
     }
 
@@ -212,7 +293,9 @@ void Slave::handleFrame(const Frame& request) {
         break;
 
     default:
-        sendNack(request.seq, NackCode::BadCommand);
+        if (!isBroadcast) {
+            sendNack(request.seq, NackCode::BadCommand);
+        }
         break;
     }
 }
@@ -237,6 +320,30 @@ CommandResult Slave::dispatchMoveLike(const Frame& request, bool blended) {
 
     return _hooks.move ? _hooks.move(_hooks.context, targetCdeg, vmaxCdegS, amaxCdegS2)
                        : CommandResult::fail(NackCode::BadCommand);
+}
+
+
+CommandResult Slave::dispatchPrepareMoveB(const Frame& request) {
+    if (request.payloadLen != 7) {
+        return CommandResult::fail(NackCode::BadLength);
+    }
+
+    const uint8_t segmentId = request.payload[0];
+    if (segmentId == NO_SEGMENT_ID) {
+        return CommandResult::fail(NackCode::BadPayload);
+    }
+
+    const int16_t targetCdeg = getI16LE(&request.payload[1]);
+    const uint16_t vmaxCdegS = getU16LE(&request.payload[3]);
+    const uint16_t amaxCdegS2 = getU16LE(&request.payload[5]);
+
+    if (vmaxCdegS == 0 || amaxCdegS2 == 0) {
+        return CommandResult::fail(NackCode::BadPayload);
+    }
+
+    return _hooks.prepareMoveB
+        ? _hooks.prepareMoveB(_hooks.context, segmentId, targetCdeg, vmaxCdegS, amaxCdegS2)
+        : CommandResult::fail(NackCode::BadCommand);
 }
 
 void Slave::sendAck(uint8_t seq, AckCode code, uint8_t detail) {
@@ -288,6 +395,21 @@ void Slave::sendQuickStatus(uint8_t seq, uint8_t qstatus) {
     f.command = Command::QuickStatusRsp;
     f.payloadLen = 1;
     f.payload[0] = qstatus;
+    sendFrame(f);
+}
+
+void Slave::sendQueueStatus(uint8_t seq, const QueueStatus& status) {
+    Frame f;
+    f.address = _address;
+    f.type = FrameType::Response;
+    f.seq = seq;
+    f.command = Command::QueueStatusRsp;
+    f.payloadLen = 5;
+    f.payload[0] = status.capacity;
+    f.payload[1] = status.freePreparedSlots;
+    f.payload[2] = status.activeSegmentId;
+    f.payload[3] = status.preparedSegmentId;
+    f.payload[4] = status.flags;
     sendFrame(f);
 }
 

@@ -31,6 +31,8 @@ SOF = 0xA5
 PROTOCOL_VERSION = 0
 MAX_PAYLOAD = 16
 REBOOT_MAGIC = 0xB007
+BROADCAST_ADDRESS = 0x0F
+NO_SEGMENT_ID = 0xFF
 
 
 class FrameType(enum.IntEnum):
@@ -49,12 +51,18 @@ class Command(enum.IntEnum):
     QUICK_STATUS = 0x07
     ZERO = 0x08
     PARK = 0x09
+    PREPARE_MOVEB = 0x0A
+    START_SEGMENT = 0x0B
+    ABORT_SEGMENT = 0x0C
+    QUEUE_STATUS = 0x0D
+    EMERGENCY_STOP = 0x0E
     PING = 0x7F
 
     ACK = 0x80
     NACK = 0x81
     STATUS_RSP = 0x86
     QUICK_STATUS_RSP = 0x87
+    QUEUE_STATUS_RSP = 0x8D
     ERROR_RSP = 0xFF
 
 
@@ -66,6 +74,10 @@ ACK_CODES: Dict[int, str] = {
     0x04: "ALREADY_DONE",
     0x05: "BLEND_ACCEPTED",
     0x06: "NOP_ACCEPTED",
+    0x07: "SEGMENT_PREPARED",
+    0x08: "SEGMENT_STARTED",
+    0x09: "SEGMENT_ABORTED",
+    0x0A: "EMERGENCY_STOPPED",
 }
 
 NACK_CODES: Dict[int, str] = {
@@ -80,6 +92,9 @@ NACK_CODES: Dict[int, str] = {
     0x09: "UNSUPPORTED_VERSION",
     0x0A: "INTERNAL_ERROR",
     0x0B: "TIMEOUT",
+    0x0C: "QUEUE_FULL",
+    0x0D: "NO_PREPARED_SEGMENT",
+    0x0E: "SEGMENT_MISMATCH",
 }
 
 JOINT_STATES: Dict[int, str] = {
@@ -105,6 +120,7 @@ JOINT_FAULTS: Dict[int, str] = {
     0x07: "BAD_PAYLOAD",
     0x09: "NOT_HOMED",
     0x0A: "INTERNAL_ERROR",
+    0x0B: "EMERGENCY_STOP",
 }
 
 QUICK_STATUS_FLAGS: Sequence[Tuple[int, str]] = (
@@ -115,6 +131,12 @@ QUICK_STATUS_FLAGS: Sequence[Tuple[int, str]] = (
     (0x10, "HOMED"),
     (0x20, "WARNING"),
     (0x40, "LIMIT_CLIPPED"),
+)
+
+QUEUE_STATUS_FLAGS: Sequence[Tuple[int, str]] = (
+    (0x01, "ACTIVE_VALID"),
+    (0x02, "PREPARED_VALID"),
+    (0x04, "ACTIVE_BUSY"),
 )
 
 
@@ -268,6 +290,9 @@ class JointBusClient:
         self.simulated_position_cdeg: Dict[int, int] = {addr: 0 for addr in self.simulated_nodes}
         self.simulated_target_cdeg: Dict[int, int] = {addr: 0 for addr in self.simulated_nodes}
         self.simulated_enabled: Dict[int, bool] = {addr: False for addr in self.simulated_nodes}
+        self.simulated_prepared: Dict[int, Optional[Tuple[int, int, int, int]]] = {addr: None for addr in self.simulated_nodes}
+        self.simulated_active_segment: Dict[int, Optional[int]] = {addr: None for addr in self.simulated_nodes}
+        self.simulated_fault: Dict[int, int] = {addr: 0 for addr in self.simulated_nodes}
 
         if not self.offline:
             if serial is None:
@@ -317,7 +342,13 @@ class JointBusClient:
         rsp_command = Command.ACK
         rsp_payload = bytes((0x00, 0x00))
 
-        if command == Command.NOP:
+        if self.simulated_fault.get(address, 0) and command in (
+            Command.MOVE, Command.MOVEB, Command.PREPARE_MOVEB,
+            Command.START_SEGMENT, Command.HOME, Command.ZERO, Command.PARK
+        ):
+            rsp_command = Command.NACK
+            rsp_payload = bytes((0x06, self.simulated_fault[address] & 0xFF))
+        elif command == Command.NOP:
             rsp_payload = bytes((0x06, 0x00))
         elif command == Command.MOVE or command == Command.MOVEB:
             if len(payload) != 6:
@@ -340,6 +371,74 @@ class JointBusClient:
             self.simulated_target_cdeg[address] = 0
             self.simulated_position_cdeg[address] = 0
             self.simulated_enabled[address] = True
+        elif command == Command.PREPARE_MOVEB:
+            if len(payload) != 7:
+                rsp_command = Command.NACK
+                rsp_payload = bytes((0x02, 0x00))
+            elif self.simulated_prepared[address] is not None:
+                rsp_command = Command.NACK
+                rsp_payload = bytes((0x0C, self.simulated_prepared[address][0]))
+            else:
+                segment_id = payload[0]
+                target, vmax, amax = struct.unpack_from("<hHH", payload, 1)
+                self.simulated_prepared[address] = (segment_id, target, vmax, amax)
+                rsp_payload = bytes((0x07, segment_id))
+        elif command == Command.START_SEGMENT:
+            if len(payload) != 1:
+                rsp_command = Command.NACK
+                rsp_payload = bytes((0x02, 0x00))
+            else:
+                segment_id = payload[0]
+                prepared = self.simulated_prepared[address]
+                if prepared is None:
+                    rsp_command = Command.NACK
+                    rsp_payload = bytes((0x0D, 0x00))
+                elif prepared[0] != segment_id:
+                    rsp_command = Command.NACK
+                    rsp_payload = bytes((0x0E, prepared[0]))
+                else:
+                    _sid, target, _vmax, _amax = prepared
+                    self.simulated_target_cdeg[address] = target
+                    self.simulated_position_cdeg[address] = target
+                    self.simulated_enabled[address] = True
+                    self.simulated_active_segment[address] = segment_id
+                    self.simulated_prepared[address] = None
+                    rsp_payload = bytes((0x08, segment_id))
+        elif command == Command.ABORT_SEGMENT:
+            if len(payload) != 1:
+                rsp_command = Command.NACK
+                rsp_payload = bytes((0x02, 0x00))
+            else:
+                segment_id = payload[0]
+                prepared = self.simulated_prepared[address]
+                if prepared is not None and (segment_id == NO_SEGMENT_ID or prepared[0] == segment_id):
+                    self.simulated_prepared[address] = None
+                    rsp_payload = bytes((0x09, segment_id))
+                else:
+                    rsp_command = Command.NACK
+                    rsp_payload = bytes((0x0D, segment_id))
+        elif command == Command.QUEUE_STATUS:
+            rsp_command = Command.QUEUE_STATUS_RSP
+            active = self.simulated_active_segment[address]
+            prepared = self.simulated_prepared[address]
+            flags = 0
+            if active is not None:
+                flags |= 0x01
+            if prepared is not None:
+                flags |= 0x02
+            rsp_payload = bytes((
+                2,
+                0 if prepared is not None else 1,
+                active if active is not None else NO_SEGMENT_ID,
+                prepared[0] if prepared is not None else NO_SEGMENT_ID,
+                flags,
+            ))
+        elif command == Command.EMERGENCY_STOP:
+            self.simulated_enabled[address] = False
+            self.simulated_prepared[address] = None
+            self.simulated_active_segment[address] = None
+            self.simulated_fault[address] = 0x0B
+            rsp_payload = bytes((0x0A, 0x00))
         elif command == Command.STOP:
             self.simulated_enabled[address] = False
         elif command == Command.REBOOT:
@@ -350,20 +449,26 @@ class JointBusClient:
                 self.simulated_enabled[address] = False
         elif command == Command.STATUS:
             rsp_command = Command.STATUS_RSP
-            state = 0x04 if self.simulated_enabled[address] else 0x06
+            fault = self.simulated_fault.get(address, 0)
+            state = 0x08 if fault else (0x04 if self.simulated_enabled[address] else 0x06)
             rsp_payload = struct.pack(
                 "<hhhBB",
                 self.simulated_position_cdeg[address],
                 self.simulated_target_cdeg[address],
                 0,
                 state,
-                0x00,
+                fault,
             )
         elif command == Command.QUICK_STATUS:
             rsp_command = Command.QUICK_STATUS_RSP
-            flags = 0x02 | 0x10
-            if self.simulated_enabled[address]:
-                flags |= 0x08
+            fault = self.simulated_fault.get(address, 0)
+            flags = 0x10
+            if fault:
+                flags |= 0x04 | 0x20
+            else:
+                flags |= 0x02
+                if self.simulated_enabled[address]:
+                    flags |= 0x08
             rsp_payload = bytes((flags,))
         elif command == Command.PING:
             rsp_payload = bytes((0x00, 0x00))
@@ -377,6 +482,64 @@ class JointBusClient:
         if frame and self.show_hex:
             print(f"RX [{len(frame.raw):2d}]: {hex_bytes(frame.raw)}")
         return frame
+
+    def send_no_response(self, address: int, command: Command, payload: bytes = b"") -> None:
+        sequence = self.next_sequence()
+        request = encode_frame(address, sequence, command, payload)
+
+        if self.show_hex:
+            print(f"TX [{len(request):2d}]: {hex_bytes(request)}")
+
+        if self.offline:
+            self._simulate_no_response(address, sequence, command, payload)
+            return
+
+        assert self.serial is not None
+        self.serial.write(request)
+        self.serial.flush()
+
+    def _simulate_no_response(self, address: int, sequence: int, command: Command, payload: bytes) -> None:
+        if command == Command.START_SEGMENT and len(payload) == 1:
+            segment_id = payload[0]
+            targets = self.simulated_nodes if address == BROADCAST_ADDRESS else {address}
+            for node in targets:
+                prepared = self.simulated_prepared.get(node)
+                if prepared is None:
+                    continue
+                prepared_id, target, _vmax, _amax = prepared
+                if prepared_id != segment_id:
+                    continue
+                self.simulated_target_cdeg[node] = target
+                self.simulated_position_cdeg[node] = target
+                self.simulated_enabled[node] = True
+                self.simulated_active_segment[node] = segment_id
+                self.simulated_prepared[node] = None
+            print(f"NO RESPONSE EXPECTED: START_SEGMENT id={segment_id} address={address}")
+            return
+
+        if command == Command.ABORT_SEGMENT and len(payload) == 1:
+            segment_id = payload[0]
+            targets = self.simulated_nodes if address == BROADCAST_ADDRESS else {address}
+            for node in targets:
+                prepared = self.simulated_prepared.get(node)
+                if prepared is None:
+                    continue
+                if segment_id == NO_SEGMENT_ID or prepared[0] == segment_id:
+                    self.simulated_prepared[node] = None
+            print(f"NO RESPONSE EXPECTED: ABORT_SEGMENT id={segment_id} address={address}")
+            return
+
+        if command == Command.EMERGENCY_STOP and len(payload) == 0:
+            targets = self.simulated_nodes if address == BROADCAST_ADDRESS else {address}
+            for node in targets:
+                self.simulated_enabled[node] = False
+                self.simulated_prepared[node] = None
+                self.simulated_active_segment[node] = None
+                self.simulated_fault[node] = 0x0B
+            print(f"NO RESPONSE EXPECTED: EMERGENCY_STOP address={address}")
+            return
+
+        print(f"NO RESPONSE EXPECTED: address={address} command={command.name}")
 
     def transact(self, address: int, command: Command, payload: bytes = b"") -> Optional[Frame]:
         sequence = self.next_sequence()
@@ -426,6 +589,18 @@ def describe_quick_status(value: int) -> str:
     return " | ".join(flags) if flags else "NO_FLAGS"
 
 
+def describe_queue_status_flags(value: int) -> str:
+    flags = [name for mask, name in QUEUE_STATUS_FLAGS if value & mask]
+    reserved = value & 0xF8
+    if reserved:
+        flags.append(f"RESERVED(0x{reserved:02X})")
+    return " | ".join(flags) if flags else "NO_FLAGS"
+
+
+def segment_id_text(value: int) -> str:
+    return "none" if value == NO_SEGMENT_ID else str(value)
+
+
 def describe_frame(frame: Frame) -> str:
     command_name = Command(frame.command).name if frame.command in Command._value2member_map_ else f"0x{frame.command:02X}"
     prefix = (
@@ -463,6 +638,19 @@ def describe_frame(frame: Frame) -> str:
             return f"{prefix} INVALID_QUICK_STATUS_LENGTH={len(frame.payload)}"
         value = frame.payload[0]
         return f"{prefix} qstatus=0x{value:02X} [{describe_quick_status(value)}]"
+
+    if frame.command == Command.QUEUE_STATUS_RSP:
+        if len(frame.payload) != 5:
+            return f"{prefix} INVALID_QUEUE_STATUS_LENGTH={len(frame.payload)}"
+        capacity, free_slots, active_id, prepared_id, flags = frame.payload
+        return (
+            f"{prefix}\n"
+            f"  capacity        : {capacity}\n"
+            f"  free prep slots : {free_slots}\n"
+            f"  active segment  : {segment_id_text(active_id)}\n"
+            f"  prepared segment: {segment_id_text(prepared_id)}\n"
+            f"  queue flags     : 0x{flags:02X} [{describe_queue_status_flags(flags)}]"
+        )
 
     payload_text = hex_bytes(frame.payload) if frame.payload else "<empty>"
     return f"{prefix} payload={payload_text}"
@@ -514,6 +702,20 @@ class JointBusShell(cmd.Cmd):
         """stop <address> -- stop immediately and disable the motor."""
         self._simple(line, Command.STOP)
 
+    def do_estop(self, line: str) -> None:
+        """estop [address|all] -- latch emergency-stop fault. Default/all uses broadcast no-response."""
+        tokens = line.split()
+        if not tokens or tokens[0].lower() in ("all", "*", "broadcast"):
+            self.client.send_no_response(BROADCAST_ADDRESS, Command.EMERGENCY_STOP)
+            return
+        address = parse_address(tokens[0])
+        if address == BROADCAST_ADDRESS:
+            self.client.send_no_response(BROADCAST_ADDRESS, Command.EMERGENCY_STOP)
+            return
+        frame = self.client.transact(address, Command.EMERGENCY_STOP)
+        if frame:
+            print(describe_frame(frame))
+
     def do_status(self, line: str) -> None:
         """status <address> -- request extended status."""
         self._simple(line, Command.STATUS)
@@ -540,6 +742,53 @@ class JointBusShell(cmd.Cmd):
     def do_moveb(self, line: str) -> None:
         """moveb <address> <angle_deg> <vmax_deg_s> <amax_deg_s2>."""
         self._move(line, Command.MOVEB)
+
+    def do_prepmb(self, line: str) -> None:
+        """prepmb <address> <segment_id> <angle_deg> <vmax_deg_s> <amax_deg_s2> -- prepare a coordinated blended segment."""
+        tokens = self._tokens(line, 5, "prepmb <address> <segment_id> <angle_deg> <vmax_deg_s> <amax_deg_s2>")
+        address = parse_address(tokens[0])
+        segment_id = parse_segment_id(tokens[1], allow_none=False)
+        angle = cdeg_signed(float(tokens[2]))
+        vmax = cdeg_unsigned(float(tokens[3]), "vmax")
+        amax = cdeg_unsigned(float(tokens[4]), "amax")
+        payload = bytes((segment_id,)) + struct.pack("<hHH", angle, vmax, amax)
+        frame = self.client.transact(address, Command.PREPARE_MOVEB, payload)
+        if frame:
+            print(describe_frame(frame))
+
+    def do_start(self, line: str) -> None:
+        """start <segment_id> [address] -- start a prepared segment. Defaults to broadcast/no response."""
+        tokens = self._tokens(line, 1, "start <segment_id> [address]")
+        segment_id = parse_segment_id(tokens[0], allow_none=False)
+        payload = bytes((segment_id,))
+        if len(tokens) >= 2:
+            address = parse_address(tokens[1])
+            frame = self.client.transact(address, Command.START_SEGMENT, payload)
+            if frame:
+                print(describe_frame(frame))
+        else:
+            self.client.send_no_response(BROADCAST_ADDRESS, Command.START_SEGMENT, payload)
+
+    def do_abortseg(self, line: str) -> None:
+        """abortseg <segment_id|all> [address] -- cancel prepared segment(s). Defaults to broadcast/no response."""
+        tokens = self._tokens(line, 1, "abortseg <segment_id|all> [address]")
+        segment_id = parse_segment_id(tokens[0], allow_none=True)
+        payload = bytes((segment_id,))
+        if len(tokens) >= 2:
+            address = parse_address(tokens[1])
+            frame = self.client.transact(address, Command.ABORT_SEGMENT, payload)
+            if frame:
+                print(describe_frame(frame))
+        else:
+            self.client.send_no_response(BROADCAST_ADDRESS, Command.ABORT_SEGMENT, payload)
+
+    def do_qqueue(self, line: str) -> None:
+        """qqueue <address> -- request coordinated segment queue status."""
+        self._simple(line, Command.QUEUE_STATUS)
+
+    def do_queue(self, line: str) -> None:
+        """queue <address> -- alias for qqueue."""
+        self.do_qqueue(line)
 
     def do_reboot(self, line: str) -> None:
         """reboot <address> [magic] -- reboot node; default magic is 0xB007."""
@@ -643,6 +892,15 @@ def parse_address(text: str) -> int:
     value = int(text, 0)
     if not 0 <= value <= 15:
         raise ValueError("address must be in range 0..15")
+    return value
+
+
+def parse_segment_id(text: str, allow_none: bool = False) -> int:
+    if allow_none and text.lower() in ("all", "none", "*"):
+        return NO_SEGMENT_ID
+    value = int(text, 0)
+    if not 0 <= value <= 254:
+        raise ValueError("segment_id must be in range 0..254")
     return value
 
 

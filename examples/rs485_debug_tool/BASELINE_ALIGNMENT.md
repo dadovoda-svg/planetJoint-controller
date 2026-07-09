@@ -1,21 +1,26 @@
-# Protocol alignment requirement
+# Debug Tool Baseline Alignment
 
-`planetjoint_rs485_debug.py` is a reference diagnostic implementation of the JointBus protocol.
+This Python tool is part of the JointBus protocol baseline and must be updated whenever the embedded protocol changes.
 
-It must remain aligned with the C++ master/slave library for every change affecting:
+Keep it aligned with:
 
-- frame structure and header bit layout;
-- command and response identifiers;
-- payload sizes, types, byte order, and scaling;
-- CRC algorithm and byte order;
-- ACK/NACK result codes;
-- compact and extended status fields;
-- startup purge, NOP/SYNC, addressing, timeout, and retry behavior.
+- frame layout and CRC
+- command IDs
+- response IDs
+- ACK/NACK codes
+- payload layouts and scaling
+- status and quick-status fields
+- coordinated segment commands
+- broadcast/no-response behavior
 
-A protocol change is not complete until both the C++ implementation and this Python tool have been updated and tested together.
+Current coordinated segment commands supported by this tool:
 
-- Protocol commands include ZERO (0x08) and PARK (0x09); keep both the C++ API and Python console synchronized.
+```text
+PREPARE_MOVEB   0x0A
+START_SEGMENT   0x0B
+ABORT_SEGMENT   0x0C
+QUEUE_STATUS    0x0D
+QUEUE_STATUS_RSP 0x8D
+```
 
-## ESP32-S3 hardware RS485 update
-
-The C++ master and slave now use `UART_MODE_RS485_HALF_DUPLEX` with the SP3485 `DE` input connected to UART RTS (GPIO9 in the current hardware). The Python USB-RS485 debug tool is unaffected because USB adapters normally manage their own transmit direction automatically. Protocol framing and command IDs are unchanged by this physical-layer update.
+`start <segment_id>` sends broadcast address `15` and expects no response unless an explicit address is provided.

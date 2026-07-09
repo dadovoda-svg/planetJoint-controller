@@ -8,6 +8,18 @@ For the firmware-specific integration notes, see:
 README_JOINTBUS_SLAVE_INTEGRATION.md
 ```
 
+For the coordinated segment / broadcast start extension, see:
+
+```text
+README_JOINTBUS_COORDINATED_SEGMENTS.md
+```
+
+For the emergency stop command, see:
+
+```text
+README_JOINTBUS_EMERGENCY_STOP.md
+```
+
 For RS485 speed considerations, see:
 
 ```text

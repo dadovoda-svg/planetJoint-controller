@@ -24,7 +24,10 @@ using MagneticEncoder = AS5600;
 // ===================== BAUDRATE =====================
 
 static constexpr uint32_t USB_BAUD      = 115200;
-static constexpr uint32_t JOINTBUS_BAUD = 500000;
+#ifndef JOINTBUS_BAUD_921600
+#define JOINTBUS_BAUD_921600 0
+#endif
+static constexpr uint32_t JOINTBUS_BAUD = JOINTBUS_BAUD_921600 ? 921600UL : 500000UL;
 static constexpr uint32_t TMC_BAUD      = 230400;
 
 // ===================== PIN MAP =====================
@@ -227,11 +230,25 @@ static bool jointBusLastLimitClipped = false;
 static bool jointBusRebootPending = false;
 static uint32_t jointBusRebootRequestedMs = 0;
 
+struct JointBusPreparedSegment {
+  bool valid = false;
+  uint8_t segmentId = JointBus::NO_SEGMENT_ID;
+  int16_t targetCdeg = 0;
+  uint16_t vmaxCdegS = 0;
+  uint16_t amaxCdegS2 = 0;
+};
+
+static JointBusPreparedSegment jointBusPreparedSegment;
+static bool jointBusActiveSegmentValid = false;
+static uint8_t jointBusActiveSegmentId = JointBus::NO_SEGMENT_ID;
+
 MotionMode motionMode = MotionMode::IDLE;
 
 // Forward declarations for helpers used by parameter callbacks.
 float jointGetPositionDeg();
 void stopMotion();
+static void latchEmergencyStopFault(const char* source);
+static void jointBusClearCoordinatedSegments();
 static void applyZeroOffsetFromParams(bool rebaseController);
 static void parkUpdate(float dt);
 static void abortPark(const char* reason);
@@ -1049,6 +1066,36 @@ void stopMotion()
   wsSetState(jointReferenced ? LedState::READY : LedState::BOOT);
 }
 
+
+static void latchEmergencyStopFault(const char* source)
+{
+  parkPhase = ParkPhase::IDLE;
+  parkCommandVelocityDegS = 0.0f;
+  testEnabled = false;
+  testStepEnabled = false;
+  stepNum = 0;
+  servoLastCmdDegS = 0.0f;
+  servoHoldActive = false;
+
+  if (tmcReady) {
+    setMotorVelocityDegPerSecond(0.0f);
+    tmc.stopInternalMotion();
+    tmc.disableDriver(false);
+  }
+
+  jointBusClearCoordinatedSegments();
+
+  const float currentZeroedDeg = jointGetPositionDeg();
+  jointCtrl.latchEmergencyStop(currentZeroedDeg);
+  servoTargetZeroedDeg = currentZeroedDeg;
+  motionMode = MotionMode::FAULT;
+  wsSetState(LedState::FAULT);
+
+  LOG_ERR("Emergency stop latched by %s at zeroed=%.3f deg\r\n",
+          source ? source : "unknown",
+          currentZeroedDeg);
+}
+
 void jointControllerInit(float currentJointDeg)
 {
   applyControllerParamsFromParams();
@@ -1506,6 +1553,40 @@ static uint8_t readJointBusAddressFromParams()
   return static_cast<uint8_t>(lroundf(value)) & 0x0F;
 }
 
+static bool jointBusMotionBusy()
+{
+  const bool positionCommandBusy = (motionMode == MotionMode::POSITION) && !jointCtrl.isSettled();
+  return positionCommandBusy ||
+         motionMode == MotionMode::PARK ||
+         motionMode == MotionMode::CALIBRATION ||
+         motionMode == MotionMode::VELOCITY_TEST ||
+         motionMode == MotionMode::STEP_TEST;
+}
+
+static void jointBusClearPreparedSegment()
+{
+  jointBusPreparedSegment.valid = false;
+  jointBusPreparedSegment.segmentId = JointBus::NO_SEGMENT_ID;
+  jointBusPreparedSegment.targetCdeg = 0;
+  jointBusPreparedSegment.vmaxCdegS = 0;
+  jointBusPreparedSegment.amaxCdegS2 = 0;
+}
+
+static void jointBusClearCoordinatedSegments()
+{
+  jointBusClearPreparedSegment();
+  jointBusActiveSegmentValid = false;
+  jointBusActiveSegmentId = JointBus::NO_SEGMENT_ID;
+}
+
+static void jointBusSegmentQueueUpdate()
+{
+  if (jointBusActiveSegmentValid && !jointBusMotionBusy()) {
+    jointBusActiveSegmentValid = false;
+    jointBusActiveSegmentId = JointBus::NO_SEGMENT_ID;
+  }
+}
+
 static JointBus::AckCode jointBusMoveAckForRequestedTarget(float requestedDeg)
 {
   float clippedDeg = requestedDeg;
@@ -1549,6 +1630,7 @@ static JointBus::CommandResult jointBusMove(void* context,
     return JointBus::CommandResult::fail(JointBus::NackCode::RejectedByState);
   }
 
+  jointBusClearCoordinatedSegments();
   return JointBus::CommandResult::ok(ack);
 }
 
@@ -1574,7 +1656,165 @@ static JointBus::CommandResult jointBusMoveB(void* context,
     return JointBus::CommandResult::fail(JointBus::NackCode::RejectedByState);
   }
 
+  jointBusClearCoordinatedSegments();
   return JointBus::CommandResult::ok(ack);
+}
+
+static JointBus::CommandResult jointBusPrepareMoveB(void* context,
+                                                    uint8_t segmentId,
+                                                    int16_t targetCdeg,
+                                                    uint16_t vmaxCdegS,
+                                                    uint16_t amaxCdegS2)
+{
+  (void)context;
+
+  if (segmentId == JointBus::NO_SEGMENT_ID) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::BadPayload);
+  }
+  if (jointBusPreparedSegment.valid) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::QueueFull,
+                                         jointBusPreparedSegment.segmentId);
+  }
+  if (jointHasFault()) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::FaultActive);
+  }
+  if (!jointReferenced) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::NotHomed);
+  }
+  if (!encoderOk || !tmcReady) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::InternalError);
+  }
+  if (motionMode == MotionMode::CALIBRATION ||
+      motionMode == MotionMode::PARK ||
+      motionMode == MotionMode::VELOCITY_TEST ||
+      motionMode == MotionMode::STEP_TEST) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::Busy);
+  }
+
+  const float requestedDeg = jointBusCdegToDeg(targetCdeg);
+  float clippedDeg = requestedDeg;
+  if (!jointClipTargetToLimits(requestedDeg, clippedDeg)) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::InternalError);
+  }
+
+  JointBus::AckCode ack = JointBus::AckCode::SegmentPrepared;
+  const float eps = 0.005f;
+  if (clippedDeg < requestedDeg - eps) {
+    jointBusLastLimitClipped = true;
+    ack = JointBus::AckCode::ClippedToMax;
+  } else if (clippedDeg > requestedDeg + eps) {
+    jointBusLastLimitClipped = true;
+    ack = JointBus::AckCode::ClippedToMin;
+  } else {
+    jointBusLastLimitClipped = false;
+  }
+
+  jointBusPreparedSegment.valid = true;
+  jointBusPreparedSegment.segmentId = segmentId;
+  jointBusPreparedSegment.targetCdeg = jointBusDegToCdeg(clippedDeg);
+  jointBusPreparedSegment.vmaxCdegS = vmaxCdegS;
+  jointBusPreparedSegment.amaxCdegS2 = amaxCdegS2;
+
+  LOG_NFO("JointBus segment prepared id=%u target=%.3f deg vmax=%.3f deg/s amax=%.3f deg/s2%s\r\n",
+          static_cast<unsigned>(segmentId),
+          clippedDeg,
+          static_cast<float>(vmaxCdegS) * 0.01f,
+          static_cast<float>(amaxCdegS2) * 0.01f,
+          ack == JointBus::AckCode::SegmentPrepared ? "" : " clipped");
+
+  return JointBus::CommandResult::ok(ack, segmentId);
+}
+
+static JointBus::CommandResult jointBusStartSegment(void* context, uint8_t segmentId)
+{
+  (void)context;
+
+  if (!jointBusPreparedSegment.valid) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::NoPreparedSegment);
+  }
+  if (jointBusPreparedSegment.segmentId != segmentId) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::SegmentMismatch,
+                                         jointBusPreparedSegment.segmentId);
+  }
+  if (jointHasFault()) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::FaultActive);
+  }
+  if (!jointReferenced) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::NotHomed);
+  }
+
+  const float targetDeg = jointBusCdegToDeg(jointBusPreparedSegment.targetCdeg);
+  const float vmaxDegS = static_cast<float>(jointBusPreparedSegment.vmaxCdegS) * 0.01f;
+  const float amaxDegS2 = static_cast<float>(jointBusPreparedSegment.amaxCdegS2) * 0.01f;
+
+  if (!jointMoveToBlended(targetDeg, vmaxDegS, amaxDegS2)) {
+    if (jointHasFault()) {
+      return JointBus::CommandResult::fail(JointBus::NackCode::FaultActive);
+    }
+    if (!jointReferenced) {
+      return JointBus::CommandResult::fail(JointBus::NackCode::NotHomed);
+    }
+    return JointBus::CommandResult::fail(JointBus::NackCode::RejectedByState);
+  }
+
+  jointBusActiveSegmentValid = true;
+  jointBusActiveSegmentId = segmentId;
+  jointBusClearPreparedSegment();
+
+  LOG_NFO("JointBus segment started id=%u target=%.3f deg vmax=%.3f deg/s amax=%.3f deg/s2\r\n",
+          static_cast<unsigned>(segmentId),
+          targetDeg,
+          vmaxDegS,
+          amaxDegS2);
+
+  return JointBus::CommandResult::ok(JointBus::AckCode::SegmentStarted, segmentId);
+}
+
+static JointBus::CommandResult jointBusAbortSegment(void* context, uint8_t segmentId)
+{
+  (void)context;
+
+  if (segmentId == JointBus::NO_SEGMENT_ID) {
+    jointBusClearPreparedSegment();
+    return JointBus::CommandResult::ok(JointBus::AckCode::SegmentAborted, segmentId);
+  }
+
+  if (jointBusPreparedSegment.valid && jointBusPreparedSegment.segmentId == segmentId) {
+    jointBusClearPreparedSegment();
+    return JointBus::CommandResult::ok(JointBus::AckCode::SegmentAborted, segmentId);
+  }
+
+  if (jointBusActiveSegmentValid && jointBusActiveSegmentId == segmentId) {
+    // Active motion is not aborted by this command. Use STOP for an immediate
+    // coordinated stop. AbortSegment only flushes the prepared next segment.
+    return JointBus::CommandResult::fail(JointBus::NackCode::Busy, segmentId);
+  }
+
+  return JointBus::CommandResult::fail(JointBus::NackCode::NoPreparedSegment, segmentId);
+}
+
+static bool jointBusQueueStatus(void* context, JointBus::QueueStatus& outStatus)
+{
+  (void)context;
+  jointBusSegmentQueueUpdate();
+
+  outStatus.capacity = 2;
+  outStatus.freePreparedSlots = jointBusPreparedSegment.valid ? 0 : 1;
+  outStatus.activeSegmentId = jointBusActiveSegmentValid ? jointBusActiveSegmentId : JointBus::NO_SEGMENT_ID;
+  outStatus.preparedSegmentId = jointBusPreparedSegment.valid ? jointBusPreparedSegment.segmentId : JointBus::NO_SEGMENT_ID;
+  outStatus.flags = 0;
+
+  if (jointBusActiveSegmentValid) {
+    outStatus.flags |= JointBus::QQUEUE_ACTIVE_VALID;
+  }
+  if (jointBusPreparedSegment.valid) {
+    outStatus.flags |= JointBus::QQUEUE_PREPARED_VALID;
+  }
+  if (jointBusActiveSegmentValid && jointBusMotionBusy()) {
+    outStatus.flags |= JointBus::QQUEUE_ACTIVE_BUSY;
+  }
+
+  return true;
 }
 
 static JointBus::CommandResult jointBusHome(void* context)
@@ -1606,6 +1846,7 @@ static JointBus::CommandResult jointBusHome(void* context)
           JOINTBUS_HOME_TARGET_DEG,
           JOINTBUS_HOME_VMAX_DEG_S,
           JOINTBUS_HOME_AMAX_DEG_S2);
+  jointBusClearCoordinatedSegments();
   return JointBus::CommandResult::ok(ack);
 }
 
@@ -1621,6 +1862,7 @@ static JointBus::CommandResult jointBusZero(void* context)
     return JointBus::CommandResult::fail(JointBus::NackCode::InternalError);
   }
 
+  jointBusClearCoordinatedSegments();
   return JointBus::CommandResult::ok(JointBus::AckCode::Accepted);
 }
 
@@ -1629,6 +1871,7 @@ static JointBus::CommandResult jointBusPark(void* context)
   (void)context;
 
   if (startPark()) {
+    jointBusClearCoordinatedSegments();
     return JointBus::CommandResult::ok(JointBus::AckCode::Accepted);
   }
 
@@ -1641,9 +1884,19 @@ static JointBus::CommandResult jointBusPark(void* context)
 static JointBus::CommandResult jointBusStop(void* context)
 {
   (void)context;
-  return jointStop()
-      ? JointBus::CommandResult::ok(JointBus::AckCode::Accepted)
-      : JointBus::CommandResult::fail(JointBus::NackCode::InternalError);
+  if (!jointStop()) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::InternalError);
+  }
+  jointBusClearCoordinatedSegments();
+  return JointBus::CommandResult::ok(JointBus::AckCode::Accepted);
+}
+
+
+static JointBus::CommandResult jointBusEmergencyStop(void* context)
+{
+  (void)context;
+  latchEmergencyStopFault("JointBus");
+  return JointBus::CommandResult::ok(JointBus::AckCode::EmergencyStopped);
 }
 
 static JointBus::CommandResult jointBusReboot(void* context, uint16_t magic)
@@ -1711,6 +1964,9 @@ static JointBus::JointFault jointBusCurrentFault()
     if (jointCtrl.faultCode() == SCurvePosVelController::FaultCode::BadLimits) {
       return JointBus::JointFault::PlannerError;
     }
+    if (jointCtrl.faultCode() == SCurvePosVelController::FaultCode::EmergencyStop) {
+      return JointBus::JointFault::EmergencyStop;
+    }
     return JointBus::JointFault::InternalError;
   }
 
@@ -1776,10 +2032,15 @@ static void setupJointBusHooks()
   hooks.context = nullptr;
   hooks.move = jointBusMove;
   hooks.moveb = jointBusMoveB;
+  hooks.prepareMoveB = jointBusPrepareMoveB;
+  hooks.startSegment = jointBusStartSegment;
+  hooks.abortSegment = jointBusAbortSegment;
+  hooks.queueStatus = jointBusQueueStatus;
   hooks.home = jointBusHome;
   hooks.zero = jointBusZero;
   hooks.park = jointBusPark;
   hooks.stop = jointBusStop;
+  hooks.emergencyStop = jointBusEmergencyStop;
   hooks.reboot = jointBusReboot;
   hooks.status = jointBusStatus;
   hooks.quickStatus = jointBusQuickStatus;
@@ -2207,6 +2468,7 @@ void loop()
 
   wsLedsUpdate();
   servoUpdate();
+  jointBusSegmentQueueUpdate();
 
   if (traceEnabled && now - lastEncoderPrintMs >= ENCODER_PRINT_PERIOD_MS) {
     lastEncoderPrintMs = now;

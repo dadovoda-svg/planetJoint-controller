@@ -33,6 +33,11 @@ struct SlaveHooks {
 
     CommandResult (*move)(void* context, int16_t targetCdeg, uint16_t vmaxCdegS, uint16_t amaxCdegS2) = nullptr;
     CommandResult (*moveb)(void* context, int16_t targetCdeg, uint16_t vmaxCdegS, uint16_t amaxCdegS2) = nullptr;
+    CommandResult (*prepareMoveB)(void* context, uint8_t segmentId, int16_t targetCdeg, uint16_t vmaxCdegS, uint16_t amaxCdegS2) = nullptr;
+    CommandResult (*startSegment)(void* context, uint8_t segmentId) = nullptr;
+    CommandResult (*abortSegment)(void* context, uint8_t segmentId) = nullptr;
+    CommandResult (*emergencyStop)(void* context) = nullptr;
+    bool (*queueStatus)(void* context, QueueStatus& outStatus) = nullptr;
     CommandResult (*home)(void* context) = nullptr;
     CommandResult (*zero)(void* context) = nullptr;
     CommandResult (*park)(void* context) = nullptr;
@@ -94,9 +99,11 @@ private:
     void sendNack(uint8_t seq, NackCode code, uint8_t detail = 0);
     void sendStatus(uint8_t seq, const Status& status);
     void sendQuickStatus(uint8_t seq, uint8_t qstatus);
+    void sendQueueStatus(uint8_t seq, const QueueStatus& status);
     void sendFrame(const Frame& frame);
 
     CommandResult dispatchMoveLike(const Frame& request, bool blended);
+    CommandResult dispatchPrepareMoveB(const Frame& request);
 };
 
 } // namespace JointBus

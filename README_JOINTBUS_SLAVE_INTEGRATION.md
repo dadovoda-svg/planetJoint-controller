@@ -196,3 +196,38 @@ This baseline intentionally does not change the USB console command set. The USB
 See `README_JOINTBUS_SHOLD_STATUS_FIX.md`.
 
 When `shold=1`, the position controller may remain armed after the move is complete. JointBus now reports this as `HOLDING`/`DONE`, not `SETTLING`/`BUSY`, as soon as `jointCtrl.isSettled()` is true.
+
+## Coordinated segment extension
+
+This baseline adds a coordinated segment layer for multi-axis planners.
+
+New slave hooks are connected in `main.cpp`:
+
+```text
+prepareMoveB
+startSegment
+abortSegment
+queueStatus
+```
+
+The implementation provides a two-level logical queue:
+
+```text
+active segment
+prepared / next segment
+```
+
+A planner should prepare one `PREPARE_MOVEB` segment per joint using addressed frames, then send one broadcast `START_SEGMENT` frame to address `15`.
+
+Broadcast segment-start and segment-abort frames are no-response to avoid RS485 collisions.
+
+The legacy immediate commands `MOVE` and `MOVEB` remain available and clear the coordinated segment queue when accepted.
+
+## Emergency stop integration
+
+This baseline adds the JointBus `EMERGENCY_STOP` command (`0x0E`).
+
+- Addressed `EMERGENCY_STOP` returns `ACK EMERGENCY_STOPPED`.
+- Broadcast `EMERGENCY_STOP` uses address `15` and does not return a response.
+- The firmware immediately stops the TMC velocity command, stops internal TMC motion, disables the driver bridge, clears the coordinated segment queue, latches the position controller fault as `EmergencyStop`, and enters `MotionMode::FAULT`.
+- Recovery is intentionally not automatic. As with hard mechanical limit faults, motion commands are rejected until an explicit recovery path is used; currently the normal recovery path is reboot.

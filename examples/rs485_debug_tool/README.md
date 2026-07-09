@@ -1,6 +1,6 @@
 # PlanetJoint RS485 Debug Console
 
-`planetjoint_rs485_debug.py` is an interactive Python terminal for testing the PlanetJoint UART/RS485 protocol V0 through a USB-RS485 adapter or in offline simulation mode.
+`planetjoint_rs485_debug.py` is an interactive Python terminal for testing the PlanetJoint UART/RS485 protocol through a USB-RS485 adapter or in offline simulation mode.
 
 ## Requirements
 
@@ -39,13 +39,13 @@ When a specified serial port cannot be opened, the program automatically falls b
 Linux:
 
 ```bash
-python3 planetjoint_rs485_debug.py --port /dev/ttyUSB0 --baud 500000
+python3 planetjoint_rs485_debug.py --port /dev/ttyUSB0 --baud 500000 --no-offline-fallback
 ```
 
 Windows:
 
 ```powershell
-python planetjoint_rs485_debug.py --port COM5 --baud 500000
+python planetjoint_rs485_debug.py --port COM5 --baud 500000 --no-offline-fallback
 ```
 
 Options:
@@ -66,8 +66,16 @@ nop <addr>
 ping <addr>
 move <addr> <angle_deg> <vmax_deg_s> <amax_deg_s2>
 moveb <addr> <angle_deg> <vmax_deg_s> <amax_deg_s2>
+prepmb <addr> <segment_id> <angle_deg> <vmax_deg_s> <amax_deg_s2>
+start <segment_id> [addr]
+abortseg <segment_id|all> [addr]
+qqueue <addr>
+queue <addr>
 home <addr>
+zero <addr>
+park <addr>
 stop <addr>
+estop [addr|all]
 reboot <addr> [magic]
 status <addr>
 qstatus <addr>
@@ -79,17 +87,31 @@ stats
 exit
 ```
 
-Example offline session:
+## Coordinated segment example
+
+Prepare one segment on two joints and start both with one broadcast frame:
 
 ```text
-jointbus> scan 0 15
-jointbus> move 2 45.0 10.0 30.0
-jointbus> status 2
+jointbus> prepmb 1 42 10.0 8.0 15.0
+jointbus> prepmb 2 42 -20.0 8.0 15.0
+jointbus> qqueue 1
+jointbus> qqueue 2
+jointbus> start 42
+jointbus> qstatus 1
 jointbus> qstatus 2
-jointbus> stop 2
 ```
 
-The simulator immediately completes movements and reports the requested target as the current position. Its purpose is protocol and UI testing, not motion-dynamics simulation.
+`start <segment_id>` without an address sends a no-response broadcast frame to address `15`.
+
+For debugging one node, addressed start is also available:
+
+```text
+jointbus> start 42 1
+```
+
+This addressed form expects an ACK/NACK response.
+
+`abortseg all` sends a no-response broadcast that cancels any prepared segment on all nodes. It does not stop active motion; use `stop <addr>` for a recoverable single-node stop or `estop` for a broadcast latched emergency stop.
 
 ## Protocol representation
 
@@ -98,6 +120,7 @@ The terminal accepts human-readable degrees and converts them to the protocol re
 - target angle: signed `int16`, centidegrees
 - maximum velocity: unsigned `uint16`, centidegrees/s
 - maximum acceleration: unsigned `uint16`, centidegrees/s²
+- segment id: `uint8`, range `0..254`; `255` is reserved as `none/all`
 - all multibyte fields: little-endian
 - CRC: CRC-16/MODBUS, transmitted little-endian
 
@@ -107,11 +130,14 @@ The tool validates response address, sequence number, frame type, protocol versi
 
 Most USB-RS485 adapters automatically control their transmitter-enable signal. The Python program therefore does not directly manage a DE GPIO. The adapter must release the bus quickly enough after the last transmitted byte to receive the slave response.
 
-## ZERO and PARK
+## Emergency stop
 
 ```text
-zero <address>
-park <address>
+estop
+estop all
+estop <addr>
 ```
 
-`zero` sets the current joint position as the zero reference. `park` starts the asynchronous movement to the locally configured park position; use `qstatus` or `status` to monitor completion.
+Without an address, `estop` sends broadcast `EMERGENCY_STOP` to address `15` and expects no response. With an address, it sends an addressed command and expects ACK/NACK.
+
+After emergency stop, poll each node with `qstatus` or `status`; the expected extended status is `state=FAULT` and `fault=EMERGENCY_STOP`.
