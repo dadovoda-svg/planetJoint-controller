@@ -20,6 +20,12 @@ For the emergency stop command, see:
 README_JOINTBUS_EMERGENCY_STOP.md
 ```
 
+For the single-call motion configuration query (`jmin`, `jmax`, `vmax`, `amax`), including master integration instructions, see:
+
+```text
+README_JOINTBUS_MOTION_CONFIG.md
+```
+
 For RS485 speed considerations, see:
 
 ```text

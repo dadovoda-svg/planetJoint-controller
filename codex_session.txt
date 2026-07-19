@@ -1,2 +1,5 @@
 cd /home/davide/Documents/Projects/documents/FreeCAD1.0/riduttorePlanetario/firmware/PlanetJoint-controller
-codex
+codex resume 019f7b49-2dcf-76d2-b49e-b4165d71685d
+
+
+jmin, jmax, vmax, amax

@@ -79,6 +79,8 @@ estop [addr|all]
 reboot <addr> [magic]
 status <addr>
 qstatus <addr>
+mconfig <addr>
+config <addr>
 sync <first_addr> <last_addr> [passes]
 scan [first_addr] [last_addr]
 purge
@@ -86,6 +88,19 @@ hex on|off
 stats
 exit
 ```
+
+`mconfig` (or its `config` alias) sends the addressed `MOTION_CONFIG` request and prints all four planning parameters returned by the node:
+
+```text
+jointbus> mconfig 1
+addr=1 seq=1 type=RESPONSE cmd=MOTION_CONFIG_RSP
+  jmin : -170.00 deg
+  jmax : 170.00 deg
+  vmax : 2.00 deg/s
+  amax : 6.00 deg/s^2
+```
+
+The offline simulator uses these same defaults for nodes `0..7`.
 
 ## Coordinated segment example
 
@@ -120,6 +135,7 @@ The terminal accepts human-readable degrees and converts them to the protocol re
 - target angle: signed `int16`, centidegrees
 - maximum velocity: unsigned `uint16`, centidegrees/s
 - maximum acceleration: unsigned `uint16`, centidegrees/s²
+- motion configuration response: `<hhHH` containing `jmin`, `jmax`, `vmax`, `amax`
 - segment id: `uint8`, range `0..254`; `255` is reserved as `none/all`
 - all multibyte fields: little-endian
 - CRC: CRC-16/MODBUS, transmitted little-endian

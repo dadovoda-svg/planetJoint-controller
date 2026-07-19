@@ -21,6 +21,8 @@ START_SEGMENT   0x0B
 ABORT_SEGMENT   0x0C
 QUEUE_STATUS    0x0D
 QUEUE_STATUS_RSP 0x8D
+MOTION_CONFIG    0x0F
+MOTION_CONFIG_RSP 0x8F
 ```
 
 `start <segment_id>` sends broadcast address `15` and expects no response unless an explicit address is provided.

@@ -30,7 +30,7 @@ The firmware is built with the Arduino framework and PlatformIO.
 - Planner-style position commands: `move` and `moveb`
 - Smart retargeting for `moveb`: blend only when safe, otherwise safe replan
 - USB CDC serial console with interactive commands
-- Dedicated serial interface object passed to the planner constructor for future external planner integration
+- Motion commands accepted through JointBus and the local USB console
 - Persistent configuration storage in ESP32 NVS
 - Header-only logger with selectable runtime log level
 - Optional motor hold at target using TMC2209 `IHOLD` current
@@ -102,19 +102,23 @@ README_JOINT_LIMITS.md
 
 src/
 ├── main.cpp
-├── JointPlanner.h
 ├── JointPlanner.cpp
-├── SCurvePosVelController.h
-├── as5048a.h
 ├── as5048a.cpp
 ├── led_status.h
 ├── led_status.cpp
-├── logger.h
-├── params.h
-├── SerialConsole.h
 ├── SerialConsole.cpp
-├── Tmc2209Driver.h
 └── Tmc2209Driver.cpp
+
+include/
+├── JointMotionApi.h
+├── JointPlanner.h
+├── SCurvePosVelController.h
+├── JointBusProtocol.h
+└── ...
+
+test/
+├── test_joint_planner.cpp
+└── test_parser.cpp
 ```
 
 ### Main / Planner Split
@@ -137,14 +141,15 @@ src/JointPlanner.h
 src/JointPlanner.cpp
 ```
 
-The planner module currently owns the higher-level motion commands:
+The planner module owns the transport-independent motion operations:
 
-- `jointMoveTo(...)`
-- `jointMoveToBlended(...)`
-- `moveJointToDeg(...)`
-- `jointStop()`
+- `JointPlanner::moveTo(...)`
+- `JointPlanner::moveToBlended(...)`
+- `JointPlanner::stop()`
 
-The current refactor is intentionally conservative: the planner module still binds to the already tested low-level objects through existing firmware symbols instead of taking ownership of all hardware. This keeps the validated hardware behavior stable while making the motion layer easier to extend.
+`JointPlannerRuntime` is the explicit boundary between planning policy and firmware hardware/state. `main.cpp` supplies the real runtime adapter, while host tests supply a fake runtime. The planner has no global `extern` bindings and does not depend on Arduino serial or hardware classes.
+
+The shared entry points used by JointBus and `SerialConsole` are declared in `JointMotionApi.h`. Commands return a typed `JointMoveOutcome`, including rejection reason, target clipping and whether a blended command used a full blend or a safe replan.
 
 ## Pinout
 
@@ -160,45 +165,38 @@ The current refactor is intentionally conservative: the planner module still bin
 | TMC2209 DIR | GPIO5 |
 | TMC2209 EN | GPIO6 |
 | WS2812 DIN | GPIO21 |
-| Reserved / planner serial | GPIO1, GPIO2, GPIO3 |
+| JointBus RS-485 | UART0, RTS/DE GPIO9 |
 
 ## Firmware Behavior
 
 - `Serial` is used for the USB CDC console at 115200 baud
-- `Serial2` is used for TMC2209 UART communication at 115200 baud
+- `Serial2` is used for TMC2209 UART communication at 230400 baud
 - HSPI is used for AS5048A encoder communication
-- the additional UART/serial object reserved for future use is now passed to the planner constructor
+- motion commands reach the planner only through JointBus or the local USB console
 - parameters are initialized, loaded from NVS and printed at boot
 - TMC2209 is configured safely before motor enable
 - motor GPIO is initialized in a safe disabled state
 - encoder reads update the real unrolled joint angle
 - the PID + S-curve controller commands motor velocity in real joint deg/s
 - TMC2209 velocity commands are converted using `stdeg`
-- the planner `update()` method is called from the main loop
 - the serial console prompt prints a newline after the prompt in normal mode to keep trace/log output clean
 
-Planner object construction follows this model:
+The planner has no serial ownership and receives its runtime dependencies and safety envelope explicitly:
 
 ```cpp
-JointPlanner planner(SerialFuture);
+JointPlanner planner(plannerRuntime, plannerConfig);
 ```
 
-and initialization follows:
-
-```cpp
-planner.begin(UART0_BAUD);
-```
-
-The planner serial interface is reserved for future integration with an external planner or upstream motion coordinator.
+JointBus and `SerialConsole` parse their respective inputs and invoke the planner API.
 
 ## Motor Direction
 
-Real hardware tests showed that the motor polarity is inverted.
+Motor polarity follows the current hardware configuration.
 
 The current firmware uses:
 
 ```cpp
-static constexpr float MOTOR_DIRECTION_SIGN = -1.0f;
+static constexpr float MOTOR_DIRECTION_SIGN = 1.0f;
 ```
 
 This is important for closed-loop control. A wrong sign would turn negative feedback into positive feedback.
@@ -293,11 +291,11 @@ It means:
 - blend if the new target is compatible with the current motion direction and can be reached smoothly
 - use safe replan if the target requires braking, reversal, or a retarget behind the current motion
 
-Typical log examples:
+The typed outcome distinguishes the two cases:
 
 ```text
-[NFO] MOVEB target=45.000 deg current=-14.496 deg vmax=8.000 deg/s amax=4.000 deg/s2 mode=blend
-[NFO] MOVEB target=-20.000 deg current=20.054 deg vmax=8.000 deg/s amax=4.000 deg/s2 mode=safe-replan
+JointMoveResult::BlendAccepted
+JointMoveResult::SafeReplan
 ```
 
 This behavior was validated on real hardware with repeated retargeting tests, including intentionally aggressive `+45/-45` direction changes.
@@ -827,10 +825,12 @@ Completed:
 - [x] Add configurable motor hold at target with `mhold`
 - [x] Replace hardcoded encoder-to-joint mechanical scale with persistent `jrev` parameter
 - [x] Add configurable software joint travel limits with target clipping and fault latch
+- [x] Route planner commands exclusively through JointBus and the local USB console
+- [x] Replace planner global bindings with an explicit runtime interface
+- [x] Add typed move outcomes and host-side planner policy tests
 
 Planned:
 
-- [ ] Extend the planner serial protocol for external planner integration
 - [ ] Add encoder offset calibration workflow
 - [ ] Add hard fault latch and reset workflow
 - [ ] Add more complete safety handling
@@ -841,15 +841,22 @@ Planned:
 
 Work in progress.
 
-The current firmware is a functional closed-loop prototype. It supports real joint position control using AS5048A feedback, TMC2209 velocity control, persistent runtime tuning, trace-based analysis, conservative safe defaults for hardware bring-up, runtime logging, configurable encoder-to-joint scaling through `jrev`, configurable joint limits through `jmin`/`jmax`/`jtol`, and a separated motion/planner module ready to be extended toward external planner integration.
+The current firmware is a functional closed-loop prototype. It supports real joint position control using AS5048A feedback, TMC2209 velocity control, persistent runtime tuning, trace-based analysis, conservative safe defaults for hardware bring-up, runtime logging, configurable encoder-to-joint scaling through `jrev`, configurable joint limits through `jmin`/`jmax`/`jtol`, and a separated motion/planner module driven by JointBus and the local USB console.
 
-The planner refactor has been compiled and tested on real hardware. The currently validated behavior includes:
+The planner policy is covered by host-side tests, while earlier movement behavior was validated on real hardware. Covered cases include:
 
 - normal point-to-point move
 - smart retarget move
 - blend when the new target is compatible with the current motion
 - safe replan when the target requires braking or direction reversal
 - clean stop and restart from the stopped position
+
+Host tests can be run with:
+
+```text
+g++ -std=c++17 -Wall -Wextra -Werror -Iinclude src/JointPlanner.cpp test/test_joint_planner.cpp -o /tmp/planetjoint_test_planner
+/tmp/planetjoint_test_planner
+```
 
 ## License
 

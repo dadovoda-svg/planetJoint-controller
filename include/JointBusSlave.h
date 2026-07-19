@@ -45,6 +45,7 @@ struct SlaveHooks {
     CommandResult (*reboot)(void* context, uint16_t magic) = nullptr;
     bool (*status)(void* context, Status& outStatus) = nullptr;
     bool (*quickStatus)(void* context, uint8_t& outQuickStatus) = nullptr;
+    bool (*motionConfig)(void* context, MotionConfig& outConfig) = nullptr;
 };
 
 class Slave {
@@ -100,6 +101,7 @@ private:
     void sendStatus(uint8_t seq, const Status& status);
     void sendQuickStatus(uint8_t seq, uint8_t qstatus);
     void sendQueueStatus(uint8_t seq, const QueueStatus& status);
+    void sendMotionConfig(uint8_t seq, const MotionConfig& config);
     void sendFrame(const Frame& frame);
 
     CommandResult dispatchMoveLike(const Frame& request, bool blended);

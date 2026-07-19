@@ -18,6 +18,7 @@ using MagneticEncoder = AS5600;
 #include "Tmc2209Driver.h"
 #include "SCurvePosVelController.h"
 #include "JointPlanner.h"
+#include "JointMotionApi.h"
 #include "logger.h"
 #include "JointBusSlave.h"
 
@@ -81,6 +82,14 @@ static constexpr float SERVO_DEADBAND_ENTER   = 0.05f;
 static constexpr float SERVO_DEADBAND_EXIT    = 0.12f;
 static constexpr float SERVO_DEADBAND_VEL     = 0.20f;
 static constexpr float SERVO_VEL_FILTER_TAU_S = 0.050f;
+
+// Absolute planner safety envelope. Runtime commands and persisted motion
+// parameters are always constrained inside these bounds.
+static constexpr float PLANNER_MIN_VMAX_DEG_S = 0.01f;
+static constexpr float PLANNER_MAX_VMAX_DEG_S = 240.0f;
+static constexpr float PLANNER_MIN_AMAX_DEG_S2 = 0.01f;
+static constexpr float PLANNER_MAX_AMAX_DEG_S2 = 650.0f;
+static constexpr float PLANNER_BLEND_MIN_REF_VEL_DEG_S = 0.02f;
 
 // ===================== JOINT POSITION LIMIT DEFAULTS =====================
 
@@ -171,7 +180,40 @@ SCurvePosVelController jointCtrl;
 
 PersistentParams params;
 SerialConsole console(Serial, params);
-JointPlanner planner(SerialJointBus);
+
+class FirmwareJointPlannerRuntime final : public JointPlannerRuntime {
+public:
+  bool isReferenced() const override;
+  MotionMode motionMode() const override;
+  bool encoderReady() const override;
+  bool driverEnabled() const override;
+  void stopMotion() override;
+  bool ensureDriverEnabled() override;
+  void latchDriverFault() override;
+  bool clipTarget(float requestedDeg, float& clippedDeg) const override;
+  float currentPositionDeg() const override;
+  float controllerRefPositionDeg() const override;
+  float controllerRefVelocityDegS() const override;
+  void configureController(float vmaxDegS,
+                           float amaxDegS2,
+                           float sCurveTimeS,
+                           float outMaxDegS,
+                           bool clearFault) override;
+  void restartController(float currentDeg, float targetDeg) override;
+  void blendControllerTarget(float targetDeg) override;
+  void beginPositionMotion(float targetDeg) override;
+};
+
+static const JointPlannerConfig plannerConfig {
+  .minVmaxDegS = PLANNER_MIN_VMAX_DEG_S,
+  .maxVmaxDegS = PLANNER_MAX_VMAX_DEG_S,
+  .minAmaxDegS2 = PLANNER_MIN_AMAX_DEG_S2,
+  .maxAmaxDegS2 = PLANNER_MAX_AMAX_DEG_S2,
+  .blendMinRefVelDegS = PLANNER_BLEND_MIN_REF_VEL_DEG_S
+};
+
+static FirmwareJointPlannerRuntime plannerRuntime;
+JointPlanner planner(plannerRuntime, plannerConfig);
 
 static JointBus::SlaveHooks jointBusHooks;
 static JointBus::Slave jointBus(SerialJointBus, 0, jointBusHooks, PIN_RS485_RTS);
@@ -1066,6 +1108,138 @@ void stopMotion()
   wsSetState(jointReferenced ? LedState::READY : LedState::BOOT);
 }
 
+bool FirmwareJointPlannerRuntime::isReferenced() const
+{
+  return jointReferenced;
+}
+
+MotionMode FirmwareJointPlannerRuntime::motionMode() const
+{
+  return ::motionMode;
+}
+
+bool FirmwareJointPlannerRuntime::encoderReady() const
+{
+  return encoderOk;
+}
+
+bool FirmwareJointPlannerRuntime::driverEnabled() const
+{
+  return tmc.status() == Tmc2209Driver::Status::Enabled;
+}
+
+void FirmwareJointPlannerRuntime::stopMotion()
+{
+  ::stopMotion();
+}
+
+bool FirmwareJointPlannerRuntime::ensureDriverEnabled()
+{
+  return ::ensureDriverEnabled();
+}
+
+void FirmwareJointPlannerRuntime::latchDriverFault()
+{
+  ::motionMode = MotionMode::FAULT;
+  wsSetState(LedState::FAULT);
+}
+
+bool FirmwareJointPlannerRuntime::clipTarget(float requestedDeg, float& clippedDeg) const
+{
+  return jointClipTargetToLimits(requestedDeg, clippedDeg);
+}
+
+float FirmwareJointPlannerRuntime::currentPositionDeg() const
+{
+  return jointGetPositionDeg();
+}
+
+float FirmwareJointPlannerRuntime::controllerRefPositionDeg() const
+{
+  return jointCtrl.refPos();
+}
+
+float FirmwareJointPlannerRuntime::controllerRefVelocityDegS() const
+{
+  return jointCtrl.refVel();
+}
+
+void FirmwareJointPlannerRuntime::configureController(float vmaxDegS,
+                                                      float amaxDegS2,
+                                                      float sCurveTimeS,
+                                                      float outMaxDegS,
+                                                      bool clearFault)
+{
+  if (clearFault) {
+    jointCtrl.clearFault();
+  }
+  jointCtrl.setLimits(vmaxDegS, amaxDegS2);
+  if (sCurveTimeS > 0.0f) {
+    jointCtrl.setSCurveTime(sCurveTimeS);
+  }
+  jointCtrl.setOutputMax(outMaxDegS);
+}
+
+void FirmwareJointPlannerRuntime::restartController(float currentDeg, float targetDeg)
+{
+  jointCtrl.reset(currentDeg);
+  jointCtrl.setTarget(targetDeg);
+}
+
+void FirmwareJointPlannerRuntime::blendControllerTarget(float targetDeg)
+{
+  jointCtrl.setTargetBlended(targetDeg);
+}
+
+void FirmwareJointPlannerRuntime::beginPositionMotion(float targetDeg)
+{
+  servoTargetZeroedDeg = targetDeg;
+  lastServoUs = micros();
+  ::motionMode = MotionMode::POSITION;
+}
+
+JointMoveOutcome moveJointToDeg(float targetZeroedDeg)
+{
+  JointMoveCommand cmd;
+  cmd.targetDeg = targetZeroedDeg;
+  cmd.vmaxDegS = readParamMinOrDefault("vmax", SERVO_VMAX_DEG_S, 0.001f);
+  cmd.amaxDegS2 = readParamMinOrDefault("amax", SERVO_AMAX_DEG_S2, 0.001f);
+  cmd.sCurveTimeS = readParamMinOrDefault("sct", SERVO_SCURVE_TIME_S, 0.001f);
+  cmd.outMaxDegS = readParamMinOrDefault("outmax", SERVO_OUTPUT_MAX_DEG_S, 0.0f);
+  return planner.moveTo(cmd);
+}
+
+JointMoveOutcome jointMoveTo(float targetDeg, float vmaxDegS, float amaxDegS2)
+{
+  return planner.moveTo(targetDeg, vmaxDegS, amaxDegS2);
+}
+
+JointMoveOutcome jointMoveTo(float targetDeg,
+                             float vmaxDegS,
+                             float amaxDegS2,
+                             float sCurveTimeS)
+{
+  return planner.moveTo(targetDeg, vmaxDegS, amaxDegS2, sCurveTimeS);
+}
+
+JointMoveOutcome jointMoveToBlended(float targetDeg, float vmaxDegS, float amaxDegS2)
+{
+  return planner.moveToBlended(targetDeg, vmaxDegS, amaxDegS2);
+}
+
+JointMoveOutcome jointMoveToBlended(float targetDeg,
+                                    float vmaxDegS,
+                                    float amaxDegS2,
+                                    float sCurveTimeS)
+{
+  return planner.moveToBlended(targetDeg, vmaxDegS, amaxDegS2, sCurveTimeS);
+}
+
+JointMoveOutcome jointStop()
+{
+  return planner.stop();
+}
+
 
 static void latchEmergencyStopFault(const char* source)
 {
@@ -1526,6 +1700,24 @@ static int16_t jointBusDegToCdeg(float valueDeg)
   return static_cast<int16_t>(lroundf(clipped * 100.0f));
 }
 
+static bool jointBusDegToCdegChecked(float valueDeg, int16_t& valueCdeg)
+{
+  if (!isfinite(valueDeg) || valueDeg < -327.68f || valueDeg > 327.67f) {
+    return false;
+  }
+  valueCdeg = static_cast<int16_t>(lroundf(valueDeg * 100.0f));
+  return true;
+}
+
+static bool jointBusPositiveToCentiChecked(float value, uint16_t& valueCenti)
+{
+  if (!isfinite(value) || value < 0.0f || value > 655.35f) {
+    return false;
+  }
+  valueCenti = static_cast<uint16_t>(lroundf(value * 100.0f));
+  return true;
+}
+
 static float jointBusCdegToDeg(int16_t valueCdeg)
 {
   return static_cast<float>(valueCdeg) * 0.01f;
@@ -1587,25 +1779,47 @@ static void jointBusSegmentQueueUpdate()
   }
 }
 
-static JointBus::AckCode jointBusMoveAckForRequestedTarget(float requestedDeg)
+static JointBus::NackCode jointBusNackForMoveResult(JointMoveResult result)
 {
-  float clippedDeg = requestedDeg;
-  if (!jointClipTargetToLimits(requestedDeg, clippedDeg)) {
-    return JointBus::AckCode::Accepted;
+  switch (result) {
+    case JointMoveResult::NotReferenced:
+      return JointBus::NackCode::NotHomed;
+    case JointMoveResult::CalibrationActive:
+      return JointBus::NackCode::Busy;
+    case JointMoveResult::FaultActive:
+      return JointBus::NackCode::FaultActive;
+    case JointMoveResult::InvalidCommand:
+      return JointBus::NackCode::BadPayload;
+    case JointMoveResult::EncoderUnavailable:
+    case JointMoveResult::InvalidLimits:
+    case JointMoveResult::DriverError:
+      return JointBus::NackCode::InternalError;
+    default:
+      return JointBus::NackCode::RejectedByState;
   }
+}
 
-  const float eps = 0.005f;
-  if (clippedDeg < requestedDeg - eps) {
+static JointBus::AckCode jointBusAckForMoveOutcome(const JointMoveOutcome& outcome,
+                                                   JointBus::AckCode successAck,
+                                                   bool exposeRetargetMode)
+{
+  if (outcome.targetAdjustment == JointTargetAdjustment::ClippedToMax) {
     jointBusLastLimitClipped = true;
     return JointBus::AckCode::ClippedToMax;
   }
-  if (clippedDeg > requestedDeg + eps) {
+  if (outcome.targetAdjustment == JointTargetAdjustment::ClippedToMin) {
     jointBusLastLimitClipped = true;
     return JointBus::AckCode::ClippedToMin;
   }
 
   jointBusLastLimitClipped = false;
-  return JointBus::AckCode::Accepted;
+  if (exposeRetargetMode && outcome.result == JointMoveResult::BlendAccepted) {
+    return JointBus::AckCode::BlendAccepted;
+  }
+  if (exposeRetargetMode && outcome.result == JointMoveResult::SafeReplan) {
+    return JointBus::AckCode::SafeReplan;
+  }
+  return successAck;
 }
 
 static JointBus::CommandResult jointBusMove(void* context,
@@ -1618,20 +1832,14 @@ static JointBus::CommandResult jointBusMove(void* context,
   const float targetDeg = jointBusCdegToDeg(targetCdeg);
   const float vmaxDegS = static_cast<float>(jointBusCdegSToUInt(vmaxCdegS)) * 0.01f;
   const float amaxDegS2 = static_cast<float>(jointBusCdegSToUInt(amaxCdegS2)) * 0.01f;
-  const JointBus::AckCode ack = jointBusMoveAckForRequestedTarget(targetDeg);
-
-  if (!jointMoveTo(targetDeg, vmaxDegS, amaxDegS2)) {
-    if (jointHasFault()) {
-      return JointBus::CommandResult::fail(JointBus::NackCode::FaultActive);
-    }
-    if (!jointReferenced) {
-      return JointBus::CommandResult::fail(JointBus::NackCode::NotHomed);
-    }
-    return JointBus::CommandResult::fail(JointBus::NackCode::RejectedByState);
+  const JointMoveOutcome outcome = jointMoveTo(targetDeg, vmaxDegS, amaxDegS2);
+  if (!outcome.accepted()) {
+    return JointBus::CommandResult::fail(jointBusNackForMoveResult(outcome.result));
   }
 
   jointBusClearCoordinatedSegments();
-  return JointBus::CommandResult::ok(ack);
+  return JointBus::CommandResult::ok(
+    jointBusAckForMoveOutcome(outcome, JointBus::AckCode::Accepted, false));
 }
 
 static JointBus::CommandResult jointBusMoveB(void* context,
@@ -1644,20 +1852,14 @@ static JointBus::CommandResult jointBusMoveB(void* context,
   const float targetDeg = jointBusCdegToDeg(targetCdeg);
   const float vmaxDegS = static_cast<float>(jointBusCdegSToUInt(vmaxCdegS)) * 0.01f;
   const float amaxDegS2 = static_cast<float>(jointBusCdegSToUInt(amaxCdegS2)) * 0.01f;
-  const JointBus::AckCode ack = jointBusMoveAckForRequestedTarget(targetDeg);
-
-  if (!jointMoveToBlended(targetDeg, vmaxDegS, amaxDegS2)) {
-    if (jointHasFault()) {
-      return JointBus::CommandResult::fail(JointBus::NackCode::FaultActive);
-    }
-    if (!jointReferenced) {
-      return JointBus::CommandResult::fail(JointBus::NackCode::NotHomed);
-    }
-    return JointBus::CommandResult::fail(JointBus::NackCode::RejectedByState);
+  const JointMoveOutcome outcome = jointMoveToBlended(targetDeg, vmaxDegS, amaxDegS2);
+  if (!outcome.accepted()) {
+    return JointBus::CommandResult::fail(jointBusNackForMoveResult(outcome.result));
   }
 
   jointBusClearCoordinatedSegments();
-  return JointBus::CommandResult::ok(ack);
+  return JointBus::CommandResult::ok(
+    jointBusAckForMoveOutcome(outcome, JointBus::AckCode::Accepted, true));
 }
 
 static JointBus::CommandResult jointBusPrepareMoveB(void* context,
@@ -1747,14 +1949,9 @@ static JointBus::CommandResult jointBusStartSegment(void* context, uint8_t segme
   const float vmaxDegS = static_cast<float>(jointBusPreparedSegment.vmaxCdegS) * 0.01f;
   const float amaxDegS2 = static_cast<float>(jointBusPreparedSegment.amaxCdegS2) * 0.01f;
 
-  if (!jointMoveToBlended(targetDeg, vmaxDegS, amaxDegS2)) {
-    if (jointHasFault()) {
-      return JointBus::CommandResult::fail(JointBus::NackCode::FaultActive);
-    }
-    if (!jointReferenced) {
-      return JointBus::CommandResult::fail(JointBus::NackCode::NotHomed);
-    }
-    return JointBus::CommandResult::fail(JointBus::NackCode::RejectedByState);
+  const JointMoveOutcome outcome = jointMoveToBlended(targetDeg, vmaxDegS, amaxDegS2);
+  if (!outcome.accepted()) {
+    return JointBus::CommandResult::fail(jointBusNackForMoveResult(outcome.result));
   }
 
   jointBusActiveSegmentValid = true;
@@ -1829,17 +2026,11 @@ static JointBus::CommandResult jointBusHome(void* context)
     return JointBus::CommandResult::fail(JointBus::NackCode::NotHomed);
   }
 
-  const JointBus::AckCode ack = jointBusMoveAckForRequestedTarget(JOINTBUS_HOME_TARGET_DEG);
-  if (!jointMoveTo(JOINTBUS_HOME_TARGET_DEG,
-                   JOINTBUS_HOME_VMAX_DEG_S,
-                   JOINTBUS_HOME_AMAX_DEG_S2)) {
-    if (jointHasFault()) {
-      return JointBus::CommandResult::fail(JointBus::NackCode::FaultActive);
-    }
-    if (!jointReferenced) {
-      return JointBus::CommandResult::fail(JointBus::NackCode::NotHomed);
-    }
-    return JointBus::CommandResult::fail(JointBus::NackCode::RejectedByState);
+  const JointMoveOutcome outcome = jointMoveTo(JOINTBUS_HOME_TARGET_DEG,
+                                               JOINTBUS_HOME_VMAX_DEG_S,
+                                               JOINTBUS_HOME_AMAX_DEG_S2);
+  if (!outcome.accepted()) {
+    return JointBus::CommandResult::fail(jointBusNackForMoveResult(outcome.result));
   }
 
   LOG_NFO("JointBus HOME accepted: target=%.3f deg vmax=%.3f deg/s amax=%.3f deg/s2\r\n",
@@ -1847,7 +2038,8 @@ static JointBus::CommandResult jointBusHome(void* context)
           JOINTBUS_HOME_VMAX_DEG_S,
           JOINTBUS_HOME_AMAX_DEG_S2);
   jointBusClearCoordinatedSegments();
-  return JointBus::CommandResult::ok(ack);
+  return JointBus::CommandResult::ok(
+    jointBusAckForMoveOutcome(outcome, JointBus::AckCode::Accepted, false));
 }
 
 static JointBus::CommandResult jointBusZero(void* context)
@@ -1884,7 +2076,7 @@ static JointBus::CommandResult jointBusPark(void* context)
 static JointBus::CommandResult jointBusStop(void* context)
 {
   (void)context;
-  if (!jointStop()) {
+  if (!jointStop().accepted()) {
     return JointBus::CommandResult::fail(JointBus::NackCode::InternalError);
   }
   jointBusClearCoordinatedSegments();
@@ -2026,6 +2218,28 @@ static bool jointBusQuickStatus(void* context, uint8_t& outQuickStatus)
   return true;
 }
 
+static bool jointBusMotionConfig(void* context, JointBus::MotionConfig& outConfig)
+{
+  (void)context;
+
+  float jmin = 0.0f;
+  float jmax = 0.0f;
+  float jtol = 0.0f;
+  float vmax = 0.0f;
+  float amax = 0.0f;
+
+  if (!readJointLimitParams(jmin, jmax, jtol) ||
+      !params.get("vmax", vmax) || !params.get("amax", amax) ||
+      !isfinite(vmax) || !isfinite(amax) || vmax <= 0.0f || amax <= 0.0f) {
+    return false;
+  }
+
+  return jointBusDegToCdegChecked(jmin, outConfig.jminCdeg) &&
+         jointBusDegToCdegChecked(jmax, outConfig.jmaxCdeg) &&
+         jointBusPositiveToCentiChecked(vmax, outConfig.vmaxCdegS) &&
+         jointBusPositiveToCentiChecked(amax, outConfig.amaxCdegS2);
+}
+
 static void setupJointBusHooks()
 {
   JointBus::SlaveHooks hooks;
@@ -2044,6 +2258,7 @@ static void setupJointBusHooks()
   hooks.reboot = jointBusReboot;
   hooks.status = jointBusStatus;
   hooks.quickStatus = jointBusQuickStatus;
+  hooks.motionConfig = jointBusMotionConfig;
 
   jointBus.setHooks(hooks);
 }

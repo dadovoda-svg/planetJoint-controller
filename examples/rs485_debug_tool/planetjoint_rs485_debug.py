@@ -56,6 +56,7 @@ class Command(enum.IntEnum):
     ABORT_SEGMENT = 0x0C
     QUEUE_STATUS = 0x0D
     EMERGENCY_STOP = 0x0E
+    MOTION_CONFIG = 0x0F
     PING = 0x7F
 
     ACK = 0x80
@@ -63,6 +64,7 @@ class Command(enum.IntEnum):
     STATUS_RSP = 0x86
     QUICK_STATUS_RSP = 0x87
     QUEUE_STATUS_RSP = 0x8D
+    MOTION_CONFIG_RSP = 0x8F
     ERROR_RSP = 0xFF
 
 
@@ -293,6 +295,9 @@ class JointBusClient:
         self.simulated_prepared: Dict[int, Optional[Tuple[int, int, int, int]]] = {addr: None for addr in self.simulated_nodes}
         self.simulated_active_segment: Dict[int, Optional[int]] = {addr: None for addr in self.simulated_nodes}
         self.simulated_fault: Dict[int, int] = {addr: 0 for addr in self.simulated_nodes}
+        self.simulated_motion_config: Dict[int, Tuple[int, int, int, int]] = {
+            addr: (-17000, 17000, 200, 600) for addr in self.simulated_nodes
+        }
 
         if not self.offline:
             if serial is None:
@@ -470,6 +475,13 @@ class JointBusClient:
                 if self.simulated_enabled[address]:
                     flags |= 0x08
             rsp_payload = bytes((flags,))
+        elif command == Command.MOTION_CONFIG:
+            if payload:
+                rsp_command = Command.NACK
+                rsp_payload = bytes((0x02, 0x00))
+            else:
+                rsp_command = Command.MOTION_CONFIG_RSP
+                rsp_payload = struct.pack("<hhHH", *self.simulated_motion_config[address])
         elif command == Command.PING:
             rsp_payload = bytes((0x00, 0x00))
         else:
@@ -652,6 +664,18 @@ def describe_frame(frame: Frame) -> str:
             f"  queue flags     : 0x{flags:02X} [{describe_queue_status_flags(flags)}]"
         )
 
+    if frame.command == Command.MOTION_CONFIG_RSP:
+        if len(frame.payload) != 8:
+            return f"{prefix} INVALID_MOTION_CONFIG_LENGTH={len(frame.payload)}"
+        jmin, jmax, vmax, amax = struct.unpack("<hhHH", frame.payload)
+        return (
+            f"{prefix}\n"
+            f"  jmin : {jmin / 100.0:.2f} deg\n"
+            f"  jmax : {jmax / 100.0:.2f} deg\n"
+            f"  vmax : {vmax / 100.0:.2f} deg/s\n"
+            f"  amax : {amax / 100.0:.2f} deg/s^2"
+        )
+
     payload_text = hex_bytes(frame.payload) if frame.payload else "<empty>"
     return f"{prefix} payload={payload_text}"
 
@@ -723,6 +747,14 @@ class JointBusShell(cmd.Cmd):
     def do_qstatus(self, line: str) -> None:
         """qstatus <address> -- request compact status flags."""
         self._simple(line, Command.QUICK_STATUS)
+
+    def do_mconfig(self, line: str) -> None:
+        """mconfig <address> -- read jmin, jmax, vmax and amax in one request."""
+        self._simple(line, Command.MOTION_CONFIG)
+
+    def do_config(self, line: str) -> None:
+        """config <address> -- alias for mconfig."""
+        self.do_mconfig(line)
 
     def _move(self, line: str, command: Command) -> None:
         tokens = self._tokens(line, 4, f"{command.name.lower()} <address> <angle_deg> <vmax_deg_s> <amax_deg_s2>")

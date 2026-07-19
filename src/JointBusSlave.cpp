@@ -284,6 +284,20 @@ void Slave::handleFrame(const Frame& request) {
         break;
     }
 
+    case Command::MotionConfig: {
+        if (request.payloadLen != 0) {
+            sendNack(request.seq, NackCode::BadLength);
+            break;
+        }
+        MotionConfig config;
+        if (_hooks.motionConfig && _hooks.motionConfig(_hooks.context, config)) {
+            sendMotionConfig(request.seq, config);
+        } else {
+            sendNack(request.seq, NackCode::InternalError);
+        }
+        break;
+    }
+
     case Command::Ping:
         if (request.payloadLen != 0) {
             sendNack(request.seq, NackCode::BadLength);
@@ -410,6 +424,17 @@ void Slave::sendQueueStatus(uint8_t seq, const QueueStatus& status) {
     f.payload[2] = status.activeSegmentId;
     f.payload[3] = status.preparedSegmentId;
     f.payload[4] = status.flags;
+    sendFrame(f);
+}
+
+void Slave::sendMotionConfig(uint8_t seq, const MotionConfig& config) {
+    Frame f;
+    f.address = _address;
+    f.type = FrameType::Response;
+    f.seq = seq;
+    f.command = Command::MotionConfigRsp;
+    f.payloadLen = MOTION_CONFIG_PAYLOAD_SIZE;
+    encodeMotionConfigPayload(config, f.payload);
     sendFrame(f);
 }
 

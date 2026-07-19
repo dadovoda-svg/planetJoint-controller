@@ -5,6 +5,8 @@
 #include <ctype.h>
 #include <esp_system.h>
 
+#include "JointMotionApi.h"
+
 extern bool toggleTrace();
 extern bool setTraceEnabled(bool enabled);
 extern bool setTraceMode(uint8_t mode);
@@ -16,12 +18,6 @@ extern bool calibrateStepsPerDegree(float targetDegrees);
 extern float getStdegCalibrationDefaultTargetDeg();
 extern bool setZero();
 extern bool startPark();
-extern bool moveJointToDeg(float targetDeg);
-extern bool jointMoveTo(float targetDeg, float vmaxDegS, float amaxDegS2);
-extern bool jointMoveTo(float targetDeg, float vmaxDegS, float amaxDegS2, float sCurveTimeS);
-extern bool jointMoveToBlended(float targetDeg, float vmaxDegS, float amaxDegS2);
-extern bool jointMoveToBlended(float targetDeg, float vmaxDegS, float amaxDegS2, float sCurveTimeS);
-extern bool jointStop();
 extern void stopMotion();
 extern void printServoStatus();
 
@@ -766,12 +762,14 @@ void SerialConsole::cmdPos(int argc, char* argv[])
     return;
   }
 
-  if (moveJointToDeg(value)) {
+  const JointMoveOutcome outcome = moveJointToDeg(value);
+  if (outcome.accepted()) {
     _serial.print("OK moving to ");
-    _serial.print(value, 3);
+    _serial.print(outcome.targetDeg, 3);
     _serial.println(" deg");
   } else {
-    _serial.println("ERR move rejected");
+    _serial.print("ERR move rejected: ");
+    _serial.println(jointMoveResultName(outcome.result));
   }
 }
 
@@ -805,7 +803,7 @@ void SerialConsole::cmdMove(int argc, char* argv[])
     return;
   }
 
-  bool ok = false;
+  JointMoveOutcome outcome;
 
   if (argc == 5) {
     const float sct = strtof(argv[4], &endPtr);
@@ -815,12 +813,17 @@ void SerialConsole::cmdMove(int argc, char* argv[])
       return;
     }
 
-    ok = jointMoveTo(target, vmax, amax, sct);
+    outcome = jointMoveTo(target, vmax, amax, sct);
   } else {
-    ok = jointMoveTo(target, vmax, amax);
+    outcome = jointMoveTo(target, vmax, amax);
   }
 
-  _serial.println(ok ? "OK move accepted" : "ERR move rejected");
+  if (outcome.accepted()) {
+    _serial.print("OK move ");
+  } else {
+    _serial.print("ERR move rejected: ");
+  }
+  _serial.println(jointMoveResultName(outcome.result));
 }
 
 
@@ -854,7 +857,7 @@ void SerialConsole::cmdMoveBlended(int argc, char* argv[])
     return;
   }
 
-  bool ok = false;
+  JointMoveOutcome outcome;
 
   if (argc == 5) {
     const float sct = strtof(argv[4], &endPtr);
@@ -864,12 +867,17 @@ void SerialConsole::cmdMoveBlended(int argc, char* argv[])
       return;
     }
 
-    ok = jointMoveToBlended(target, vmax, amax, sct);
+    outcome = jointMoveToBlended(target, vmax, amax, sct);
   } else {
-    ok = jointMoveToBlended(target, vmax, amax);
+    outcome = jointMoveToBlended(target, vmax, amax);
   }
 
-  _serial.println(ok ? "OK blended move accepted" : "ERR blended move rejected");
+  if (outcome.accepted()) {
+    _serial.print("OK blended move ");
+  } else {
+    _serial.print("ERR blended move rejected: ");
+  }
+  _serial.println(jointMoveResultName(outcome.result));
 }
 
 void SerialConsole::cmdStop(int argc, char* argv[])

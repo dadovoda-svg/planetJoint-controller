@@ -46,6 +46,7 @@ enum class Command : uint8_t {
     AbortSegment = 0x0C,
     QueueStatus  = 0x0D,
     EmergencyStop = 0x0E,
+    MotionConfig = 0x0F,
     Ping       = 0x7F,
 
     Ack        = 0x80,
@@ -53,6 +54,7 @@ enum class Command : uint8_t {
     StatusRsp  = 0x86,
     QuickStatusRsp = 0x87,
     QueueStatusRsp = 0x8D,
+    MotionConfigRsp = 0x8F,
     ErrorRsp   = 0xFF
 };
 
@@ -133,6 +135,20 @@ struct Status {
     JointFault fault = JointFault::None;
 };
 
+// MotionConfigRsp payload (8 bytes, little-endian):
+//   0..1: jmin, signed centidegrees
+//   2..3: jmax, signed centidegrees
+//   4..5: vmax, unsigned centidegrees/second
+//   6..7: amax, unsigned centidegrees/second^2
+static constexpr size_t MOTION_CONFIG_PAYLOAD_SIZE = 8;
+
+struct MotionConfig {
+    int16_t jminCdeg = 0;
+    int16_t jmaxCdeg = 0;
+    uint16_t vmaxCdegS = 0;
+    uint16_t amaxCdegS2 = 0;
+};
+
 // QueueStatusRsp payload layout (5 bytes):
 //   byte 0: queue capacity, including the active slot (currently 2)
 //   byte 1: free prepared slots (0 or 1 in the current implementation)
@@ -196,6 +212,26 @@ static inline uint16_t getU16LE(const uint8_t* src) {
 
 static inline int16_t getI16LE(const uint8_t* src) {
     return static_cast<int16_t>(getU16LE(src));
+}
+
+static inline void encodeMotionConfigPayload(const MotionConfig& config, uint8_t* payload) {
+    putI16LE(&payload[0], config.jminCdeg);
+    putI16LE(&payload[2], config.jmaxCdeg);
+    putU16LE(&payload[4], config.vmaxCdegS);
+    putU16LE(&payload[6], config.amaxCdegS2);
+}
+
+static inline bool decodeMotionConfigPayload(const uint8_t* payload,
+                                             size_t payloadLen,
+                                             MotionConfig& config) {
+    if (payload == nullptr || payloadLen != MOTION_CONFIG_PAYLOAD_SIZE) {
+        return false;
+    }
+    config.jminCdeg = getI16LE(&payload[0]);
+    config.jmaxCdeg = getI16LE(&payload[2]);
+    config.vmaxCdegS = getU16LE(&payload[4]);
+    config.amaxCdegS2 = getU16LE(&payload[6]);
+    return true;
 }
 
 // CRC-16/MODBUS: polynomial 0xA001, init 0xFFFF, little-endian on wire.
