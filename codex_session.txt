@@ -1,0 +1,2 @@
+cd /home/davide/Documents/Projects/documents/FreeCAD1.0/riduttorePlanetario/firmware/PlanetJoint-controller
+codex

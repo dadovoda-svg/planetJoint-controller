@@ -36,8 +36,8 @@ static constexpr float SERVO_AMAX_DEG_S2      = 6.0f;
 static constexpr float SERVO_SCURVE_TIME_S    = 0.150f;
 static constexpr float SERVO_OUTPUT_MAX_DEG_S = 2.5f;
 
-static constexpr float PLANNER_HARD_VMAX_LIMIT_DEG_S = 90.0f;
-static constexpr float PLANNER_HARD_AMAX_LIMIT_DEG_S2 = 180.0f;
+static constexpr float PLANNER_HARD_VMAX_LIMIT_DEG_S = 240.0f;
+static constexpr float PLANNER_HARD_AMAX_LIMIT_DEG_S2 = 650.0f;
 
 JointPlanner::JointPlanner(HardwareSerial& plannerSerial)
 : _serial(plannerSerial)
