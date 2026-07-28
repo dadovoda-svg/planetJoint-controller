@@ -18,7 +18,6 @@ struct JointMoveCommand {
   float targetDeg = 0.0f;
   float vmaxDegS = 0.0f;
   float amaxDegS2 = 0.0f;
-  float sCurveTimeS = 0.0f; // <= 0 keeps the current controller value
   float outMaxDegS = 0.0f;  // <= 0 selects 1.25 * vmax
 };
 
@@ -86,11 +85,10 @@ public:
 
   virtual void configureController(float vmaxDegS,
                                    float amaxDegS2,
-                                   float sCurveTimeS,
                                    float outMaxDegS,
                                    bool clearFault) = 0;
   virtual void restartController(float currentDeg, float targetDeg) = 0;
-  virtual void blendControllerTarget(float targetDeg) = 0;
+  virtual bool blendControllerTarget(float targetDeg) = 0;
   virtual void beginPositionMotion(float targetDeg) = 0;
 };
 
@@ -101,11 +99,9 @@ public:
   JointMoveOutcome stop();
   JointMoveOutcome moveTo(const JointMoveCommand& cmd);
   JointMoveOutcome moveTo(float targetDeg, float vmaxDegS, float amaxDegS2);
-  JointMoveOutcome moveTo(float targetDeg, float vmaxDegS, float amaxDegS2, float sCurveTimeS);
 
   JointMoveOutcome moveToBlended(const JointMoveCommand& cmd);
   JointMoveOutcome moveToBlended(float targetDeg, float vmaxDegS, float amaxDegS2);
-  JointMoveOutcome moveToBlended(float targetDeg, float vmaxDegS, float amaxDegS2, float sCurveTimeS);
 
 private:
   enum class RetargetMode : uint8_t { Restart, BlendIfSafe };

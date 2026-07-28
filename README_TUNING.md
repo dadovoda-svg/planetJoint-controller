@@ -1,6 +1,8 @@
-# Planetary Joint Controller - PID/S-curve Tunable Build
+# Planetary Joint Controller - Analytic Quintic Tuning
 
-This build keeps the conservative PID + S-curve controller and exposes the main controller parameters through the serial console parameter dictionary.
+This build uses an analytic quintic S-curve reference followed by the existing
+PID and exposes the main controller parameters through the serial console
+parameter dictionary.
 
 ## New runtime parameters
 
@@ -20,10 +22,13 @@ All keys are at most 6 characters because the persistent parameter dictionary li
 
 | Key | Meaning | Default |
 |---|---:|---:|
-| `vmax` | S-curve reference max velocity, deg/s | `2.0` |
-| `amax` | S-curve reference max acceleration, deg/s² | `6.0` |
-| `sct` | S-curve acceleration ramp time, seconds | `0.150` |
+| `vmax` | analytic reference max velocity, deg/s | `2.0` |
+| `amax` | analytic reference max acceleration, deg/s² | `6.0` |
 | `outmax` | final command velocity clamp, deg/s | `2.5` |
+
+Trajectory duration is calculated from distance, `vmax`, and `amax`. There is
+no independent ramp-time or jerk-limit parameter. When importing an older text
+export, remove its `sct=<value>` line.
 
 ### Settling, deadband and velocity estimate
 
@@ -89,7 +94,7 @@ trace 0        full diagnostic trace
 trace 1        position and target only
 trace 2        position, target, commanded velocity, measured velocity
 trace 3        error, commanded velocity, measured velocity
-trace 4        position, S-curve reference, target, reference velocity, commanded velocity
+trace 4        position, quintic reference, target, reference velocity/acceleration, commanded velocity
 ```
 
 Trace output always keeps the `@name:value,name:value` format so it can be plotted by the serial plotter.

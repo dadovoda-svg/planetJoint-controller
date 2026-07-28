@@ -25,17 +25,22 @@ New behavior:
 
 `moveb` now checks:
 
-- current S-curve reference position: `jointCtrl.refPos()`
-- current S-curve reference velocity: `jointCtrl.refVel()`
+- current analytic reference position: `jointCtrl.refPos()`
+- current analytic reference velocity: `jointCtrl.refVel()`
+- current analytic reference acceleration: `jointCtrl.refAcc()`
 - new target position
 
-If the new target is ahead of the current reference velocity, the command performs a real blend:
+If the new target is ahead of the current reference velocity and the controller
+can construct an admissible continuous quintic, the command performs a real
+blend:
 
 ```text
 mode=blend
 ```
 
-If the new target requires reversal or is ambiguous, the command falls back to a safe replan from the current measured zeroed position:
+If the new target requires reversal, is ambiguous, or the sampled quintic is
+infeasible, the command falls back to a safe replan from the current measured
+zeroed position:
 
 ```text
 mode=safe-replan

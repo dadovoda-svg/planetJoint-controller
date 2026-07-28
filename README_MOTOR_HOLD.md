@@ -48,7 +48,7 @@ The separate parameter `shold` enables active position hold at target:
 
 ```text
 shold = 0   default: after a completed move, stop the controller and enter IDLE
-shold = 1   keep the PID/S-curve controller active after the target is reached
+shold = 1   keep the PID follower active after the target is reached
 ```
 
 With `shold = 1`, the firmware keeps `motionMode = POSITION` after the move settles.

@@ -7,7 +7,7 @@ This project implements a compact closed-loop joint controller based on:
 - a compile-time selectable magnetic absolute encoder: AS5048A 14-bit SPI or AS5600 12-bit I2C
 - a Trinamic TMC2209 stepper motor driver configured over UART
 - a stepper motor driving a planetary gearbox actuator
-- a PID + S-curve position controller running on an ESP32-S3
+- a PID follower driven by an analytic quintic S-curve reference
 - a dedicated motion/planner module separated from the main firmware wiring
 
 The firmware is built with the Arduino framework and PlatformIO.
@@ -22,7 +22,7 @@ The firmware is built with the Arduino framework and PlatformIO.
 - TMC2209 UART communication and safe register configuration
 - STEP/DIR motor velocity control
 - Closed-loop joint position control
-- PID + S-curve motion controller
+- Analytic quintic S-curve with continuous position, velocity and acceleration
 - Runtime tunable PID, feed-forward, motion profile, settling, encoder scale, motor hold and joint travel limit parameters
 - `stdeg` calibration routine for estimating motor microsteps per real joint degree
 - Direct velocity test mode in real joint degrees/second
@@ -128,7 +128,7 @@ test/
 - serial ports
 - SPI and encoder instance
 - TMC2209 driver instance
-- PID/S-curve controller instance
+- PID controller and analytic quintic trajectory instance
 - persistent parameters
 - LED state machine
 - console setup
@@ -177,7 +177,7 @@ The shared entry points used by JointBus and `SerialConsole` are declared in `Jo
 - TMC2209 is configured safely before motor enable
 - motor GPIO is initialized in a safe disabled state
 - encoder reads update the real unrolled joint angle
-- the PID + S-curve controller commands motor velocity in real joint deg/s
+- the PID follower tracks an analytic quintic reference in real joint degrees
 - TMC2209 velocity commands are converted using `stdeg`
 - the serial console prompt prints a newline after the prompt in normal mode to keep trace/log output clean
 
@@ -251,8 +251,8 @@ Trace lines are separate from logger lines. Trace lines remain plotter-friendly 
 | `cancel` | Cancel import mode |
 | `zero` | Set current real joint position as zero |
 | `pos <deg>` | Move to target position relative to zero using the default position command |
-| `move <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]` | Planner-style move with explicit motion limits |
-| `moveb <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]` | Planner-style smart retarget move |
+| `move <target_deg> <vmax_deg_s> <amax_deg_s2>` | Planner-style move with explicit motion limits |
+| `moveb <target_deg> <vmax_deg_s> <amax_deg_s2>` | Planner-style smart retarget move |
 | `stop` | Stop all motion and disable the motor bridge |
 | `servo` | Print controller status |
 | `trace` | Toggle trace output using the current trace mode |
@@ -269,10 +269,11 @@ Trace lines are separate from logger lines. Trace lines remain plotter-friendly 
 ### `move`
 
 ```text
-move <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]
+move <target_deg> <vmax_deg_s> <amax_deg_s2>
 ```
 
-`move` starts a normal planner-style move toward the target using the supplied motion limits.
+`move` starts a rest-to-rest analytic quintic. Duration is calculated
+automatically from distance, `vmax`, and `amax`.
 
 Example:
 
@@ -286,7 +287,7 @@ This command is appropriate for explicit point-to-point moves where preserving t
 ### `moveb`
 
 ```text
-moveb <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]
+moveb <target_deg> <vmax_deg_s> <amax_deg_s2>
 ```
 
 `moveb` is a smart retarget command.
@@ -295,7 +296,8 @@ Important: `moveb` does **not** mean "always blend".
 
 It means:
 
-- blend if the new target is compatible with the current motion direction and can be reached smoothly
+- blend only if a continuous, monotonic quintic from the current reference
+  position, velocity and acceleration satisfies the motion and joint limits
 - use safe replan if the target requires braking, reversal, or a retarget behind the current motion
 
 The typed outcome distinguishes the two cases:
@@ -337,16 +339,33 @@ All parameter keys are limited to 6 characters.
 
 | Key | Meaning | Default |
 |---|---|---:|
-| `vmax` | S-curve reference max velocity, deg/s | `2.0` |
-| `amax` | S-curve reference max acceleration, deg/s² | `6.0` |
-| `sct` | S-curve acceleration ramp time, seconds | `0.150` |
+| `vmax` | Analytic reference max velocity, deg/s | `2.0` |
+| `amax` | Analytic reference max acceleration, deg/s² | `6.0` |
 | `outmax` | Final command velocity clamp, deg/s | `2.5` |
 
-`vmax` limits the internal S-curve reference velocity.
+Trajectory duration is derived from movement distance, `vmax`, and `amax`.
+There is no configurable profile-ramp or jerk limit.
+
+The PID follower retains the existing command structure:
+
+```text
+command = ffv * reference_velocity
+        + kp * (reference_position - measured_position)
+        + integral_term
+        - kd * measured_velocity
+```
+
+Measured encoder velocity remains filtered and is used by the derivative term,
+deadband velocity qualification, settled detection and diagnostics. It does not
+drive the analytic trajectory generator.
 
 `outmax` limits the final velocity command sent to the motor after PID and feed-forward processing.
 
 Normally `outmax` should be slightly higher than `vmax`, so the controller has a small correction margin without being overly aggressive.
+
+The removed `sct` key needs no flash erase: NVS uses a fixed-size, key-based
+merge and ignores obsolete stored keys. Before importing an older text export,
+remove its `sct=<value>` line because text import rejects unknown keys.
 
 ### Joint Travel Limits
 
@@ -553,7 +572,7 @@ Available modes:
 | `trace 1` | `joint_zeroed_deg`, `target_deg` | Overshoot and settling view |
 | `trace 2` | `joint_zeroed_deg`, `target_deg`, `cmd_deg_s`, `meas_vel` | Position and velocity tuning |
 | `trace 3` | `err_deg`, `cmd_deg_s`, `meas_vel` | PID-focused tuning |
-| `trace 4` | `joint_zeroed_deg`, `ref_deg`, `target_deg`, `ref_vel`, `cmd_deg_s` | S-curve/reference tracking |
+| `trace 4` | `joint_zeroed_deg`, `ref_deg`, `target_deg`, `ref_vel`, `ref_acc`, `cmd_deg_s` | Analytic quintic tracking |
 
 Recommended overshoot check:
 
@@ -566,7 +585,7 @@ pos -1
 pos 0
 ```
 
-Recommended S-curve and retargeting check:
+Recommended analytic quintic and retargeting check:
 
 ```text
 stop
@@ -822,14 +841,15 @@ Completed:
 - [x] Add direct motor velocity test mode
 - [x] Add direct STEP/DIR pulse test mode
 - [x] Add `stdeg` calibration routine
-- [x] Add closed-loop PID + S-curve position control
+- [x] Add closed-loop PID position control
+- [x] Migrate the reference generator to an analytic quintic S-curve
 - [x] Add runtime PID and motion parameter tuning
 - [x] Add selectable trace modes
 - [x] Add header-only runtime logger with `loglvl`
 - [x] Add planner-style `move` command
 - [x] Add smart retarget `moveb` command
 - [x] Refactor motion/planner logic from `main.cpp` into `JointPlanner.h/.cpp`
-- [x] Validate `moveb` blend and safe-replan behavior on real hardware
+- [ ] Validate analytic-quintic `moveb` and safe-replan behavior on real hardware
 - [x] Adjust console prompt formatting to avoid dirty trace/log output
 - [x] Add configurable motor hold at target with `mhold`
 - [x] Replace hardcoded encoder-to-joint mechanical scale with persistent `jrev` parameter
@@ -852,7 +872,10 @@ Work in progress.
 
 The current firmware is a functional closed-loop prototype. It supports real joint position control using AS5048A feedback, TMC2209 velocity control, persistent runtime tuning, trace-based analysis, conservative safe defaults for hardware bring-up, runtime logging, configurable encoder-to-joint scaling through `jrev`, configurable joint limits through `jmin`/`jmax`/`jtol`, and a separated motion/planner module driven by JointBus and the local USB console.
 
-The planner policy is covered by host-side tests, while earlier movement behavior was validated on real hardware. Covered cases include:
+The analytic controller and planner policy are covered by host-side tests.
+Earlier motion-controller revisions were exercised on hardware, but this
+analytic quintic migration still requires the hardware validation documented in
+`README_QUINTIC_SCURVE_MIGRATION.md`. Covered host cases include:
 
 - normal point-to-point move
 - smart retarget move
@@ -863,6 +886,9 @@ The planner policy is covered by host-side tests, while earlier movement behavio
 Host tests can be run with:
 
 ```text
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -Itest -Iinclude test/test_quintic_controller.cpp -o /tmp/planetjoint_test_quintic
+/tmp/planetjoint_test_quintic
+
 g++ -std=c++17 -Wall -Wextra -Werror -Iinclude src/JointPlanner.cpp test/test_joint_planner.cpp -o /tmp/planetjoint_test_planner
 /tmp/planetjoint_test_planner
 ```

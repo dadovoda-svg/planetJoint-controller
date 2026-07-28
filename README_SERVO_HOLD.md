@@ -26,7 +26,10 @@ mhold = 1   keep the motor bridge enabled at hold current
 
 With `mhold = 1`, the motor is energized, but the firmware does not actively correct a position error after the move has completed.
 
-`shold = 1` keeps the PID/S-curve controller running after the target has been reached. While the joint is still at target, the commanded velocity is zero. If the joint is moved by an external force, the controller commands motion back toward the stored target.
+`shold = 1` keeps the PID follower running after the analytic trajectory has
+finished. PID output is suppressed only after the configured deadband has
+latched. If the joint is moved outside the deadband by an external force, the
+controller commands motion back toward the stored target.
 
 ## Recommended use
 
@@ -44,7 +47,7 @@ Keep `kp`, `kd`, `outmax`, `vmax`, and `amax` conservative during the first hard
 When `shold = 0`:
 
 1. The move reaches the target.
-2. The controller commands zero velocity.
+2. The PID follower remains active after the analytic profile completes.
 3. The firmware enters `IDLE`.
 4. The motor bridge follows `mhold`.
 
@@ -53,7 +56,8 @@ When `shold = 1`:
 1. The move reaches the target.
 2. The controller commands zero velocity.
 3. The firmware remains in `POSITION` mode.
-4. If the measured position moves away from target, the controller corrects it.
+4. The configured `dbent`, `dbext`, and `dbvel` determine when output is
+   suppressed and when correction resumes.
 5. The `stop` command still disables the motor bridge and exits active hold.
 
 ## Status output

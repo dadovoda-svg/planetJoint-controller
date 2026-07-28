@@ -5,22 +5,33 @@
 class SCurvePosVelController {
 public:
   struct Limits {
-    float v_max = 0.0f;     // [deg/s]
-    float a_max = 0.0f;     // [deg/s^2]
-    float j_max = 0.0f;     // [deg/s^3]
+    float v_max = 0.0f;      // [deg/s]
+    float a_max = 0.0f;      // [deg/s^2]
     float out_max = -1.0f;   // [deg/s] final clamp (default = v_max)
   };
 
   struct Gains {
     float kp = 0.0f;
     float ki = 0.0f;
-    float kd = 0.0f;        // used as derivative on measurement (recommended)
+    float kd = 0.0f;         // derivative on measured position
     float ff_vel = 1.0f;
   };
 
   struct Tolerances {
-    float pos = 0.0f;       // [deg]
-    float vel = 0.0f;       // [deg/s]
+    float pos = 0.0f;        // [deg]
+    float vel = 0.0f;        // [deg/s]
+  };
+
+  struct Trajectory {
+    bool active = false;
+    float elapsed = 0.0f;
+    float duration = 0.0f;
+    float c0 = 0.0f;
+    float c1 = 0.0f;
+    float c2 = 0.0f;
+    float c3 = 0.0f;
+    float c4 = 0.0f;
+    float c5 = 0.0f;
   };
 
   enum class FaultCode : uint8_t {
@@ -39,29 +50,21 @@ public:
     if (_out_auto) _lim.out_max = _lim.v_max;
   }
 
-  // S-curve smoothing time (seconds): accel ramps 0->Amax in t_jerk
-  void setSCurveTime(float t_jerk) {
-    const float tj = fmaxf(t_jerk, 1e-6f);
-    _lim.j_max = (_lim.a_max > 0.0f) ? (_lim.a_max / tj) : 0.0f;
-  }
-
-  void setJerkMax(float j_max) { _lim.j_max = fabsf(j_max); }
-
   void setOutputMax(float out_max) {
-    if (out_max <= 0.0f) { 
-      _out_auto = true;  
-      _lim.out_max = 0.0f; 
-    }
-    else { 
-      _out_auto = false; 
-      _lim.out_max = fabsf(out_max); 
+    if (out_max <= 0.0f) {
+      _out_auto = true;
+      _lim.out_max = 0.0f;
+    } else {
+      _out_auto = false;
+      _lim.out_max = fabsf(out_max);
     }
   }
-
-  //void setOutputMax(float out_max) { _lim.out_max = fabsf(out_max); }
 
   void setGains(float kp, float ki, float kd, float ff_vel = 1.0f) {
-    _g.kp = kp; _g.ki = ki; _g.kd = kd; _g.ff_vel = ff_vel;
+    _g.kp = kp;
+    _g.ki = ki;
+    _g.kd = kd;
+    _g.ff_vel = ff_vel;
   }
 
   void setIntegratorLimit(float i_abs_max) { _i_abs_max = fabsf(i_abs_max); }
@@ -71,9 +74,11 @@ public:
     _tol.vel = fabsf(vel_tol);
   }
 
-  // Hard mechanical limits: must NEVER be exceeded.
-  // stop_margin_deg: internal guard band where commands pushing outward are blocked
-  void setPositionLimits(float pos_min_deg, float pos_max_deg, float stop_margin_deg = 0.5f, float fault_margin_deg = 0.0f) {
+  // Hard mechanical limits: measured position must never exceed this range.
+  void setPositionLimits(float pos_min_deg,
+                         float pos_max_deg,
+                         float stop_margin_deg = 0.5f,
+                         float fault_margin_deg = 0.0f) {
     _pos_min = pos_min_deg;
     _pos_max = pos_max_deg;
     _stop_margin = fabsf(stop_margin_deg);
@@ -83,6 +88,11 @@ public:
     if (_pos_max <= _pos_min) {
       _fault = FaultCode::BadLimits;
       _fault_latched = true;
+      _i_term = 0.0f;
+      _ref_vel = 0.0f;
+      _ref_acc = 0.0f;
+      _target = _ref_pos;
+      clearTrajectory();
     }
   }
 
@@ -92,48 +102,25 @@ public:
   bool fault() const { return _fault_latched; }
   FaultCode faultCode() const { return _fault; }
 
-  // Clear fault latch (does NOT move anything; output remains 0 until next update computes it)
   void clearFault() {
     _fault_latched = false;
     _fault = FaultCode::None;
-    // reset integrator for safety
     _i_term = 0.0f;
     _ref_vel = 0.0f;
     _ref_acc = 0.0f;
+    _target = _ref_pos;
+    clearTrajectory();
   }
 
   void latchPositionLimitFault(float measured_pos) {
-    _fault = FaultCode::PositionLimitExceeded;
-    _fault_latched = true;
-    _i_term = 0.0f;
-    _ref_vel = 0.0f;
-    _ref_acc = 0.0f;
-    _ref_pos = _limits_enabled ? clampf(measured_pos, _pos_min, _pos_max) : measured_pos;
-    _target = _ref_pos;
-    _prev_meas = _ref_pos;
-    _has_prev = false;
-    _meas_vel_f = 0.0f;
-    _last_meas_pos = _ref_pos;
-    _last_meas_vel = 0.0f;
+    latchStoppedFault(FaultCode::PositionLimitExceeded, measured_pos);
   }
 
   void latchEmergencyStop(float measured_pos) {
-    _fault = FaultCode::EmergencyStop;
-    _fault_latched = true;
-    _i_term = 0.0f;
-    _ref_vel = 0.0f;
-    _ref_acc = 0.0f;
-    _ref_pos = _limits_enabled ? clampf(measured_pos, _pos_min, _pos_max) : measured_pos;
-    _target = _ref_pos;
-    _prev_meas = _ref_pos;
-    _has_prev = false;
-    _meas_vel_f = 0.0f;
-    _last_meas_pos = _ref_pos;
-    _last_meas_vel = 0.0f;
+    latchStoppedFault(FaultCode::EmergencyStop, measured_pos);
   }
 
   // ---------- Lifecycle ----------
-  // Call once after you know your initial measured position.
   void reset(float measured_pos) {
     if (_limits_enabled) measured_pos = clampf(measured_pos, _pos_min, _pos_max);
 
@@ -141,6 +128,7 @@ public:
     _ref_pos = measured_pos;
     _ref_vel = 0.0f;
     _ref_acc = 0.0f;
+    clearTrajectory();
 
     _i_term = 0.0f;
     _prev_meas = measured_pos;
@@ -153,220 +141,189 @@ public:
     _last_meas_vel = 0.0f;
     _last_meas_pos = measured_pos;
     _target_gen = 0;
-    _meas_gen   = 0;
+    _meas_gen = 0;
+    _db_active = false;
 
     _last_us = micros();
   }
 
-  // Target can be updated continuously.
-  // Target is clamped inside hard limits (prevention).
+  // Plan from the current analytic reference state. The normal planner resets
+  // the controller first, so ordinary moves are rest-to-rest trajectories.
   void setTarget(float target_pos) {
-    if (_limits_enabled) {
-      _target = clampf(target_pos, _pos_min, _pos_max);
-    } else {
-      _target = target_pos;
+    const float target = clampedTarget(target_pos);
+    Trajectory candidate;
+
+    if (!makeTrajectory(_ref_pos, _ref_vel, _ref_acc, target, candidate)) {
+      // The non-blended API cannot report failure. Fall back to a safe
+      // rest-to-rest plan at the current reference position.
+      _ref_vel = 0.0f;
+      _ref_acc = 0.0f;
+      if (!makeTrajectory(_ref_pos, 0.0f, 0.0f, target, candidate)) {
+        _fault = FaultCode::BadLimits;
+        _fault_latched = true;
+        _target = _ref_pos;
+        clearTrajectory();
+        return;
+      }
     }
 
-    _target_gen++;          // NEW: target changed
-    _db_active = false;     // recommended: leave deadband when the target changes
+    acceptTarget(target, candidate);
   }
 
-  // Blended target update: keeps the current internal reference state
-  // (_ref_pos, _ref_vel, _ref_acc). This is intended for planner-style
-  // target changes while a move is already running.
-  void setTargetBlended(float target_pos) {
-    setTarget(target_pos);
+  // Install a continuous quintic only when it is monotonic and admissible.
+  // Failure is transactional: target and current trajectory remain unchanged.
+  bool setTargetBlended(float target_pos) {
+    const float target = clampedTarget(target_pos);
+    Trajectory candidate;
+    if (!makeTrajectory(_ref_pos, _ref_vel, _ref_acc, target, candidate)) {
+      return false;
+    }
+
+    acceptTarget(target, candidate);
+    return true;
+  }
+
+  // Rebuild the active remainder after vmax/amax changes. The current analytic
+  // position, velocity and acceleration are used as exact boundary conditions.
+  bool replanActiveTrajectory() {
+    if (!_trajectory.active) {
+      return true;
+    }
+
+    Trajectory candidate;
+    if (!makeTrajectory(_ref_pos, _ref_vel, _ref_acc, _target, candidate)) {
+      return false;
+    }
+
+    _trajectory = candidate;
+    return true;
   }
 
   float target() const { return _target; }
-
-  // Optional debug access
   float refPos() const { return _ref_pos; }
   float refVel() const { return _ref_vel; }
   float refAcc() const { return _ref_acc; }
+  bool trajectoryActive() const { return _trajectory.active; }
+  float trajectoryDuration() const { return _trajectory.duration; }
+  float trajectoryElapsed() const { return _trajectory.elapsed; }
 
   // ---------- Control Update ----------
   float update(float measured_pos) {
     const uint32_t now = micros();
     float dt = (now - _last_us) * 1e-6f;
     _last_us = now;
-
-    if (dt <= 0.0f) dt = 1e-6f;
-    if (dt > 0.2f)  dt = 0.2f;
-
     return update(measured_pos, dt);
   }
 
   float update(float measured_pos, float dt_s) {
-    const float dt = fmaxf(dt_s, 1e-6f);
+    const float dt = clampf(dt_s, MIN_UPDATE_DT_S, MAX_UPDATE_DT_S);
 
-    // 0) HARD SAFETY CHECK: measured position must be inside limits.
-    if (_limits_enabled) {
-      if (measured_pos < (_pos_min - _fault_margin) || measured_pos > (_pos_max + _fault_margin)) {
-        // Immediate stop + latch fault
-        _fault = FaultCode::PositionLimitExceeded;
-        _fault_latched = true;
-
-        // Freeze internal states (prevents integrator windup and odd profile states)
-        _i_term = 0.0f;
-        _ref_vel = 0.0f;
-        _ref_acc = 0.0f;
-        _ref_pos = clampf(measured_pos, _pos_min, _pos_max);
-        _target = _ref_pos;
-
-        _prev_meas = _ref_pos;
-        _has_prev = false;
-
-        _meas_vel_f = 0.0f;
-        _last_meas_pos = _ref_pos;
-        _last_meas_vel = 0.0f;
-
-        return 0.0f; // command velocity = 0 NOW
-      }
+    // Hard measured-position safety check.
+    if (_limits_enabled &&
+        (measured_pos < (_pos_min - _fault_margin) ||
+         measured_pos > (_pos_max + _fault_margin))) {
+      latchStoppedFault(FaultCode::PositionLimitExceeded, measured_pos);
+      return 0.0f;
     }
 
-    // If fault latched, stay stopped
     if (_fault_latched) {
       return 0.0f;
     }
-    
-    // ---- velocity estimate (needed for deadband and D term) ----
-    float meas_vel = 0.0f;
+
+    // Measured velocity is used by derivative-on-measurement, deadband and
+    // settled detection. It is not used to evolve the analytic trajectory.
+    float measured_velocity = 0.0f;
     if (_has_prev) {
-      meas_vel = (measured_pos - _prev_meas) / dt; // [deg/s]
+      measured_velocity = (measured_pos - _prev_meas) / dt;
     }
 
-    // ---- Low-pass filter on measured velocity ----
-    // tau = 0 => no filtering
-    float meas_vel_used = meas_vel;
+    float measured_velocity_used = measured_velocity;
     if (_vel_f_tau > 0.0f) {
       const float alpha = dt / (_vel_f_tau + dt);
-      _meas_vel_f += alpha * (meas_vel - _meas_vel_f);
-      meas_vel_used = _meas_vel_f;
+      _meas_vel_f += alpha * (measured_velocity - _meas_vel_f);
+      measured_velocity_used = _meas_vel_f;
     } else {
-      _meas_vel_f = meas_vel;
-      meas_vel_used = meas_vel;
+      _meas_vel_f = measured_velocity;
     }
 
-    // Save last measurement for isSettled()
     _last_meas_pos = measured_pos;
-    _last_meas_vel = meas_vel_used;
-    _meas_gen = _target_gen;      // NEW: we have a measurement for current target generation
+    _last_meas_vel = measured_velocity_used;
+    _meas_gen = _target_gen;
 
-    // ---- Deadband check (uses target vs measured) ----
-    if (_db_enabled && !_fault_latched) {
-      float tgt = _target;
-      if (_limits_enabled) tgt = clampf(tgt, _pos_min, _pos_max);
-
-      const float err_tgt = tgt - measured_pos;
-      const float aerr = fabsf(err_tgt);
-      //const float avel = fabsf(meas_vel);
-      const float avel = fabsf(meas_vel_used);
+    // Deadband is deliberately disabled while an analytic profile is active.
+    if (_db_enabled && !_trajectory.active) {
+      const float target = clampedTarget(_target);
+      const float position_error = fabsf(target - measured_pos);
+      const float velocity_abs = fabsf(measured_velocity_used);
 
       if (_db_active) {
-        // remain in deadband until we exceed exit threshold or we are moving too fast
-        if (aerr <= _db_exit && avel <= _db_vel) {
-          // freeze all internal dynamics and stop output
-          _ref_pos = tgt;
-          _ref_vel = 0.0f;
-          _ref_acc = 0.0f;
-          _i_term  = 0.0f;     // evita micro-creep da integrale
-          _prev_meas = measured_pos;
-          _has_prev = true;
-          // Save last measurement for isSettled()
-          _last_meas_pos = measured_pos;
-          //_last_meas_vel = meas_vel;
-          _last_meas_vel = meas_vel_used;
-          return 0.0f;
-        } else {
-          _db_active = false; // exit deadband -> resume control
-        }
-      } else {
-        // enter deadband only when close enough AND slow enough
-        if (aerr <= _db_enter && avel <= _db_vel) {
-          _db_active = true;
-          _ref_pos = tgt;
-          _ref_vel = 0.0f;
-          _ref_acc = 0.0f;
-          _i_term  = 0.0f;
-          _prev_meas = measured_pos;
-          _has_prev = true;
-          // Save last measurement for isSettled()
-          _last_meas_pos = measured_pos;
-          //_last_meas_vel = meas_vel;
-          _last_meas_vel = meas_vel_used;
+        if (position_error <= _db_exit && velocity_abs <= _db_vel) {
+          freezeInDeadband(target, measured_pos, measured_velocity_used);
           return 0.0f;
         }
+        _db_active = false;
+      } else if (position_error <= _db_enter && velocity_abs <= _db_vel) {
+        _db_active = true;
+        freezeInDeadband(target, measured_pos, measured_velocity_used);
+        return 0.0f;
       }
     }
 
-    // 1) Trajectory generator (jerk-limited), always confined within limits
     stepTrajectory(dt);
 
-    // 2) Position error between reference position and measured position
-    const float err = _ref_pos - measured_pos;
+    const float error = _ref_pos - measured_pos;
+    const float derivative = -_g.kd * measured_velocity_used;
 
-    // 3) Derivative on measurement (recommended with moving setpoint)
-    //const float d = -_g.kd * meas_vel;
-    const float d = -_g.kd * meas_vel_used;
-
-    // update the previous-measurement state only here
     _prev_meas = measured_pos;
     _has_prev = true;
 
-    // 4) Integrator with clamp
-    _i_term += _g.ki * err * dt;
+    _i_term += _g.ki * error * dt;
     if (_i_abs_max > 0.0f) {
       _i_term = clampf(_i_term, -_i_abs_max, +_i_abs_max);
     }
 
-    const float p = _g.kp * err;
-    float v_cmd = (_g.ff_vel * _ref_vel) + p + _i_term + d;
+    const float proportional = _g.kp * error;
+    float command = (_g.ff_vel * _ref_vel) +
+                    proportional +
+                    _i_term +
+                    derivative;
 
-    //Serial1.printf (" cmd %4.1f ", v_cmd);
-
-    // 5) Output clamp
-    const float out_lim = (_lim.out_max > 0.0f) ? _lim.out_max : _lim.v_max;
-    if (out_lim > 0.0f) {
-      const float v_sat = clampf(v_cmd, -out_lim, +out_lim);
-      if (v_sat != v_cmd && _g.ki != 0.0f) {
-        // undo last integration step if saturating
-        _i_term -= _g.ki * err * dt;
+    const float output_limit = (_lim.out_max > 0.0f)
+      ? _lim.out_max
+      : _lim.v_max;
+    if (output_limit > 0.0f) {
+      const float saturated = clampf(command, -output_limit, +output_limit);
+      if (saturated != command && _g.ki != 0.0f) {
+        _i_term -= _g.ki * error * dt;
       }
-      v_cmd = v_sat;
+      command = saturated;
     }
 
-    //Serial1.printf (" clamp %4.1f ", v_cmd);
-    //Serial1.println ();
-
-    // 6) Soft-stop near hard limits: forbid commands that push outward.
-    // This is prevention; the "must not exceed" is enforced by the HARD CHECK above.
+    // Prevent an output command from pushing farther through a hard limit.
     if (_limits_enabled && _stop_margin > 0.0f) {
-      const float lo = _pos_min + _stop_margin;
-      const float hi = _pos_max - _stop_margin;
-
-      if (measured_pos <= lo && v_cmd < 0.0f) v_cmd = 0.0f;
-      if (measured_pos >= hi && v_cmd > 0.0f) v_cmd = 0.0f;
+      const float lower_guard = _pos_min + _stop_margin;
+      const float upper_guard = _pos_max - _stop_margin;
+      if (measured_pos <= lower_guard && command < 0.0f) command = 0.0f;
+      if (measured_pos >= upper_guard && command > 0.0f) command = 0.0f;
     }
 
-    return v_cmd;
+    return command;
   }
 
-  // Deadband (position) with hysteresis:
-  // - enter_deg: when |target - measured| <= enter_deg and velocity is low, stop and latch
-  // - exit_deg : higher threshold used to leave deadband (if 0 => exit = enter)
-  // - vel_deg_s: additional condition; measured velocity must be low to enter/stay in deadband
-  void setDeadband(float enter_deg, float exit_deg = 0.0f, float vel_deg_s = 0.5f) {
+  // ---------- Deadband and settled detection ----------
+  void setDeadband(float enter_deg,
+                   float exit_deg = 0.0f,
+                   float vel_deg_s = 0.5f) {
     _db_enabled = (enter_deg > 0.0f);
     _db_enter = fabsf(enter_deg);
-    _db_exit  = (exit_deg > 0.0f) ? fabsf(exit_deg) : _db_enter;
-    if (_db_exit < _db_enter) _db_exit = _db_enter; // safety
-    _db_vel   = fabsf(vel_deg_s);
+    _db_exit = (exit_deg > 0.0f) ? fabsf(exit_deg) : _db_enter;
+    if (_db_exit < _db_enter) _db_exit = _db_enter;
+    _db_vel = fabsf(vel_deg_s);
     _db_active = false;
   }
 
   void setVelocityFilterTau(float tau_s) {
-    _vel_f_tau = fmaxf(tau_s, 0.0f);   // 0 disables filtering
+    _vel_f_tau = fmaxf(tau_s, 0.0f);
   }
 
   void disableDeadband() {
@@ -375,163 +332,346 @@ public:
   }
 
   bool inDeadband() const { return _db_active; }
-
   float getLastMeasuredVel() const { return _last_meas_vel; }
 
   bool isSettled() const {
-    if (_fault_latched) return false;
-
-    if (_meas_gen != _target_gen) return false;   // NEW
-
-    // If deadband is active, by definition the controller is stopped at target
+    if (_fault_latched || _trajectory.active) return false;
+    if (_meas_gen != _target_gen) return false;
     if (_db_enabled && _db_active) return true;
-
-    // Settled state definition: use the configured tolerances
     if (_tol.pos <= 0.0f || _tol.vel <= 0.0f) return false;
 
-    float tgt = _target;
-    if (_limits_enabled) tgt = clampf(tgt, _pos_min, _pos_max);
-
-    const float pos_err = fabsf(tgt - _last_meas_pos);
-    const float vel_abs = fabsf(_last_meas_vel);
-
-    return (pos_err <= _tol.pos) && (vel_abs <= _tol.vel);
+    const float position_error = fabsf(clampedTarget(_target) - _last_meas_pos);
+    const float velocity_abs = fabsf(_last_meas_vel);
+    return position_error <= _tol.pos && velocity_abs <= _tol.vel;
   }
 
 private:
+  static constexpr float MIN_UPDATE_DT_S = 1.0e-6f;
+  static constexpr float MAX_UPDATE_DT_S = 0.2f;
+  static constexpr float MIN_TRAJECTORY_DURATION_S = 1.0e-3f;
+  static constexpr float POSITION_EPSILON_DEG = 1.0e-6f;
+  static constexpr float VELOCITY_EPSILON_DEG_S = 1.0e-5f;
+  static constexpr float ACCELERATION_EPSILON_DEG_S2 = 1.0e-4f;
+  static constexpr float QUINTIC_PEAK_VELOCITY = 1.875f;
+  static constexpr float QUINTIC_PEAK_ACCELERATION = 5.7735027f;
+  static constexpr uint16_t PROFILE_SAMPLES = 160;
+  static constexpr uint16_t DURATION_SEARCH_STEPS = 120;
+  static constexpr float DURATION_GROWTH = 1.08f;
+
   Limits _lim{};
   Gains _g{};
   Tolerances _tol{};
+  Trajectory _trajectory{};
 
   bool _out_auto = true;
-
   float _target = 0.0f;
 
-  // reference state
   float _ref_pos = 0.0f;
   float _ref_vel = 0.0f;
   float _ref_acc = 0.0f;
 
-  // PID state
   float _i_term = 0.0f;
   float _i_abs_max = 0.0f;
 
-  // derivative state
   float _prev_meas = 0.0f;
-  bool  _has_prev = false;
+  bool _has_prev = false;
 
-  // safety limits
-  bool  _limits_enabled = false;
+  bool _limits_enabled = false;
   float _pos_min = -INFINITY;
   float _pos_max = +INFINITY;
   float _stop_margin = 0.5f;
   float _fault_margin = 0.0f;
 
-  // fault state
   FaultCode _fault = FaultCode::None;
   bool _fault_latched = false;
 
-  // timekeeping
   uint32_t _last_us = 0;
 
-  // Deadband state
-  bool  _db_enabled = false;
-  bool  _db_active  = false;
-  float _db_enter   = 0.0f;   // [deg]
-  float _db_exit    = 0.0f;   // [deg]
-  float _db_vel     = 0.5f;   // [deg/s]
+  bool _db_enabled = false;
+  bool _db_active = false;
+  float _db_enter = 0.0f;
+  float _db_exit = 0.0f;
+  float _db_vel = 0.5f;
 
-  // last measurement (for isSettled)
   float _last_meas_pos = 0.0f;
   float _last_meas_vel = 0.0f;
   uint32_t _target_gen = 0;
-  uint32_t _meas_gen   = 0;
+  uint32_t _meas_gen = 0;
 
-
-  // filtered measured velocity (for D, deadband, isSettled)
   float _meas_vel_f = 0.0f;
-  float _vel_f_tau  = 0.05f;   // [s] default 50ms (good @200Hz)
+  float _vel_f_tau = 0.05f;
 
-
-  static float clampf(float x, float lo, float hi) {
-    if (x < lo) return lo;
-    if (x > hi) return hi;
-    return x;
+  static float clampf(float value, float lower, float upper) {
+    if (value < lower) return lower;
+    if (value > upper) return upper;
+    return value;
   }
 
-  static float signf(float x) { return (x > 0.0f) - (x < 0.0f); }
+  float clampedTarget(float target) const {
+    return _limits_enabled ? clampf(target, _pos_min, _pos_max) : target;
+  }
 
-  void stepTrajectory(float dt) {
-    if (_lim.v_max <= 0.0f || _lim.a_max <= 0.0f) {
-      _ref_pos = _target;
+  void clearTrajectory() {
+    _trajectory = Trajectory{};
+  }
+
+  void latchStoppedFault(FaultCode code, float measured_pos) {
+    _fault = code;
+    _fault_latched = true;
+    _i_term = 0.0f;
+    _ref_vel = 0.0f;
+    _ref_acc = 0.0f;
+    _ref_pos = _limits_enabled
+      ? clampf(measured_pos, _pos_min, _pos_max)
+      : measured_pos;
+    _target = _ref_pos;
+    clearTrajectory();
+    _prev_meas = _ref_pos;
+    _has_prev = false;
+    _meas_vel_f = 0.0f;
+    _last_meas_pos = _ref_pos;
+    _last_meas_vel = 0.0f;
+    _db_active = false;
+  }
+
+  void freezeInDeadband(float target,
+                        float measured_pos,
+                        float measured_velocity) {
+    _ref_pos = target;
+    _ref_vel = 0.0f;
+    _ref_acc = 0.0f;
+    _i_term = 0.0f;
+    _prev_meas = measured_pos;
+    _has_prev = true;
+    _last_meas_pos = measured_pos;
+    _last_meas_vel = measured_velocity;
+  }
+
+  void acceptTarget(float target, const Trajectory& trajectory) {
+    _target = target;
+    _trajectory = trajectory;
+    _target_gen++;
+    _db_active = false;
+
+    if (!_trajectory.active) {
+      _ref_pos = target;
       _ref_vel = 0.0f;
       _ref_acc = 0.0f;
-      if (_limits_enabled) _ref_pos = clampf(_ref_pos, _pos_min, _pos_max);
-      return;
+    }
+  }
+
+  float initialDuration(float distance_abs, float initial_velocity) const {
+    const float velocity_duration =
+      QUINTIC_PEAK_VELOCITY * distance_abs / _lim.v_max;
+    const float acceleration_duration =
+      sqrtf(QUINTIC_PEAK_ACCELERATION * distance_abs / _lim.a_max);
+    const float boundary_velocity_duration =
+      2.0f * fabsf(initial_velocity) / _lim.a_max;
+    return fmaxf(MIN_TRAJECTORY_DURATION_S,
+                 fmaxf(boundary_velocity_duration,
+                       fmaxf(velocity_duration, acceleration_duration)));
+  }
+
+  static bool buildCoefficients(float p0,
+                                float v0,
+                                float a0,
+                                float pf,
+                                float duration,
+                                Trajectory& trajectory) {
+    if (!isfinite(p0) || !isfinite(v0) || !isfinite(a0) ||
+        !isfinite(pf) || !isfinite(duration) || duration <= 0.0f) {
+      return false;
     }
 
-    // Clamp target within limits (prevention)
-    float tgt = _target;
-    if (_limits_enabled) tgt = clampf(tgt, _pos_min, _pos_max);
+    trajectory = Trajectory{};
+    trajectory.active = true;
+    trajectory.duration = duration;
+    trajectory.c0 = p0;
+    trajectory.c1 = v0 * duration;
+    trajectory.c2 = 0.5f * a0 * duration * duration;
 
-    const float d = tgt - _ref_pos;
-    const float ad = fabsf(d);
+    const float position_remainder =
+      pf - (trajectory.c0 + trajectory.c1 + trajectory.c2);
+    const float velocity_remainder =
+      -(trajectory.c1 + 2.0f * trajectory.c2);
+    const float acceleration_remainder =
+      -(2.0f * trajectory.c2);
 
-    // Snap if close enough
-    if (_tol.pos > 0.0f && _tol.vel > 0.0f) {
-      if (ad <= _tol.pos && fabsf(_ref_vel) <= _tol.vel) {
-        _ref_pos = tgt;
-        _ref_vel = 0.0f;
-        _ref_acc = 0.0f;
-        // Serial.print ("rpos ");
-        // Serial.println (_ref_pos);
-        return;
+    trajectory.c3 = 10.0f * position_remainder -
+                    4.0f * velocity_remainder +
+                    0.5f * acceleration_remainder;
+    trajectory.c4 = -15.0f * position_remainder +
+                    7.0f * velocity_remainder -
+                    acceleration_remainder;
+    trajectory.c5 = 6.0f * position_remainder -
+                    3.0f * velocity_remainder +
+                    0.5f * acceleration_remainder;
+
+    return isfinite(trajectory.c0) && isfinite(trajectory.c1) &&
+           isfinite(trajectory.c2) && isfinite(trajectory.c3) &&
+           isfinite(trajectory.c4) && isfinite(trajectory.c5);
+  }
+
+  static void evaluate(const Trajectory& trajectory,
+                       float normalized_time,
+                       float& position,
+                       float& velocity,
+                       float& acceleration) {
+    const double u = static_cast<double>(
+      clampf(normalized_time, 0.0f, 1.0f));
+    // Horner evaluation reduces cancellation near the exact endpoint.
+    const double position_value =
+      static_cast<double>(trajectory.c0) +
+      u * (static_cast<double>(trajectory.c1) +
+      u * (static_cast<double>(trajectory.c2) +
+      u * (static_cast<double>(trajectory.c3) +
+      u * (static_cast<double>(trajectory.c4) +
+      u * static_cast<double>(trajectory.c5)))));
+
+    const double position_du =
+      static_cast<double>(trajectory.c1) +
+      u * (2.0 * static_cast<double>(trajectory.c2) +
+      u * (3.0 * static_cast<double>(trajectory.c3) +
+      u * (4.0 * static_cast<double>(trajectory.c4) +
+      u * 5.0 * static_cast<double>(trajectory.c5))));
+
+    const double position_du2 =
+      2.0 * static_cast<double>(trajectory.c2) +
+      u * (6.0 * static_cast<double>(trajectory.c3) +
+      u * (12.0 * static_cast<double>(trajectory.c4) +
+      u * 20.0 * static_cast<double>(trajectory.c5)));
+
+    const double duration = static_cast<double>(trajectory.duration);
+    position = static_cast<float>(position_value);
+    velocity = static_cast<float>(position_du / duration);
+    acceleration = static_cast<float>(
+      position_du2 / (duration * duration));
+  }
+
+  bool trajectoryAdmissible(const Trajectory& trajectory,
+                            float p0,
+                            float v0,
+                            float a0,
+                            float pf) const {
+    const float distance = pf - p0;
+    const float distance_abs = fabsf(distance);
+    const float direction = distance >= 0.0f ? 1.0f : -1.0f;
+    const float lower_position = fminf(p0, pf);
+    const float upper_position = fmaxf(p0, pf);
+    const float position_slack =
+      1.0e-4f + 1.0e-5f * fmaxf(1.0f, distance_abs);
+    const float velocity_limit = fmaxf(_lim.v_max, fabsf(v0));
+    const float acceleration_limit = fmaxf(_lim.a_max, fabsf(a0));
+    const float velocity_slack = 1.0e-4f + 1.0e-3f * velocity_limit;
+    const float acceleration_slack =
+      1.0e-4f + 1.0e-3f * acceleration_limit;
+
+    for (uint16_t sample = 0; sample <= PROFILE_SAMPLES; ++sample) {
+      const float u = static_cast<float>(sample) /
+                      static_cast<float>(PROFILE_SAMPLES);
+      float position = 0.0f;
+      float velocity = 0.0f;
+      float acceleration = 0.0f;
+      evaluate(trajectory, u, position, velocity, acceleration);
+
+      if (!isfinite(position) || !isfinite(velocity) ||
+          !isfinite(acceleration)) {
+        return false;
+      }
+      if (position < lower_position - position_slack ||
+          position > upper_position + position_slack) {
+        return false;
+      }
+      if (direction * velocity < -velocity_slack) {
+        return false;
+      }
+      if (_limits_enabled &&
+          (position < _pos_min - position_slack ||
+           position > _pos_max + position_slack)) {
+        return false;
+      }
+      if (fabsf(velocity) > velocity_limit + velocity_slack ||
+          fabsf(acceleration) > acceleration_limit + acceleration_slack) {
+        return false;
       }
     }
 
-    // braking distance with a_max: v^2/(2a)
-    const float v = _ref_vel;
-    const float v_abs = fabsf(v);
-    const float d_brake = (v_abs * v_abs) / (2.0f * _lim.a_max);
+    return true;
+  }
 
-    float acc_cmd = 0.0f;
-    if (ad > d_brake) {
-      acc_cmd = signf(d) * _lim.a_max;   // accelerate toward target
-    } else {
-      const float s = (v_abs > 1e-6f) ? signf(v) : signf(d);
-      acc_cmd = -s * _lim.a_max;         // decelerate to stop
+  bool makeTrajectory(float p0,
+                      float v0,
+                      float a0,
+                      float pf,
+                      Trajectory& trajectory) const {
+    if (!isfinite(_lim.v_max) || !isfinite(_lim.a_max) ||
+        _lim.v_max <= 0.0f || _lim.a_max <= 0.0f ||
+        !isfinite(p0) || !isfinite(v0) || !isfinite(a0) ||
+        !isfinite(pf)) {
+      return false;
     }
 
-    // jerk limit
-    if (_lim.j_max > 0.0f) {
-      const float da_max = _lim.j_max * dt;
-      const float da = clampf(acc_cmd - _ref_acc, -da_max, +da_max);
-      _ref_acc += da;
-    } else {
-      _ref_acc = acc_cmd;
+    const float distance = pf - p0;
+    if (fabsf(distance) <= POSITION_EPSILON_DEG) {
+      if (fabsf(v0) <= VELOCITY_EPSILON_DEG_S &&
+          fabsf(a0) <= ACCELERATION_EPSILON_DEG_S2) {
+        trajectory = Trajectory{};
+        return true;
+      }
+      return false;
     }
 
-    // integrate velocity
-    _ref_vel += _ref_acc * dt;
-    _ref_vel = clampf(_ref_vel, -_lim.v_max, +_lim.v_max);
-
-    // integrate position
-    _ref_pos += _ref_vel * dt;
-
-    // confine reference to limits (prevention)
-    if (_limits_enabled) {
-      if (_ref_pos <= _pos_min) { _ref_pos = _pos_min; _ref_vel = 0.0f; _ref_acc = 0.0f; }
-      if (_ref_pos >= _pos_max) { _ref_pos = _pos_max; _ref_vel = 0.0f; _ref_acc = 0.0f; }
-      tgt = clampf(tgt, _pos_min, _pos_max);
+    if (fabsf(v0) > VELOCITY_EPSILON_DEG_S && distance * v0 < 0.0f) {
+      return false;
     }
 
-    // overshoot guard relative to target
-    const float d2 = tgt - _ref_pos;
-    if (signf(d) != 0.0f && signf(d2) != 0.0f && signf(d) != signf(d2)) {
-      _ref_pos = tgt;
+    float duration = initialDuration(fabsf(distance), v0);
+    for (uint16_t attempt = 0; attempt < DURATION_SEARCH_STEPS; ++attempt) {
+      Trajectory candidate;
+      if (buildCoefficients(p0, v0, a0, pf, duration, candidate) &&
+          trajectoryAdmissible(candidate, p0, v0, a0, pf)) {
+        trajectory = candidate;
+        return true;
+      }
+      duration *= DURATION_GROWTH;
+      if (!isfinite(duration)) {
+        break;
+      }
+    }
+
+    return false;
+  }
+
+  void stepTrajectory(float dt) {
+    if (!_trajectory.active) {
+      return;
+    }
+
+    _trajectory.elapsed =
+      fminf(_trajectory.elapsed + clampf(dt, MIN_UPDATE_DT_S, MAX_UPDATE_DT_S),
+            _trajectory.duration);
+
+    if (_trajectory.elapsed >= _trajectory.duration) {
+      _ref_pos = _target;
       _ref_vel = 0.0f;
       _ref_acc = 0.0f;
+      _trajectory.active = false;
+      return;
     }
+
+    const float normalized_time =
+      _trajectory.elapsed / _trajectory.duration;
+    evaluate(_trajectory,
+             normalized_time,
+             _ref_pos,
+             _ref_vel,
+             _ref_acc);
+
+    // Candidate validation guarantees this interval analytically. Clamp only
+    // sub-millidegree floating-point residue so endpoint cleanup cannot move
+    // the reference backward on the final update.
+    _ref_pos = clampf(_ref_pos,
+                      fminf(_trajectory.c0, _target),
+                      fmaxf(_trajectory.c0, _target));
   }
 };
-

@@ -28,6 +28,7 @@ public:
   float position = 0.0f;
   float refPosition = 0.0f;
   float refVelocity = 0.0f;
+  bool blendSucceeds = true;
 
   int stopCalls = 0;
   int enableCalls = 0;
@@ -39,7 +40,6 @@ public:
   bool lastClearFault = false;
   float configuredVmax = 0.0f;
   float configuredAmax = 0.0f;
-  float configuredSCurve = 0.0f;
   float configuredOutMax = 0.0f;
   float startedTarget = 0.0f;
 
@@ -79,13 +79,11 @@ public:
 
   void configureController(float vmaxDegS,
                            float amaxDegS2,
-                           float sCurveTimeS,
                            float outMaxDegS,
                            bool clearFault) override {
     ++configureCalls;
     configuredVmax = vmaxDegS;
     configuredAmax = amaxDegS2;
-    configuredSCurve = sCurveTimeS;
     configuredOutMax = outMaxDegS;
     lastClearFault = clearFault;
   }
@@ -98,9 +96,12 @@ public:
     refVelocity = 0.0f;
   }
 
-  void blendControllerTarget(float targetDeg) override {
+  bool blendControllerTarget(float targetDeg) override {
     ++blendCalls;
-    startedTarget = targetDeg;
+    if (blendSucceeds) {
+      startedTarget = targetDeg;
+    }
+    return blendSucceeds;
   }
 
   void beginPositionMotion(float targetDeg) override {
@@ -232,6 +233,24 @@ void testBlendReverseUsesSafeReplan()
   CHECK(std::fabs(runtime.refPosition - 4.0f) < 0.001f);
 }
 
+void testRejectedBlendUsesSafeReplan()
+{
+  FakeRuntime runtime;
+  runtime.mode = MotionMode::POSITION;
+  runtime.driverIsEnabled = true;
+  runtime.position = 4.0f;
+  runtime.refPosition = 5.0f;
+  runtime.refVelocity = 2.0f;
+  runtime.blendSucceeds = false;
+  JointPlanner planner(runtime, testConfig());
+
+  const JointMoveOutcome outcome = planner.moveToBlended(command(20.0f));
+  CHECK(outcome.result == JointMoveResult::SafeReplan);
+  CHECK(runtime.blendCalls == 1);
+  CHECK(runtime.restartCalls == 1);
+  CHECK(std::fabs(runtime.refPosition - 4.0f) < 0.001f);
+}
+
 void testDriverFailureLatchesFault()
 {
   FakeRuntime runtime;
@@ -265,6 +284,7 @@ int main()
   testClippingAndSafetyClamps();
   testBlendAheadKeepsReference();
   testBlendReverseUsesSafeReplan();
+  testRejectedBlendUsesSafeReplan();
   testDriverFailureLatchesFault();
   testStop();
 

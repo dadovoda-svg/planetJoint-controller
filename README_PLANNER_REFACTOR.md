@@ -28,8 +28,8 @@ The old console-compatible global API is still available as wrappers:
 This keeps the existing USB console commands unchanged:
 
 - `pos <deg>`
-- `move <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]`
-- `moveb <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]`
+- `move <target_deg> <vmax_deg_s> <amax_deg_s2>`
+- `moveb <target_deg> <vmax_deg_s> <amax_deg_s2>`
 - `stop`
 
 ### Planner serial port
@@ -60,8 +60,8 @@ Supported commands on the planner serial port are intentionally minimal for now:
 help
 status
 stop
-move <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]
-moveb <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]
+move <target_deg> <vmax_deg_s> <amax_deg_s2>
+moveb <target_deg> <vmax_deg_s> <amax_deg_s2>
 ```
 
 Line endings are tolerant of `\n`, `\r` and `\r\n`.

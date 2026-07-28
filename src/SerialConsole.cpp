@@ -120,14 +120,14 @@ const SerialConsole::Command SerialConsole::_commands[] = {
   },
   {
     "move",
-    "move <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]",
+    "move <target_deg> <vmax_deg_s> <amax_deg_s2>",
     "Planner-style move with explicit target, velocity and acceleration",
     &SerialConsole::cmdMove
   },
   {
     "moveb",
-    "moveb <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]",
-    "Planner-style blended move without resetting reference velocity",
+    "moveb <target_deg> <vmax_deg_s> <amax_deg_s2>",
+    "Planner-style continuous quintic retarget with safe fallback",
     &SerialConsole::cmdMoveBlended
   },
   {
@@ -775,8 +775,8 @@ void SerialConsole::cmdPos(int argc, char* argv[])
 
 void SerialConsole::cmdMove(int argc, char* argv[])
 {
-  if (argc != 4 && argc != 5) {
-    _serial.println("ERR usage: move <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]");
+  if (argc != 4) {
+    _serial.println("ERR usage: move <target_deg> <vmax_deg_s> <amax_deg_s2>");
     return;
   }
 
@@ -803,20 +803,7 @@ void SerialConsole::cmdMove(int argc, char* argv[])
     return;
   }
 
-  JointMoveOutcome outcome;
-
-  if (argc == 5) {
-    const float sct = strtof(argv[4], &endPtr);
-    if (endPtr == argv[4] || *endPtr != '\0') {
-      _serial.print("ERR invalid sct_s: ");
-      _serial.println(argv[4]);
-      return;
-    }
-
-    outcome = jointMoveTo(target, vmax, amax, sct);
-  } else {
-    outcome = jointMoveTo(target, vmax, amax);
-  }
+  const JointMoveOutcome outcome = jointMoveTo(target, vmax, amax);
 
   if (outcome.accepted()) {
     _serial.print("OK move ");
@@ -829,8 +816,8 @@ void SerialConsole::cmdMove(int argc, char* argv[])
 
 void SerialConsole::cmdMoveBlended(int argc, char* argv[])
 {
-  if (argc != 4 && argc != 5) {
-    _serial.println("ERR usage: moveb <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]");
+  if (argc != 4) {
+    _serial.println("ERR usage: moveb <target_deg> <vmax_deg_s> <amax_deg_s2>");
     return;
   }
 
@@ -857,20 +844,8 @@ void SerialConsole::cmdMoveBlended(int argc, char* argv[])
     return;
   }
 
-  JointMoveOutcome outcome;
-
-  if (argc == 5) {
-    const float sct = strtof(argv[4], &endPtr);
-    if (endPtr == argv[4] || *endPtr != '\0') {
-      _serial.print("ERR invalid sct_s: ");
-      _serial.println(argv[4]);
-      return;
-    }
-
-    outcome = jointMoveToBlended(target, vmax, amax, sct);
-  } else {
-    outcome = jointMoveToBlended(target, vmax, amax);
-  }
+  const JointMoveOutcome outcome =
+    jointMoveToBlended(target, vmax, amax);
 
   if (outcome.accepted()) {
     _serial.print("OK blended move ");

@@ -6,13 +6,5 @@
 // Transport parsing and response formatting remain outside JointPlanner.
 JointMoveOutcome moveJointToDeg(float targetZeroedDeg);
 JointMoveOutcome jointMoveTo(float targetDeg, float vmaxDegS, float amaxDegS2);
-JointMoveOutcome jointMoveTo(float targetDeg,
-                             float vmaxDegS,
-                             float amaxDegS2,
-                             float sCurveTimeS);
 JointMoveOutcome jointMoveToBlended(float targetDeg, float vmaxDegS, float amaxDegS2);
-JointMoveOutcome jointMoveToBlended(float targetDeg,
-                                    float vmaxDegS,
-                                    float amaxDegS2,
-                                    float sCurveTimeS);
 JointMoveOutcome jointStop();

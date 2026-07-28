@@ -66,7 +66,6 @@ static constexpr float DEFAULT_ENCODER_DIRECTION_SIGN = 1.0f;
 static constexpr uint32_t SERVO_CONTROL_PERIOD_US = 5000; // 200 Hz
 static constexpr float SERVO_VMAX_DEG_S       = 2.0f;
 static constexpr float SERVO_AMAX_DEG_S2      = 6.0f;
-static constexpr float SERVO_SCURVE_TIME_S    = 0.150f;
 static constexpr float SERVO_OUTPUT_MAX_DEG_S = 2.5f;
 
 static constexpr float SERVO_KP               = 0.8f;
@@ -195,11 +194,10 @@ public:
   float controllerRefVelocityDegS() const override;
   void configureController(float vmaxDegS,
                            float amaxDegS2,
-                           float sCurveTimeS,
                            float outMaxDegS,
                            bool clearFault) override;
   void restartController(float currentDeg, float targetDeg) override;
-  void blendControllerTarget(float targetDeg) override;
+  bool blendControllerTarget(float targetDeg) override;
   void beginPositionMotion(float targetDeg) override;
 };
 
@@ -627,7 +625,7 @@ void paramsInit()
   params.initKey("jmax", JOINT_MAX_DEG_DEFAULT);
   params.initKey("jtol", JOINT_LIMIT_TOL_DEFAULT); // allowed measured overshoot beyond jmin/jmax before fault
 
-  // PID + S-curve controller parameters.
+  // PID + analytic quintic trajectory controller parameters.
   // Key names are intentionally short because PersistentParams allows max 6 chars.
   params.initKey("kp", SERVO_KP);
   params.initKey("ki", SERVO_KI);
@@ -637,7 +635,6 @@ void paramsInit()
 
   params.initKey("vmax", SERVO_VMAX_DEG_S);
   params.initKey("amax", SERVO_AMAX_DEG_S2);
-  params.initKey("sct", SERVO_SCURVE_TIME_S);
   params.initKey("outmax", SERVO_OUTPUT_MAX_DEG_S);
 
   params.initKey("ptol", SERVO_POS_TOL_DEG);
@@ -695,19 +692,23 @@ static void applyMicrostepResolutionFromParams()
   LOG_NFO("Updated TMC2209 microstep resolution: USTEP=%u\r\n", ustep);
 }
 
-static void applyControllerMotionParamsFromParams()
+static void applyControllerMotionParamsFromParams(bool replanActive)
 {
   const float vmax = readParamMinOrDefault("vmax", SERVO_VMAX_DEG_S, 0.001f);
   const float amax = readParamMinOrDefault("amax", SERVO_AMAX_DEG_S2, 0.001f);
-  const float sct = readParamMinOrDefault("sct", SERVO_SCURVE_TIME_S, 0.001f);
   const float outmax = readParamMinOrDefault("outmax", SERVO_OUTPUT_MAX_DEG_S, 0.0f);
 
   jointCtrl.setLimits(vmax, amax);
-  jointCtrl.setSCurveTime(sct);
   jointCtrl.setOutputMax(outmax);
 
-  LOG_NFO("Servo motion params: vmax=%.4f amax=%.4f sct=%.4f outmax=%.4f\r\n",
-                vmax, amax, sct, outmax);
+  LOG_NFO("Servo motion params: vmax=%.4f amax=%.4f outmax=%.4f\r\n",
+          vmax, amax, outmax);
+
+  if (replanActive && jointCtrl.trajectoryActive() &&
+      !jointCtrl.replanActiveTrajectory()) {
+    LOG_ERR("Active quintic trajectory cannot satisfy updated motion limits; stopping safely\r\n");
+    stopMotion();
+  }
 }
 
 static void applyControllerGainsFromParams()
@@ -744,7 +745,7 @@ static void applyControllerSettlingParamsFromParams()
 
 static void applyControllerParamsFromParams()
 {
-  applyControllerMotionParamsFromParams();
+  applyControllerMotionParamsFromParams(false);
   applyControllerGainsFromParams();
   applyControllerSettlingParamsFromParams();
 }
@@ -807,9 +808,13 @@ void onConsoleParamSet(const char* key)
     return;
   }
 
-  if (strcmp(key, "vmax") == 0 || strcmp(key, "amax") == 0 ||
-      strcmp(key, "sct") == 0 || strcmp(key, "outmax") == 0) {
-    applyControllerMotionParamsFromParams();
+  if (strcmp(key, "vmax") == 0 || strcmp(key, "amax") == 0) {
+    applyControllerMotionParamsFromParams(true);
+    return;
+  }
+
+  if (strcmp(key, "outmax") == 0) {
+    applyControllerMotionParamsFromParams(false);
     return;
   }
 
@@ -1253,7 +1258,6 @@ float FirmwareJointPlannerRuntime::controllerRefVelocityDegS() const
 
 void FirmwareJointPlannerRuntime::configureController(float vmaxDegS,
                                                       float amaxDegS2,
-                                                      float sCurveTimeS,
                                                       float outMaxDegS,
                                                       bool clearFault)
 {
@@ -1261,9 +1265,6 @@ void FirmwareJointPlannerRuntime::configureController(float vmaxDegS,
     jointCtrl.clearFault();
   }
   jointCtrl.setLimits(vmaxDegS, amaxDegS2);
-  if (sCurveTimeS > 0.0f) {
-    jointCtrl.setSCurveTime(sCurveTimeS);
-  }
   jointCtrl.setOutputMax(outMaxDegS);
 }
 
@@ -1273,9 +1274,9 @@ void FirmwareJointPlannerRuntime::restartController(float currentDeg, float targ
   jointCtrl.setTarget(targetDeg);
 }
 
-void FirmwareJointPlannerRuntime::blendControllerTarget(float targetDeg)
+bool FirmwareJointPlannerRuntime::blendControllerTarget(float targetDeg)
 {
-  jointCtrl.setTargetBlended(targetDeg);
+  return jointCtrl.setTargetBlended(targetDeg);
 }
 
 void FirmwareJointPlannerRuntime::beginPositionMotion(float targetDeg)
@@ -1291,7 +1292,6 @@ JointMoveOutcome moveJointToDeg(float targetZeroedDeg)
   cmd.targetDeg = targetZeroedDeg;
   cmd.vmaxDegS = readParamMinOrDefault("vmax", SERVO_VMAX_DEG_S, 0.001f);
   cmd.amaxDegS2 = readParamMinOrDefault("amax", SERVO_AMAX_DEG_S2, 0.001f);
-  cmd.sCurveTimeS = readParamMinOrDefault("sct", SERVO_SCURVE_TIME_S, 0.001f);
   cmd.outMaxDegS = readParamMinOrDefault("outmax", SERVO_OUTPUT_MAX_DEG_S, 0.0f);
   return planner.moveTo(cmd);
 }
@@ -1301,25 +1301,9 @@ JointMoveOutcome jointMoveTo(float targetDeg, float vmaxDegS, float amaxDegS2)
   return planner.moveTo(targetDeg, vmaxDegS, amaxDegS2);
 }
 
-JointMoveOutcome jointMoveTo(float targetDeg,
-                             float vmaxDegS,
-                             float amaxDegS2,
-                             float sCurveTimeS)
-{
-  return planner.moveTo(targetDeg, vmaxDegS, amaxDegS2, sCurveTimeS);
-}
-
 JointMoveOutcome jointMoveToBlended(float targetDeg, float vmaxDegS, float amaxDegS2)
 {
   return planner.moveToBlended(targetDeg, vmaxDegS, amaxDegS2);
-}
-
-JointMoveOutcome jointMoveToBlended(float targetDeg,
-                                    float vmaxDegS,
-                                    float amaxDegS2,
-                                    float sCurveTimeS)
-{
-  return planner.moveToBlended(targetDeg, vmaxDegS, amaxDegS2, sCurveTimeS);
 }
 
 JointMoveOutcome jointStop()
@@ -1364,7 +1348,7 @@ void jointControllerInit(float currentJointDeg)
   applyJointLimitsFromParams(true);
   jointCtrl.reset(currentJointDeg);
 
-  LOG_NFO("Joint PID + S-curve controller initialized\r\n");
+  LOG_NFO("Joint PID + analytic quintic S-curve controller initialized\r\n");
   LOG_NFO("Servo parameters are runtime-tunable with set <key> <value>. Keep early tests slow.\r\n");
 }
 
@@ -1723,7 +1707,7 @@ void printServoStatus()
   float jtol = 0.0f;
   readJointLimitParams(jmin, jmax, jtol);
 
-  Serial.printf("mode=%s referenced=%u park_sensor=%u tmc=%u hold=%u shold=%u enc=%.3f joint=%.3f zeroed=%.3f target=%.3f ref=%.3f refv=%.3f measv=%.3f cmd=%.3f stdeg=%.6f jrev=%.6f mdir=%+.0f edir=%+.0f zoff=%.6f jmin=%.3f jmax=%.3f jtol=%.3f fault=%u\r\n",
+  Serial.printf("mode=%s referenced=%u park_sensor=%u tmc=%u hold=%u shold=%u enc=%.3f joint=%.3f zeroed=%.3f target=%.3f ref=%.3f refv=%.3f refa=%.3f profile=%u time=%.3f/%.3f measv=%.3f cmd=%.3f stdeg=%.6f jrev=%.6f mdir=%+.0f edir=%+.0f zoff=%.6f jmin=%.3f jmax=%.3f jtol=%.3f fault=%u\r\n",
                 motionModeName(motionMode),
                 jointReferenced ? 1u : 0u,
                 digitalRead(PIN_PARK_SENSOR) == LOW ? 1u : 0u,
@@ -1736,6 +1720,10 @@ void printServoStatus()
                 servoTargetZeroedDeg,
                 jointCtrl.refPos(),
                 jointCtrl.refVel(),
+                jointCtrl.refAcc(),
+                jointCtrl.trajectoryActive() ? 1u : 0u,
+                jointCtrl.trajectoryElapsed(),
+                jointCtrl.trajectoryDuration(),
                 jointCtrl.getLastMeasuredVel(),
                 servoLastCmdDegS,
                 stepsPerDegree(),
@@ -1748,7 +1736,7 @@ void printServoStatus()
                 jtol,
                 static_cast<unsigned>(jointCtrl.faultCode()));
 
-  Serial.printf("pid kp=%.4f ki=%.4f kd=%.4f ffv=%.4f ilim=%.4f | motion vmax=%.4f amax=%.4f sct=%.4f outmax=%.4f | settle ptol=%.4f vtol=%.4f dbent=%.4f dbext=%.4f dbvel=%.4f vtau=%.4f\r\n",
+  Serial.printf("pid kp=%.4f ki=%.4f kd=%.4f ffv=%.4f ilim=%.4f | motion vmax=%.4f amax=%.4f outmax=%.4f | settle ptol=%.4f vtol=%.4f dbent=%.4f dbext=%.4f dbvel=%.4f vtau=%.4f\r\n",
                 readParamFloatOrDefault("kp", SERVO_KP),
                 readParamFloatOrDefault("ki", SERVO_KI),
                 readParamFloatOrDefault("kd", SERVO_KD),
@@ -1756,7 +1744,6 @@ void printServoStatus()
                 readParamFloatOrDefault("ilim", SERVO_I_LIMIT),
                 readParamFloatOrDefault("vmax", SERVO_VMAX_DEG_S),
                 readParamFloatOrDefault("amax", SERVO_AMAX_DEG_S2),
-                readParamFloatOrDefault("sct", SERVO_SCURVE_TIME_S),
                 readParamFloatOrDefault("outmax", SERVO_OUTPUT_MAX_DEG_S),
                 readParamFloatOrDefault("ptol", SERVO_POS_TOL_DEG),
                 readParamFloatOrDefault("vtol", SERVO_VEL_TOL_DEG_S),
@@ -2638,9 +2625,6 @@ void servoUpdate()
   }
 
   if (jointCtrl.isSettled()) {
-    setMotorVelocityDegPerSecond(0.0f);
-    tmc.stopInternalMotion();
-    servoLastCmdDegS = 0.0f;
     wsSetState(LedState::READY);
 
     if (servoHoldEnabled()) {
@@ -2649,8 +2633,19 @@ void servoUpdate()
         LOG_NFO("Move complete zeroed=%.3f deg servo-hold active\r\n",
                 jointGetPositionDeg());
       }
+      // Servo hold keeps applying PID correction after the analytic profile.
+      // Only a latched configured deadband is allowed to suppress the command.
+      if (jointCtrl.inDeadband()) {
+        setMotorVelocityDegPerSecond(0.0f);
+        tmc.stopInternalMotion();
+        servoLastCmdDegS = 0.0f;
+      }
       return;
     }
+
+    setMotorVelocityDegPerSecond(0.0f);
+    tmc.stopInternalMotion();
+    servoLastCmdDegS = 0.0f;
 
     if (!motorHoldEnabled()) {
       tmc.disableDriver(false);
@@ -2661,7 +2656,7 @@ void servoUpdate()
     LOG_NFO("Move complete zeroed=%.3f deg motor=%s\r\n",
             jointGetPositionDeg(),
             motorHoldEnabled() ? "hold" : "disabled");
-  } else {
+  } else if (!servoHoldEnabled()) {
     servoHoldActive = false;
   }
 }
@@ -2683,9 +2678,9 @@ void setup()
 
   Serial.println();
   #if MAGNETIC_ENCODER_TYPE == MAGNETIC_ENCODER_AS5048A
-  LOG_NFO("PlanetJoint ESP32-S3 - AS5048A PID+S-curve build\r\n");
+  LOG_NFO("PlanetJoint ESP32-S3 - AS5048A analytic quintic S-curve build\r\n");
 #else
-  LOG_NFO("PlanetJoint ESP32-S3 - AS5600 PID+S-curve build\r\n");
+  LOG_NFO("PlanetJoint ESP32-S3 - AS5600 analytic quintic S-curve build\r\n");
 #endif
   LOG_NFO("USB CDC console ready\r\n");
 
@@ -2749,7 +2744,7 @@ void setup()
   LOG_NFO("Use zero, then save, to store a new logical zero.\r\n");
   LOG_NFO("Direction signs: mdir=%+.0f edir=%+.0f.\r\n",
           activeMotorDirectionSign, encoder.directionSign());
-  LOG_NFO("Runtime params: kp ki kd ffv ilim vmax amax sct outmax ptol vtol dbent dbext dbvel vtau stdeg jrev mdir edir jmin jmax jtol loglvl mhold shold zoff pkdir pkvel pkenc pkpos addr.\r\n");
+  LOG_NFO("Runtime params: kp ki kd ffv ilim vmax amax outmax ptol vtol dbent dbext dbvel vtau stdeg jrev mdir edir jmin jmax jtol loglvl mhold shold zoff pkdir pkvel pkenc pkpos addr.\r\n");
   LOG_NFO("trace toggles on/off; trace 0..4 selects output mode.\r\n");
   LOG_NFO("Example: set kp 1.0 / set vmax 3.0 / save\r\n");
 
@@ -2784,7 +2779,9 @@ void loop()
     const float errDeg = targetDeg - jointZeroedDeg;
     const float measVel = jointCtrl.getLastMeasuredVel();
     const float refVel = jointCtrl.refVel();
+    const float refAcc = jointCtrl.refAcc();
     const uint8_t settled = jointCtrl.isSettled() ? 1 : 0;
+    const uint8_t profileActive = jointCtrl.trajectoryActive() ? 1 : 0;
     float traceJmin = 0.0f;
     float traceJmax = 0.0f;
     float traceJtol = 0.0f;
@@ -2812,6 +2809,18 @@ void loop()
 
         Serial.print(",ref_vel:");
         Serial.print(refVel, 3);
+
+        Serial.print(",ref_acc:");
+        Serial.print(refAcc, 3);
+
+        Serial.print(",profile:");
+        Serial.print(profileActive);
+
+        Serial.print(",profile_elapsed:");
+        Serial.print(jointCtrl.trajectoryElapsed(), 3);
+
+        Serial.print(",profile_duration:");
+        Serial.print(jointCtrl.trajectoryDuration(), 3);
 
         Serial.print(",meas_vel:");
         Serial.print(measVel, 3);
@@ -2886,6 +2895,8 @@ void loop()
         Serial.print(targetDeg, 3);
         Serial.print(",ref_vel:");
         Serial.print(refVel, 3);
+        Serial.print(",ref_acc:");
+        Serial.print(refAcc, 3);
         Serial.print(",cmd_deg_s:");
         Serial.println(servoLastCmdDegS, 3);
         break;

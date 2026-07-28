@@ -35,8 +35,8 @@ The same logic applies to:
 
 ```text
 pos <deg>
-move <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]
-moveb <target_deg> <vmax_deg_s> <amax_deg_s2> [sct_s]
+move <target_deg> <vmax_deg_s> <amax_deg_s2>
+moveb <target_deg> <vmax_deg_s> <amax_deg_s2>
 ```
 
 ## Runtime fault window

@@ -53,8 +53,8 @@ JointMoveResult JointPlanner::validateAndPrepare(const JointMoveCommand& cmd,
   if (!_runtime.encoderReady()) return JointMoveResult::EncoderUnavailable;
 
   if (!isfinite(cmd.targetDeg) || !isfinite(cmd.vmaxDegS) ||
-      !isfinite(cmd.amaxDegS2) || !isfinite(cmd.sCurveTimeS) ||
-      !isfinite(cmd.outMaxDegS) || cmd.vmaxDegS <= 0.0f || cmd.amaxDegS2 <= 0.0f) {
+      !isfinite(cmd.amaxDegS2) || !isfinite(cmd.outMaxDegS) ||
+      cmd.vmaxDegS <= 0.0f || cmd.amaxDegS2 <= 0.0f) {
     return JointMoveResult::InvalidCommand;
   }
 
@@ -136,7 +136,6 @@ JointMoveOutcome JointPlanner::executeMove(const JointMoveCommand& cmd, Retarget
 
   _runtime.configureController(prepared.command.vmaxDegS,
                                prepared.command.amaxDegS2,
-                               prepared.command.sCurveTimeS,
                                prepared.command.outMaxDegS,
                                !alreadyPositioning);
 
@@ -150,8 +149,8 @@ JointMoveOutcome JointPlanner::executeMove(const JointMoveCommand& cmd, Retarget
     const bool movingReference = fabsf(refVel) > _config.blendMinRefVelDegS;
     const bool targetAhead = !movingReference || distance * refVel >= 0.0f;
 
-    if (targetAhead) {
-      _runtime.blendControllerTarget(prepared.command.targetDeg);
+    if (targetAhead &&
+        _runtime.blendControllerTarget(prepared.command.targetDeg)) {
       fullBlend = true;
     } else {
       _runtime.restartController(currentDeg, prepared.command.targetDeg);
@@ -183,19 +182,6 @@ JointMoveOutcome JointPlanner::moveTo(float targetDeg, float vmaxDegS, float ama
   return moveTo(cmd);
 }
 
-JointMoveOutcome JointPlanner::moveTo(float targetDeg,
-                                      float vmaxDegS,
-                                      float amaxDegS2,
-                                      float sCurveTimeS)
-{
-  JointMoveCommand cmd;
-  cmd.targetDeg = targetDeg;
-  cmd.vmaxDegS = vmaxDegS;
-  cmd.amaxDegS2 = amaxDegS2;
-  cmd.sCurveTimeS = sCurveTimeS;
-  return moveTo(cmd);
-}
-
 JointMoveOutcome JointPlanner::moveToBlended(const JointMoveCommand& cmd)
 {
   return executeMove(cmd, RetargetMode::BlendIfSafe);
@@ -207,18 +193,5 @@ JointMoveOutcome JointPlanner::moveToBlended(float targetDeg, float vmaxDegS, fl
   cmd.targetDeg = targetDeg;
   cmd.vmaxDegS = vmaxDegS;
   cmd.amaxDegS2 = amaxDegS2;
-  return moveToBlended(cmd);
-}
-
-JointMoveOutcome JointPlanner::moveToBlended(float targetDeg,
-                                             float vmaxDegS,
-                                             float amaxDegS2,
-                                             float sCurveTimeS)
-{
-  JointMoveCommand cmd;
-  cmd.targetDeg = targetDeg;
-  cmd.vmaxDegS = vmaxDegS;
-  cmd.amaxDegS2 = amaxDegS2;
-  cmd.sCurveTimeS = sCurveTimeS;
   return moveToBlended(cmd);
 }
