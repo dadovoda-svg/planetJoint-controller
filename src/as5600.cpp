@@ -110,7 +110,7 @@ void AS5600::setContinuousOutputDegrees(float outputDegrees) {
   }
 
   const float countsFloat = (outputDegrees * static_cast<float>(COUNTS_PER_REV)) /
-                            _outputDegreesPerEncoderRev;
+                            (_directionSign * _outputDegreesPerEncoderRev);
   const int64_t requestedCounts = static_cast<int64_t>(llroundf(countsFloat));
   const int64_t raw = static_cast<int64_t>(_lastRaw & 0x3FFF);
   const int64_t nearestTurn = static_cast<int64_t>(llroundf(
@@ -126,11 +126,25 @@ void AS5600::setContinuousOutputDegrees(float outputDegrees) {
 void AS5600::setOutputDegreesPerEncoderRevolution(float degreesPerEncoderRev) {
   if (isfinite(degreesPerEncoderRev) && degreesPerEncoderRev > 0.0f) {
     _outputDegreesPerEncoderRev = degreesPerEncoderRev;
+    _lastContinuousDeg = continuousCountsToOutputDegrees(_continuousCounts);
   }
 }
 
 float AS5600::outputDegreesPerEncoderRevolution() const {
   return _outputDegreesPerEncoderRev;
+}
+
+bool AS5600::setDirectionSign(float directionSign) {
+  if (directionSign != -1.0f && directionSign != 1.0f) {
+    return false;
+  }
+  _directionSign = directionSign;
+  _lastContinuousDeg = continuousCountsToOutputDegrees(_continuousCounts);
+  return true;
+}
+
+float AS5600::directionSign() const {
+  return _directionSign;
 }
 
 bool AS5600::readNative12(uint16_t& raw12) {
@@ -191,8 +205,12 @@ uint16_t AS5600::lastRaw() const {
 }
 
 float AS5600::lastDegrees() const {
-  return (static_cast<float>(_lastRaw) * 360.0f) /
-         static_cast<float>(COUNTS_PER_REV);
+  const float rawDegrees = (static_cast<float>(_lastRaw) * 360.0f) /
+                           static_cast<float>(COUNTS_PER_REV);
+  if (_directionSign > 0.0f || rawDegrees == 0.0f) {
+    return rawDegrees;
+  }
+  return 360.0f - rawDegrees;
 }
 
 float AS5600::lastContinuousDegrees() const {
@@ -241,12 +259,12 @@ int64_t AS5600::updateContinuousCounts(uint16_t rawAngle) {
 }
 
 float AS5600::continuousCountsToEncoderDegrees(int64_t counts) const {
-  return (static_cast<float>(counts) * 360.0f) /
+  return (_directionSign * static_cast<float>(counts) * 360.0f) /
          static_cast<float>(COUNTS_PER_REV);
 }
 
 float AS5600::continuousCountsToOutputDegrees(int64_t counts) const {
-  return (static_cast<float>(counts) * _outputDegreesPerEncoderRev) /
+  return (_directionSign * static_cast<float>(counts) * _outputDegreesPerEncoderRev) /
          static_cast<float>(COUNTS_PER_REV);
 }
 

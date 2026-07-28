@@ -45,7 +45,7 @@ void AS5048A::setContinuousOutputDegrees(float outputDegrees) {
   }
 
   const float countsFloat = (outputDegrees * static_cast<float>(COUNTS_PER_REV)) /
-                            _outputDegreesPerEncoderRev;
+                            (_directionSign * _outputDegreesPerEncoderRev);
   const int64_t requestedCounts = static_cast<int64_t>(llroundf(countsFloat));
   const int64_t raw = static_cast<int64_t>(_lastRaw & 0x3FFF);
   const int64_t nearestTurn = static_cast<int64_t>(llroundf(
@@ -61,11 +61,25 @@ void AS5048A::setContinuousOutputDegrees(float outputDegrees) {
 void AS5048A::setOutputDegreesPerEncoderRevolution(float degreesPerEncoderRev) {
   if (isfinite(degreesPerEncoderRev) && degreesPerEncoderRev > 0.0f) {
     _outputDegreesPerEncoderRev = degreesPerEncoderRev;
+    _lastContinuousDeg = continuousCountsToOutputDegrees(_continuousCounts);
   }
 }
 
 float AS5048A::outputDegreesPerEncoderRevolution() const {
   return _outputDegreesPerEncoderRev;
+}
+
+bool AS5048A::setDirectionSign(float directionSign) {
+  if (directionSign != -1.0f && directionSign != 1.0f) {
+    return false;
+  }
+  _directionSign = directionSign;
+  _lastContinuousDeg = continuousCountsToOutputDegrees(_continuousCounts);
+  return true;
+}
+
+float AS5048A::directionSign() const {
+  return _directionSign;
 }
 
 uint16_t AS5048A::transfer16(uint16_t value) {
@@ -150,8 +164,12 @@ uint16_t AS5048A::lastRaw() const {
 }
 
 float AS5048A::lastDegrees() const {
-  return (static_cast<float>(_lastRaw) * 360.0f) /
-         static_cast<float>(COUNTS_PER_REV);
+  const float rawDegrees = (static_cast<float>(_lastRaw) * 360.0f) /
+                           static_cast<float>(COUNTS_PER_REV);
+  if (_directionSign > 0.0f || rawDegrees == 0.0f) {
+    return rawDegrees;
+  }
+  return 360.0f - rawDegrees;
 }
 
 float AS5048A::lastContinuousDegrees() const {
@@ -200,12 +218,12 @@ int64_t AS5048A::updateContinuousCounts(uint16_t rawAngle) {
 }
 
 float AS5048A::continuousCountsToEncoderDegrees(int64_t counts) const {
-  return (static_cast<float>(counts) * 360.0f) /
+  return (_directionSign * static_cast<float>(counts) * 360.0f) /
          static_cast<float>(COUNTS_PER_REV);
 }
 
 float AS5048A::continuousCountsToOutputDegrees(int64_t counts) const {
-  return (static_cast<float>(counts) * _outputDegreesPerEncoderRev) /
+  return (_directionSign * static_cast<float>(counts) * _outputDegreesPerEncoderRev) /
          static_cast<float>(COUNTS_PER_REV);
 }
 

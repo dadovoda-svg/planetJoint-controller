@@ -47,7 +47,8 @@ move 5 4 10 0.150
 
 ## Safety defaults
 
-`MOTOR_DIRECTION_SIGN` is set to `-1.0f`, as found during real hardware tests.
+Motor polarity is configured through the persistent `mdir` parameter. Its
+default is `+1`; only `-1` and `+1` are accepted.
 
 The planner API clamps requested speed to a conservative hard limit:
 

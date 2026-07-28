@@ -28,5 +28,6 @@ When `jrev` is changed from the console, the firmware stops active motion, appli
 
 - `jrev`: encoder-to-real-joint angle scale
 - `stdeg`: motor microsteps per real joint degree
+- `edir`: encoder direction sign (`-1` or `+1`)
 
 If the mechanics change, both may need to be reviewed.

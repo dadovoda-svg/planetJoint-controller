@@ -63,8 +63,8 @@ This keeps active servo-hold behavior unchanged while allowing the external mast
 
 No settling/deadband parameters were changed by this fix.
 
-The hardware-specific motor polarity remains:
+Motor polarity is now a persistent runtime parameter:
 
-```cpp
-static constexpr float MOTOR_DIRECTION_SIGN = 1.0f;
+```text
+mdir = +1
 ```

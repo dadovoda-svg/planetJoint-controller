@@ -38,8 +38,8 @@ This makes the parser robust even when bytes arrive across multiple `Slave::upda
 
 ## Additional baseline update
 
-This baseline also keeps the updated hardware configuration:
+Motor polarity is now represented by the persistent runtime parameter:
 
-```cpp
-static constexpr float MOTOR_DIRECTION_SIGN = 1.0f;
+```text
+mdir = +1
 ```

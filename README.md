@@ -189,17 +189,24 @@ JointPlanner planner(plannerRuntime, plannerConfig);
 
 JointBus and `SerialConsole` parse their respective inputs and invoke the planner API.
 
-## Motor Direction
+## Motor and Encoder Direction
 
-Motor polarity follows the current hardware configuration.
+Motor and encoder polarity are independent persistent parameters:
 
-The current firmware uses:
-
-```cpp
-static constexpr float MOTOR_DIRECTION_SIGN = 1.0f;
+```text
+mdir = +1
+edir = +1
 ```
 
-This is important for closed-loop control. A wrong sign would turn negative feedback into positive feedback.
+`mdir` multiplies the motor STEP/DIR velocity command. `edir` changes the positive direction of both the modulo encoder angle and the continuous joint angle calculated from raw counts. Both accept only `-1` or `+1`.
+
+```text
+set mdir -1
+set edir -1
+save
+```
+
+Changing either value stops active motion. When `edir` changes, the firmware rebases `zoff` in RAM so the current logical joint position does not jump; use `save` to persist both changes. Direction settings are safety-critical: an incoherent motor/encoder sign combination can turn closed-loop negative feedback into positive feedback, so validate at low speed.
 
 ## Logger
 
@@ -385,6 +392,8 @@ During motion, a small PID ringing overshoot is allowed. With the default `jtol=
 | Key | Meaning | Default |
 |---|---|---:|
 | `stdeg` | Motor microsteps per real joint degree | `100.0` |
+| `mdir` | Motor command direction sign (`-1` or `+1`) | `+1` |
+| `edir` | Encoder raw-to-degree direction sign (`-1` or `+1`) | `+1` |
 | `ustep` | TMC2209 microstep setting | `16` |
 | `irun` | TMC2209 run current scale | `10` |
 | `ihold` | TMC2209 hold current scale | `4` |
@@ -395,13 +404,13 @@ During motion, a small PID ringing overshoot is allowed. With the default `jtol=
 The velocity conversion is:
 
 ```text
-microsteps_per_second = joint_deg_per_second * stdeg
+microsteps_per_second = joint_deg_per_second * stdeg * mdir
 ```
 
 The encoder-to-joint scale conversion is:
 
 ```text
-joint_degrees = continuous_encoder_revolutions * jrev
+joint_degrees = continuous_encoder_revolutions * jrev * edir
 ```
 
 For the current reference mechanics:

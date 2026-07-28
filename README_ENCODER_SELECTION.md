@@ -4,6 +4,11 @@ The firmware supports two magnetic encoders while preserving the same
 high-level API and all existing joint-angle, unwrap, `jrev`, planner, and
 controller logic.
 
+The persistent `edir` parameter selects the encoder direction for both
+implementations. It is applied after conversion from the native raw count, so
+AS5048A and AS5600 expose the same signed modulo and continuous-angle behavior.
+Only `-1` and `+1` are accepted; the default is `+1`.
+
 ## Build environments
 
 ```bash

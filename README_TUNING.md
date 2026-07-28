@@ -118,13 +118,22 @@ trace 3
 
 for PID-focused tuning.
 
-## Motor direction
+## Motor and encoder direction
 
-This build uses the direction measured on the real hardware:
+The two direction signs are persistent runtime parameters:
 
-```cpp
-static constexpr float MOTOR_DIRECTION_SIGN = -1.0f;
+```text
+set mdir 1    # motor command direction
+set edir 1    # encoder raw-to-angle direction
+save
 ```
+
+Both parameters accept only `-1` or `+1` and default to `+1`. Changing either
+sign stops active motion. Changing `edir` also rebases `zoff` in RAM to avoid a
+position jump; run `save` to persist the new sign and offset.
+
+An incoherent `mdir`/`edir` combination can make the position loop use positive
+feedback. Validate direction changes at low speed with conservative limits.
 
 ## Active servo hold
 

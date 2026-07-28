@@ -11,6 +11,9 @@ The logical joint zero is stored in the runtime parameter `zoff`.
 - After the first valid encoder reading, the controller target is initialized to the measured zeroed position. Therefore startup does not request a movement.
 - If no saved parameter image exists, `zoff` defaults to `0.0 deg`; this is not treated as a fault.
 - `load` now reapplies all loaded parameters, including `zoff`, and rebases the target to the current measured position.
+- Changing the encoder direction parameter `edir` rebases `zoff` in RAM so the
+  current logical joint position remains unchanged. Use `save` afterward to
+  persist the coherent `edir`/`zoff` pair.
 
 ## Typical calibration
 
@@ -22,8 +25,11 @@ save
 After a reboot, the logical position is calculated as:
 
 ```text
-joint_position = absolute_encoder_position - zoff
+joint_position = direction_adjusted_absolute_encoder_position - zoff
 ```
+
+Here `direction_adjusted_absolute_encoder_position` already includes the
+persistent `edir` sign.
 
 ## Current limitation
 

@@ -36,6 +36,10 @@ public:
   void setOutputDegreesPerEncoderRevolution(float degreesPerEncoderRev);
   float outputDegreesPerEncoderRevolution() const;
 
+  // Selects the positive encoder direction. Only +1 and -1 are accepted.
+  bool setDirectionSign(float directionSign);
+  float directionSign() const;
+
   uint16_t lastRaw() const;
   float lastDegrees() const;
   float lastContinuousDegrees() const;
@@ -59,6 +63,7 @@ private:
   bool _lastErrorFlag = false;
 
   float _outputDegreesPerEncoderRev = 360.0f;
+  float _directionSign = 1.0f;
   float _lastContinuousDeg = 0.0f;
 
   bool _continuousInitialized = false;

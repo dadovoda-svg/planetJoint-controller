@@ -55,10 +55,9 @@ static constexpr int PIN_RS485_RTS   = 9; // UART0 RTS -> SP3485 DE, hardware RS
 // Runtime parameter `jrev` overrides this value:
 // one full 360-degree encoder revolution corresponds to `jrev` degrees of real joint motion.
 static constexpr float DEFAULT_JOINT_DEGREES_PER_ENCODER_REV = 15.6f;
+static constexpr float DEFAULT_MOTOR_DIRECTION_SIGN = 1.0f;
+static constexpr float DEFAULT_ENCODER_DIRECTION_SIGN = 1.0f;
 
-// Direction correction between positive controller output and real positive joint motion.
-// If the first low-speed test moves away from the target, change this to -1.0f.
-static constexpr float MOTOR_DIRECTION_SIGN = 1.0f;
 
 // ===================== VERY CONSERVATIVE SERVO DEFAULTS =====================
 
@@ -271,6 +270,7 @@ bool tmcReady = false;
 static bool jointBusLastLimitClipped = false;
 static bool jointBusRebootPending = false;
 static uint32_t jointBusRebootRequestedMs = 0;
+static float activeMotorDirectionSign = DEFAULT_MOTOR_DIRECTION_SIGN;
 
 struct JointBusPreparedSegment {
   bool valid = false;
@@ -296,6 +296,8 @@ static void parkUpdate(float dt);
 static void abortPark(const char* reason);
 static void setupJointBusHooks();
 static uint8_t readJointBusAddressFromParams();
+static bool applyMotorDirectionFromParams(bool stopBeforeApply);
+static bool applyEncoderDirectionFromParams(bool preserveZeroedPosition);
 bool startPark();
 
 // ===================== PARAMS =====================
@@ -364,6 +366,32 @@ static float stepsPerDegree()
     value = 100.0f;
   }
   return value;
+}
+
+static bool isValidDirectionSign(float value)
+{
+  return isfinite(value) && (value == -1.0f || value == 1.0f);
+}
+
+static bool applyMotorDirectionFromParams(bool stopBeforeApply)
+{
+  float requested = DEFAULT_MOTOR_DIRECTION_SIGN;
+  if (!params.get("mdir", requested) || !isValidDirectionSign(requested)) {
+    params.set("mdir", activeMotorDirectionSign);
+    LOG_ERR("Invalid mdir rejected: use -1 or +1; keeping %+.0f\r\n",
+            activeMotorDirectionSign);
+    return false;
+  }
+
+  const bool changed = requested != activeMotorDirectionSign;
+  if (stopBeforeApply && changed) {
+    stopMotion();
+  }
+  activeMotorDirectionSign = requested;
+  LOG_NFO("Motor direction sign mdir=%+.0f%s\r\n",
+          activeMotorDirectionSign,
+          stopBeforeApply && changed ? "; motion stopped" : "");
+  return true;
 }
 
 static bool motorHoldEnabled()
@@ -490,11 +518,10 @@ static void applyEncoderScaleFromParams(bool preserveZeroedPosition)
 
   encoder.setOutputDegreesPerEncoderRevolution(jrev);
 
-  // Recompute the current absolute joint angle from the already unwrapped
-  // encoder angle using the new scale. This avoids waiting for the next
-  // encoder sample and keeps status/trace coherent immediately after set jrev.
-  const float continuousEncoderDeg = encoder.lastContinuousEncoderDegrees();
-  jointDeg = (continuousEncoderDeg * jrev) / 360.0f;
+  // The driver immediately recomputes its last continuous value using the new
+  // scale, including the configured encoder direction sign.
+  jointDeg = encoder.lastContinuousDegrees();
+  encoderDeg = encoder.lastDegrees();
 
   if (preserveZeroedPosition) {
     encoderZero = jointDeg - oldZeroed;
@@ -505,6 +532,47 @@ static void applyEncoderScaleFromParams(bool preserveZeroedPosition)
 
   LOG_NFO("Encoder scale: 360.000 encoder deg = %.6f joint deg\r\n",
           encoder.outputDegreesPerEncoderRevolution());
+}
+
+static bool applyEncoderDirectionFromParams(bool preserveZeroedPosition)
+{
+  float requested = DEFAULT_ENCODER_DIRECTION_SIGN;
+  if (!params.get("edir", requested) || !isValidDirectionSign(requested)) {
+    params.set("edir", encoder.directionSign());
+    LOG_ERR("Invalid edir rejected: use -1 or +1; keeping %+.0f\r\n",
+            encoder.directionSign());
+    return false;
+  }
+
+  const float oldZeroed = jointGetPositionDeg();
+  const bool changed = requested != encoder.directionSign();
+  if (preserveZeroedPosition && changed) {
+    stopMotion();
+  }
+
+  if (!encoder.setDirectionSign(requested)) {
+    return false;
+  }
+
+  if (encoderOk) {
+    jointDeg = encoder.lastContinuousDegrees();
+    encoderDeg = encoder.lastDegrees();
+  }
+
+  if (preserveZeroedPosition && changed && encoderOk) {
+    encoderZero = jointDeg - oldZeroed;
+    params.set("zoff", encoderZero);
+    jointCtrl.reset(oldZeroed);
+    jointCtrl.setTarget(oldZeroed);
+    servoTargetZeroedDeg = oldZeroed;
+  }
+
+  LOG_NFO("Encoder direction sign edir=%+.0f%s\r\n",
+          encoder.directionSign(),
+          preserveZeroedPosition && changed && encoderOk
+            ? "; motion stopped, logical position preserved, zoff updated in RAM"
+            : "");
+  return true;
 }
 
 static void applyLogLevelFromParams(bool announce)
@@ -543,6 +611,8 @@ void paramsInit()
   params.initKey("ihold", 4.0f);
   params.initKey("stdeg", 100.0f); // motor microsteps per real joint degree
   params.initKey("jrev", DEFAULT_JOINT_DEGREES_PER_ENCODER_REV); // real joint degrees per encoder revolution
+  params.initKey("mdir", DEFAULT_MOTOR_DIRECTION_SIGN); // motor command direction, -1 or +1
+  params.initKey("edir", DEFAULT_ENCODER_DIRECTION_SIGN); // encoder angle direction, -1 or +1
   params.initKey("loglvl", 2.0f); // 0=OFF, 1=ERR, 2=NFO, 3=DBG
   params.initKey("mhold", 0.0f); // 0=disable driver at target, 1=keep driver enabled at IHOLD
   params.initKey("shold", 0.0f); // 0=stop control at target, 1=active servo hold at target
@@ -705,6 +775,8 @@ static void applyZeroOffsetFromParams(bool rebaseController)
 
 void applyAllParams()
 {
+  applyMotorDirectionFromParams(false);
+  applyEncoderDirectionFromParams(false);
   applyCurrentScaleFromParams();
   applyMicrostepResolutionFromParams();
   applyControllerParamsFromParams();
@@ -755,6 +827,20 @@ void onConsoleParamSet(const char* key)
 
   if (strcmp(key, "mhold") == 0) {
     LOG_NFO("motor hold at target %s\r\n", motorHoldEnabled() ? "enabled" : "disabled");
+    return;
+  }
+
+  if (strcmp(key, "mdir") == 0) {
+    if (applyMotorDirectionFromParams(true)) {
+      LOG_NFO("Use 'save' to persist the motor direction sign.\r\n");
+    }
+    return;
+  }
+
+  if (strcmp(key, "edir") == 0) {
+    if (applyEncoderDirectionFromParams(true)) {
+      LOG_NFO("Use 'save' to persist edir and the rebased zoff.\r\n");
+    }
     return;
   }
 
@@ -854,6 +940,7 @@ void encoderInit()
 
   encoder.begin();
   encoder.setOutputDegreesPerEncoderRevolution(jointDegreesPerEncoderRevolution());
+  applyEncoderDirectionFromParams(false);
 
   LOG_NFO("Encoder scale: 360.000 encoder deg = %.6f joint deg\r\n",
           encoder.outputDegreesPerEncoderRevolution());
@@ -1022,7 +1109,7 @@ bool setMotorVelocityDegPerSecond(float degreesPerSecond)
   }
 
   const float spd = stepsPerDegree();
-  const float microstepsPerSecond = MOTOR_DIRECTION_SIGN * degreesPerSecond * spd;
+  const float microstepsPerSecond = activeMotorDirectionSign * degreesPerSecond * spd;
 
   if (!tmc.runVelocityMicrostepsPerSecond(microstepsPerSecond)) {
     LOG_ERR("TMC velocity command failed\r\n");
@@ -1510,7 +1597,7 @@ bool calibrateStepsPerDegree(float targetDegrees = STDEG_CALIBRATION_TARGET_DEG)
   delay(50);
 
   // Apply the same direction convention used by velocity control.
-  const bool forward = (targetDegrees * MOTOR_DIRECTION_SIGN) > 0.0f;
+  const bool forward = (targetDegrees * activeMotorDirectionSign) > 0.0f;
 
   for (int32_t i = 0; i < requestedSteps; i++) {
     tmc.step(forward, STDEG_CALIBRATION_STEP_HIGH_US);
@@ -1560,7 +1647,7 @@ bool calibrateStepsPerDegree(float targetDegrees = STDEG_CALIBRATION_TARGET_DEG)
   if ((targetDegrees > 0.0f && measuredDeltaDeg < 0.0f) ||
       (targetDegrees < 0.0f && measuredDeltaDeg > 0.0f)) {
     Serial.println("[CAL] WARNING: measured direction is opposite to requested direction");
-    Serial.println("[CAL] Check MOTOR_DIRECTION_SIGN / DIR wiring / mechanics. Magnitude will still be applied.");
+    Serial.println("[CAL] Check mdir / DIR wiring / mechanics. Magnitude will still be applied.");
   }
 
   const float estimatedStepsPerDegree = static_cast<float>(requestedSteps) / absDeltaDeg;
@@ -1636,7 +1723,7 @@ void printServoStatus()
   float jtol = 0.0f;
   readJointLimitParams(jmin, jmax, jtol);
 
-  Serial.printf("mode=%s referenced=%u park_sensor=%u tmc=%u hold=%u shold=%u enc=%.3f joint=%.3f zeroed=%.3f target=%.3f ref=%.3f refv=%.3f measv=%.3f cmd=%.3f stdeg=%.6f jrev=%.6f zoff=%.6f jmin=%.3f jmax=%.3f jtol=%.3f fault=%u\r\n",
+  Serial.printf("mode=%s referenced=%u park_sensor=%u tmc=%u hold=%u shold=%u enc=%.3f joint=%.3f zeroed=%.3f target=%.3f ref=%.3f refv=%.3f measv=%.3f cmd=%.3f stdeg=%.6f jrev=%.6f mdir=%+.0f edir=%+.0f zoff=%.6f jmin=%.3f jmax=%.3f jtol=%.3f fault=%u\r\n",
                 motionModeName(motionMode),
                 jointReferenced ? 1u : 0u,
                 digitalRead(PIN_PARK_SENSOR) == LOW ? 1u : 0u,
@@ -1653,6 +1740,8 @@ void printServoStatus()
                 servoLastCmdDegS,
                 stepsPerDegree(),
                 encoder.outputDegreesPerEncoderRevolution(),
+                activeMotorDirectionSign,
+                encoder.directionSign(),
                 encoderZero,
                 jmin,
                 jmax,
@@ -2658,8 +2747,9 @@ void setup()
     LOG_NFO("Multi-turn position is not valid after boot: execute park before any motion.\r\n");
   }
   LOG_NFO("Use zero, then save, to store a new logical zero.\r\n");
-  LOG_NFO("MOTOR_DIRECTION_SIGN=1.0 from updated hardware configuration.\r\n");
-  LOG_NFO("Runtime params: kp ki kd ffv ilim vmax amax sct outmax ptol vtol dbent dbext dbvel vtau stdeg jrev jmin jmax jtol loglvl mhold shold zoff pkdir pkvel pkenc pkpos addr.\r\n");
+  LOG_NFO("Direction signs: mdir=%+.0f edir=%+.0f.\r\n",
+          activeMotorDirectionSign, encoder.directionSign());
+  LOG_NFO("Runtime params: kp ki kd ffv ilim vmax amax sct outmax ptol vtol dbent dbext dbvel vtau stdeg jrev mdir edir jmin jmax jtol loglvl mhold shold zoff pkdir pkvel pkenc pkpos addr.\r\n");
   LOG_NFO("trace toggles on/off; trace 0..4 selects output mode.\r\n");
   LOG_NFO("Example: set kp 1.0 / set vmax 3.0 / save\r\n");
 
