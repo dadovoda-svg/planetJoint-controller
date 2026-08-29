@@ -47,6 +47,10 @@ enum class Command : uint8_t {
     QueueStatus  = 0x0D,
     EmergencyStop = 0x0E,
     MotionConfig = 0x0F,
+    MotionState  = 0x10,
+    SegmentTiming = 0x11,
+    ClearFault   = 0x12,
+    PrepareHold  = 0x13,
     Ping       = 0x7F,
 
     Ack        = 0x80,
@@ -55,6 +59,8 @@ enum class Command : uint8_t {
     QuickStatusRsp = 0x87,
     QueueStatusRsp = 0x8D,
     MotionConfigRsp = 0x8F,
+    MotionStateRsp = 0x90,
+    SegmentTimingRsp = 0x91,
     ErrorRsp   = 0xFF
 };
 
@@ -69,7 +75,10 @@ enum class AckCode : uint8_t {
     SegmentPrepared    = 0x07,
     SegmentStarted     = 0x08,
     SegmentAborted     = 0x09,
-    EmergencyStopped   = 0x0A
+    EmergencyStopped   = 0x0A,
+    SegmentScheduled   = 0x0B,
+    FaultCleared       = 0x0C,
+    HoldPrepared       = 0x0D
 };
 
 enum class NackCode : uint8_t {
@@ -86,7 +95,8 @@ enum class NackCode : uint8_t {
     Timeout            = 0x0B,
     QueueFull          = 0x0C,
     NoPreparedSegment  = 0x0D,
-    SegmentMismatch    = 0x0E
+    SegmentMismatch    = 0x0E,
+    DurationInfeasible = 0x0F
 };
 
 enum class JointState : uint8_t {
@@ -154,11 +164,14 @@ struct MotionConfig {
 //   byte 1: free prepared slots (0 or 1 in the current implementation)
 //   byte 2: active segment id, or NO_SEGMENT_ID
 //   byte 3: prepared segment id, or NO_SEGMENT_ID
-//   byte 4: flags: bit0 active_valid, bit1 prepared_valid, bit2 active_busy
+//   byte 4: QueueStatusFlags, including prepared/active HOLD mode
 enum QueueStatusFlags : uint8_t {
     QQUEUE_ACTIVE_VALID   = 0x01,
     QQUEUE_PREPARED_VALID = 0x02,
-    QQUEUE_ACTIVE_BUSY    = 0x04
+    QQUEUE_ACTIVE_BUSY    = 0x04,
+    QQUEUE_START_PENDING  = 0x08,
+    QQUEUE_PREPARED_HOLD  = 0x10,
+    QQUEUE_ACTIVE_HOLD    = 0x20
 };
 
 struct QueueStatus {
@@ -168,6 +181,54 @@ struct QueueStatus {
     uint8_t preparedSegmentId = NO_SEGMENT_ID;
     uint8_t flags = 0;
 };
+
+// MotionStateRsp payload layout (16 bytes):
+//   byte 0: active segment id, or NO_SEGMENT_ID
+//   byte 1: MotionStateFlags
+//   2..3: analytic reference position, signed centidegrees
+//   4..5: analytic reference velocity, signed centidegrees/second
+//   6..7: analytic reference acceleration, signed deci-degrees/second^2
+//   8..11: elapsed analytic trajectory time, milliseconds
+//   12..15: total analytic trajectory duration, milliseconds
+static constexpr size_t MOTION_STATE_PAYLOAD_SIZE = 16;
+static_assert(MOTION_STATE_PAYLOAD_SIZE <= MAX_PAYLOAD,
+              "MotionState payload exceeds JointBus frame capacity");
+
+enum MotionStateFlags : uint8_t {
+    MSTATE_ACTIVE_VALID       = 0x01,
+    MSTATE_TRAJECTORY_ACTIVE = 0x02,
+    MSTATE_BLEND_ACCEPTED     = 0x04,
+    MSTATE_SAFE_REPLAN        = 0x08,
+    MSTATE_SERVO_SETTLING     = 0x10,
+    MSTATE_HOLD_AXIS          = 0x20
+};
+
+struct MotionState {
+    uint8_t activeSegmentId = NO_SEGMENT_ID;
+    uint8_t flags = 0;
+    int16_t refPosCdeg = 0;
+    int16_t refVelCdegS = 0;
+    int16_t refAccDdegS2 = 0;
+    uint32_t elapsedMs = 0;
+    uint32_t durationMs = 0;
+};
+
+// SegmentTimingRsp payload (5 bytes): prepared segment id followed by the
+// minimum currently admissible quintic duration in milliseconds.
+static constexpr size_t SEGMENT_TIMING_PAYLOAD_SIZE = 5;
+static constexpr size_t TIMED_START_PAYLOAD_SIZE = 9;
+static_assert(SEGMENT_TIMING_PAYLOAD_SIZE <= MAX_PAYLOAD,
+              "SegmentTiming payload exceeds JointBus frame capacity");
+static_assert(TIMED_START_PAYLOAD_SIZE <= MAX_PAYLOAD,
+              "Timed start payload exceeds JointBus frame capacity");
+
+struct SegmentTiming {
+    uint8_t segmentId = NO_SEGMENT_ID;
+    uint32_t minimumDurationMs = 0;
+};
+
+static constexpr uint32_t MIN_SCHEDULE_DELAY_US = 1000;
+static constexpr uint32_t MAX_SCHEDULE_DELAY_US = 1000000;
 
 struct Frame {
     uint8_t address = 0;
@@ -212,6 +273,64 @@ static inline uint16_t getU16LE(const uint8_t* src) {
 
 static inline int16_t getI16LE(const uint8_t* src) {
     return static_cast<int16_t>(getU16LE(src));
+}
+
+static inline void putU32LE(uint8_t* dst, uint32_t value) {
+    dst[0] = static_cast<uint8_t>(value & 0xFF);
+    dst[1] = static_cast<uint8_t>((value >> 8) & 0xFF);
+    dst[2] = static_cast<uint8_t>((value >> 16) & 0xFF);
+    dst[3] = static_cast<uint8_t>((value >> 24) & 0xFF);
+}
+
+static inline uint32_t getU32LE(const uint8_t* src) {
+    return static_cast<uint32_t>(src[0]) |
+           (static_cast<uint32_t>(src[1]) << 8) |
+           (static_cast<uint32_t>(src[2]) << 16) |
+           (static_cast<uint32_t>(src[3]) << 24);
+}
+
+static inline void encodeMotionStatePayload(const MotionState& state,
+                                            uint8_t* payload) {
+    payload[0] = state.activeSegmentId;
+    payload[1] = state.flags;
+    putI16LE(&payload[2], state.refPosCdeg);
+    putI16LE(&payload[4], state.refVelCdegS);
+    putI16LE(&payload[6], state.refAccDdegS2);
+    putU32LE(&payload[8], state.elapsedMs);
+    putU32LE(&payload[12], state.durationMs);
+}
+
+static inline bool decodeMotionStatePayload(const uint8_t* payload,
+                                            size_t payloadLen,
+                                            MotionState& state) {
+    if (payload == nullptr || payloadLen != MOTION_STATE_PAYLOAD_SIZE) {
+        return false;
+    }
+    state.activeSegmentId = payload[0];
+    state.flags = payload[1];
+    state.refPosCdeg = getI16LE(&payload[2]);
+    state.refVelCdegS = getI16LE(&payload[4]);
+    state.refAccDdegS2 = getI16LE(&payload[6]);
+    state.elapsedMs = getU32LE(&payload[8]);
+    state.durationMs = getU32LE(&payload[12]);
+    return true;
+}
+
+static inline void encodeSegmentTimingPayload(const SegmentTiming& timing,
+                                              uint8_t* payload) {
+    payload[0] = timing.segmentId;
+    putU32LE(&payload[1], timing.minimumDurationMs);
+}
+
+static inline bool decodeSegmentTimingPayload(const uint8_t* payload,
+                                              size_t payloadLen,
+                                              SegmentTiming& timing) {
+    if (payload == nullptr || payloadLen != SEGMENT_TIMING_PAYLOAD_SIZE) {
+        return false;
+    }
+    timing.segmentId = payload[0];
+    timing.minimumDurationMs = getU32LE(&payload[1]);
+    return true;
 }
 
 static inline void encodeMotionConfigPayload(const MotionConfig& config, uint8_t* payload) {

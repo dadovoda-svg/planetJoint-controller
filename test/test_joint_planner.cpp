@@ -23,12 +23,17 @@ public:
   bool driverIsEnabled = false;
   bool enableSucceeds = true;
   bool limitsValid = true;
+  bool commandActive = false;
   float minTarget = -170.0f;
   float maxTarget = 170.0f;
   float position = 0.0f;
   float refPosition = 0.0f;
   float refVelocity = 0.0f;
   bool blendSucceeds = true;
+  bool timedRestartSucceeds = true;
+  bool timedBlendSucceeds = true;
+  bool durationPreviewSucceeds = true;
+  float previewDuration = 1.25f;
 
   int stopCalls = 0;
   int enableCalls = 0;
@@ -47,11 +52,13 @@ public:
   MotionMode motionMode() const override { return mode; }
   bool encoderReady() const override { return encoderOk; }
   bool driverEnabled() const override { return driverIsEnabled; }
+  bool positionCommandActive() const override { return commandActive; }
 
   void stopMotion() override {
     ++stopCalls;
     mode = MotionMode::IDLE;
     driverIsEnabled = false;
+    commandActive = false;
   }
 
   bool ensureDriverEnabled() override {
@@ -104,10 +111,33 @@ public:
     return blendSucceeds;
   }
 
+  bool restartControllerTimed(float currentDeg,
+                              float targetDeg,
+                              float) override {
+    if (!timedRestartSucceeds) return false;
+    restartController(currentDeg, targetDeg);
+    return true;
+  }
+
+  bool blendControllerTargetTimed(float targetDeg, float) override {
+    if (!timedBlendSucceeds) return false;
+    return blendControllerTarget(targetDeg);
+  }
+
+  bool minimumCoordinatedDuration(float,
+                                  float,
+                                  float,
+                                  float& durationS) const override {
+    if (!durationPreviewSucceeds) return false;
+    durationS = previewDuration;
+    return true;
+  }
+
   void beginPositionMotion(float targetDeg) override {
     ++beginCalls;
     startedTarget = targetDeg;
     mode = MotionMode::POSITION;
+    commandActive = true;
   }
 };
 
@@ -202,6 +232,7 @@ void testBlendAheadKeepsReference()
 {
   FakeRuntime runtime;
   runtime.mode = MotionMode::POSITION;
+  runtime.commandActive = true;
   runtime.driverIsEnabled = true;
   runtime.position = 4.0f;
   runtime.refPosition = 5.0f;
@@ -220,6 +251,7 @@ void testBlendReverseUsesSafeReplan()
 {
   FakeRuntime runtime;
   runtime.mode = MotionMode::POSITION;
+  runtime.commandActive = true;
   runtime.driverIsEnabled = true;
   runtime.position = 4.0f;
   runtime.refPosition = 5.0f;
@@ -237,6 +269,7 @@ void testRejectedBlendUsesSafeReplan()
 {
   FakeRuntime runtime;
   runtime.mode = MotionMode::POSITION;
+  runtime.commandActive = true;
   runtime.driverIsEnabled = true;
   runtime.position = 4.0f;
   runtime.refPosition = 5.0f;
@@ -251,6 +284,27 @@ void testRejectedBlendUsesSafeReplan()
   CHECK(std::fabs(runtime.refPosition - 4.0f) < 0.001f);
 }
 
+void testBlendDuringCompletedServoHoldUsesSafeReplan()
+{
+  FakeRuntime runtime;
+  runtime.mode = MotionMode::POSITION;
+  runtime.commandActive = false;
+  runtime.driverIsEnabled = true;
+  runtime.position = 4.0f;
+  runtime.refPosition = 5.0f;
+  runtime.refVelocity = 2.0f;
+  JointPlanner planner(runtime, testConfig());
+
+  const JointMoveOutcome outcome = planner.moveToBlended(command(20.0f));
+  CHECK(outcome.result == JointMoveResult::SafeReplan);
+  CHECK(runtime.stopCalls == 1);
+  CHECK(runtime.blendCalls == 0);
+  CHECK(runtime.restartCalls == 1);
+  CHECK(runtime.beginCalls == 1);
+  CHECK(runtime.commandActive);
+  CHECK(std::fabs(runtime.refPosition - runtime.position) < 0.001f);
+}
+
 void testDriverFailureLatchesFault()
 {
   FakeRuntime runtime;
@@ -263,6 +317,31 @@ void testDriverFailureLatchesFault()
   CHECK(runtime.faultCalls == 1);
   CHECK(runtime.configureCalls == 0);
   CHECK(runtime.beginCalls == 0);
+}
+
+void testTimedMoveAndDurationPreview()
+{
+  FakeRuntime runtime;
+  runtime.mode = MotionMode::POSITION;
+  runtime.commandActive = true;
+  runtime.driverIsEnabled = true;
+  runtime.refPosition = 5.0f;
+  runtime.refVelocity = 2.0f;
+  JointPlanner planner(runtime, testConfig());
+
+  float durationS = 0.0f;
+  CHECK(planner.minimumBlendedDuration(command(20.0f), durationS));
+  CHECK(std::fabs(durationS - runtime.previewDuration) < 0.001f);
+  CHECK(planner.moveToBlendedTimed(command(20.0f), durationS).result ==
+        JointMoveResult::BlendAccepted);
+
+  runtime.timedBlendSucceeds = false;
+  CHECK(planner.moveToBlendedTimed(command(30.0f), durationS).result ==
+        JointMoveResult::SafeReplan);
+
+  runtime.timedRestartSucceeds = false;
+  CHECK(planner.moveToBlendedTimed(command(40.0f), durationS).result ==
+        JointMoveResult::DurationInfeasible);
 }
 
 void testStop()
@@ -285,7 +364,9 @@ int main()
   testBlendAheadKeepsReference();
   testBlendReverseUsesSafeReplan();
   testRejectedBlendUsesSafeReplan();
+  testBlendDuringCompletedServoHoldUsesSafeReplan();
   testDriverFailureLatchesFault();
+  testTimedMoveAndDurationPreview();
   testStop();
 
   if (failures != 0) {

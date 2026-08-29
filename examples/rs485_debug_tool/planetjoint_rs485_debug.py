@@ -57,6 +57,8 @@ class Command(enum.IntEnum):
     QUEUE_STATUS = 0x0D
     EMERGENCY_STOP = 0x0E
     MOTION_CONFIG = 0x0F
+    CLEAR_FAULT = 0x12
+    PREPARE_HOLD = 0x13
     PING = 0x7F
 
     ACK = 0x80
@@ -80,6 +82,8 @@ ACK_CODES: Dict[int, str] = {
     0x08: "SEGMENT_STARTED",
     0x09: "SEGMENT_ABORTED",
     0x0A: "EMERGENCY_STOPPED",
+    0x0C: "FAULT_CLEARED",
+    0x0D: "HOLD_PREPARED",
 }
 
 NACK_CODES: Dict[int, str] = {
@@ -139,6 +143,9 @@ QUEUE_STATUS_FLAGS: Sequence[Tuple[int, str]] = (
     (0x01, "ACTIVE_VALID"),
     (0x02, "PREPARED_VALID"),
     (0x04, "ACTIVE_BUSY"),
+    (0x08, "START_PENDING"),
+    (0x10, "PREPARED_HOLD"),
+    (0x20, "ACTIVE_HOLD"),
 )
 
 
@@ -444,6 +451,16 @@ class JointBusClient:
             self.simulated_active_segment[address] = None
             self.simulated_fault[address] = 0x0B
             rsp_payload = bytes((0x0A, 0x00))
+        elif command == Command.CLEAR_FAULT:
+            if payload:
+                rsp_command = Command.NACK
+                rsp_payload = bytes((0x02, 0x00))
+            elif self.simulated_fault.get(address, 0):
+                self.simulated_fault[address] = 0
+                self.simulated_enabled[address] = False
+                rsp_payload = bytes((0x0C, 0x00))
+            else:
+                rsp_payload = bytes((0x04, 0x00))
         elif command == Command.STOP:
             self.simulated_enabled[address] = False
         elif command == Command.REBOOT:
@@ -740,6 +757,10 @@ class JointBusShell(cmd.Cmd):
         if frame:
             print(describe_frame(frame))
 
+    def do_clearfault(self, line: str) -> None:
+        """clearfault <address> -- clear a fault after node-side safety validation."""
+        self._simple(line, Command.CLEAR_FAULT)
+
     def do_status(self, line: str) -> None:
         """status <address> -- request extended status."""
         self._simple(line, Command.STATUS)
@@ -785,6 +806,16 @@ class JointBusShell(cmd.Cmd):
         amax = cdeg_unsigned(float(tokens[4]), "amax")
         payload = bytes((segment_id,)) + struct.pack("<hHH", angle, vmax, amax)
         frame = self.client.transact(address, Command.PREPARE_MOVEB, payload)
+        if frame:
+            print(describe_frame(frame))
+
+    def do_preph(self, line: str) -> None:
+        """preph <address> <segment_id> -- prepare a coordinated HOLD segment."""
+        tokens = self._tokens(line, 2, "preph <address> <segment_id>")
+        address = parse_address(tokens[0])
+        segment_id = parse_segment_id(tokens[1], allow_none=False)
+        frame = self.client.transact(
+            address, Command.PREPARE_HOLD, bytes((segment_id,)))
         if frame:
             print(describe_frame(frame))
 

@@ -27,6 +27,7 @@ const char* jointMoveResultName(JointMoveResult result)
     case JointMoveResult::EncoderUnavailable: return "encoder unavailable";
     case JointMoveResult::InvalidCommand: return "invalid command";
     case JointMoveResult::InvalidLimits: return "invalid limits";
+    case JointMoveResult::DurationInfeasible: return "duration infeasible";
     case JointMoveResult::DriverError: return "driver error";
   }
   return "unknown";
@@ -108,7 +109,9 @@ JointMoveOutcome JointPlanner::makeOutcome(JointMoveResult result,
   return outcome;
 }
 
-JointMoveOutcome JointPlanner::executeMove(const JointMoveCommand& cmd, RetargetMode mode)
+JointMoveOutcome JointPlanner::executeMove(const JointMoveCommand& cmd,
+                                           RetargetMode mode,
+                                           float fixedDurationS)
 {
   PreparedMove prepared;
   const JointMoveResult validation = validateAndPrepare(cmd, prepared);
@@ -116,8 +119,13 @@ JointMoveOutcome JointPlanner::executeMove(const JointMoveCommand& cmd, Retarget
     return makeOutcome(validation, cmd);
   }
 
-  const bool alreadyPositioning = _runtime.motionMode() == MotionMode::POSITION;
+  const bool alreadyPositioning = _runtime.positionCommandActive();
   const bool blendRequested = mode == RetargetMode::BlendIfSafe;
+  const bool fixedDuration = fixedDurationS > 0.0f;
+  if ((fixedDuration && !isfinite(fixedDurationS)) ||
+      (!fixedDuration && fixedDurationS != 0.0f)) {
+    return makeOutcome(JointMoveResult::InvalidCommand, cmd, &prepared);
+  }
 
   if (!blendRequested) {
     if (_runtime.motionMode() != MotionMode::IDLE) {
@@ -149,14 +157,35 @@ JointMoveOutcome JointPlanner::executeMove(const JointMoveCommand& cmd, Retarget
     const bool movingReference = fabsf(refVel) > _config.blendMinRefVelDegS;
     const bool targetAhead = !movingReference || distance * refVel >= 0.0f;
 
-    if (targetAhead &&
-        _runtime.blendControllerTarget(prepared.command.targetDeg)) {
+    const bool blended = targetAhead &&
+      (fixedDuration
+        ? _runtime.blendControllerTargetTimed(
+            prepared.command.targetDeg, fixedDurationS)
+        : _runtime.blendControllerTarget(prepared.command.targetDeg));
+    if (blended) {
       fullBlend = true;
+    } else {
+      const bool restarted = !fixedDuration ||
+        _runtime.restartControllerTimed(
+          currentDeg, prepared.command.targetDeg, fixedDurationS);
+      if (!restarted) {
+        return makeOutcome(
+          JointMoveResult::DurationInfeasible, cmd, &prepared);
+      }
+      if (!fixedDuration) {
+        _runtime.restartController(currentDeg, prepared.command.targetDeg);
+      }
+    }
+  } else {
+    if (fixedDuration) {
+      if (!_runtime.restartControllerTimed(
+            currentDeg, prepared.command.targetDeg, fixedDurationS)) {
+        return makeOutcome(
+          JointMoveResult::DurationInfeasible, cmd, &prepared);
+      }
     } else {
       _runtime.restartController(currentDeg, prepared.command.targetDeg);
     }
-  } else {
-    _runtime.restartController(currentDeg, prepared.command.targetDeg);
   }
 
   _runtime.beginPositionMotion(prepared.command.targetDeg);
@@ -194,4 +223,25 @@ JointMoveOutcome JointPlanner::moveToBlended(float targetDeg, float vmaxDegS, fl
   cmd.vmaxDegS = vmaxDegS;
   cmd.amaxDegS2 = amaxDegS2;
   return moveToBlended(cmd);
+}
+
+JointMoveOutcome JointPlanner::moveToBlendedTimed(
+    const JointMoveCommand& cmd,
+    float durationS)
+{
+  return executeMove(cmd, RetargetMode::BlendIfSafe, durationS);
+}
+
+bool JointPlanner::minimumBlendedDuration(const JointMoveCommand& cmd,
+                                          float& durationS) const
+{
+  PreparedMove prepared;
+  if (validateAndPrepare(cmd, prepared) != JointMoveResult::Accepted) {
+    return false;
+  }
+  return _runtime.minimumCoordinatedDuration(
+    prepared.command.targetDeg,
+    prepared.command.vmaxDegS,
+    prepared.command.amaxDegS2,
+    durationS);
 }

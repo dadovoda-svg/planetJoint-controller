@@ -120,6 +120,10 @@ public:
     latchStoppedFault(FaultCode::EmergencyStop, measured_pos);
   }
 
+  void latchPlannerFault(float measured_pos) {
+    latchStoppedFault(FaultCode::BadLimits, measured_pos);
+  }
+
   // ---------- Lifecycle ----------
   void reset(float measured_pos) {
     if (_limits_enabled) measured_pos = clampf(measured_pos, _pos_min, _pos_max);
@@ -181,6 +185,112 @@ public:
 
     acceptTarget(target, candidate);
     return true;
+  }
+
+  // Install a trajectory with an exact externally coordinated duration.
+  // Failure is transactional: the current target and polynomial are retained.
+  bool setTargetBlendedWithDuration(float target_pos, float duration_s) {
+    const float target = clampedTarget(target_pos);
+    Trajectory candidate;
+    if (!makeTrajectoryWithDuration(
+            _ref_pos, _ref_vel, _ref_acc, target, duration_s, candidate)) {
+      return false;
+    }
+
+    acceptTarget(target, candidate);
+    return true;
+  }
+
+  // Safe-replan counterpart of setTargetBlendedWithDuration(). The candidate
+  // is validated before reset(), so a rejected duration cannot disturb the
+  // trajectory currently being followed.
+  bool setTargetFromRestWithDuration(float measured_pos,
+                                     float target_pos,
+                                     float duration_s) {
+    const float start = _limits_enabled
+      ? clampf(measured_pos, _pos_min, _pos_max)
+      : measured_pos;
+    const float target = clampedTarget(target_pos);
+    Trajectory candidate;
+    if (!makeTrajectoryWithDuration(
+            start, 0.0f, 0.0f, target, duration_s, candidate)) {
+      return false;
+    }
+
+    reset(start);
+    acceptTarget(target, candidate);
+    return true;
+  }
+
+  // Preview the minimum duration without modifying controller state. The
+  // returned value is safe both for a continuous retarget, when admissible,
+  // and for the rest-to-rest fallback used by the joint planner.
+  bool minimumCoordinatedDuration(float target_pos,
+                                  float vmax_deg_s,
+                                  float amax_deg_s2,
+                                  float restart_pos,
+                                  bool allow_blend,
+                                  float& duration_s) const {
+    if (!isfinite(vmax_deg_s) || !isfinite(amax_deg_s2) ||
+        vmax_deg_s <= 0.0f || amax_deg_s2 <= 0.0f) {
+      return false;
+    }
+
+    SCurvePosVelController preview = *this;
+    preview._lim.v_max = fabsf(vmax_deg_s);
+    preview._lim.a_max = fabsf(amax_deg_s2);
+    const float target = preview.clampedTarget(target_pos);
+    const float restart = preview._limits_enabled
+      ? clampf(restart_pos, preview._pos_min, preview._pos_max)
+      : restart_pos;
+
+    // The timing query and the scheduled START are separated by the bus
+    // negotiation plus the requested start delay.  During that interval an
+    // existing trajectory may advance, and the timed blend may have to fall
+    // back to a rest-to-rest replan.  Bound that fallback from every endpoint
+    // the reference can occupy, not only from the position sampled now.
+    float required = 0.0f;
+    const auto includeRestToRest = [&](float start) -> bool {
+      Trajectory candidate;
+      if (!preview.makeTrajectory(start, 0.0f, 0.0f,
+                                  target, candidate)) {
+        return false;
+      }
+      required = fmaxf(required, candidate.duration);
+      return true;
+    };
+
+    if (!includeRestToRest(restart)) {
+      return false;
+    }
+
+    if (allow_blend) {
+      if (!includeRestToRest(preview._ref_pos)) {
+        return false;
+      }
+      if (preview._trajectory.active &&
+          !includeRestToRest(preview._target)) {
+        return false;
+      }
+
+      const float distance = target - preview._ref_pos;
+      const bool moving_reference =
+        fabsf(preview._ref_vel) > VELOCITY_EPSILON_DEG_S;
+      const bool target_ahead =
+        !moving_reference || distance * preview._ref_vel >= 0.0f;
+      Trajectory blend_candidate;
+      if (target_ahead &&
+          preview.makeTrajectory(preview._ref_pos,
+                                 preview._ref_vel,
+                                 preview._ref_acc,
+                                 target,
+                                 blend_candidate)) {
+        required = fmaxf(required, blend_candidate.duration);
+      }
+    }
+
+    duration_s = required;
+    return isfinite(duration_s) && duration_s >= 0.0f;
   }
 
   // Rebuild the active remainder after vmax/amax changes. The current analytic
@@ -257,7 +367,10 @@ public:
       const float velocity_abs = fabsf(measured_velocity_used);
 
       if (_db_active) {
-        if (position_error <= _db_exit && velocity_abs <= _db_vel) {
+        // Once latched, positional hysteresis alone controls the exit.
+        // Requiring dbvel here makes encoder quantization look like motion and
+        // can release the deadband well inside the configured dbext threshold.
+        if (position_error <= _db_exit) {
           freezeInDeadband(target, measured_pos, measured_velocity_used);
           return 0.0f;
         }
@@ -640,6 +753,37 @@ private:
     }
 
     return false;
+  }
+
+  bool makeTrajectoryWithDuration(float p0,
+                                  float v0,
+                                  float a0,
+                                  float pf,
+                                  float duration,
+                                  Trajectory& trajectory) const {
+    if (!isfinite(_lim.v_max) || !isfinite(_lim.a_max) ||
+        _lim.v_max <= 0.0f || _lim.a_max <= 0.0f ||
+        !isfinite(p0) || !isfinite(v0) || !isfinite(a0) ||
+        !isfinite(pf) || !isfinite(duration) ||
+        duration < MIN_TRAJECTORY_DURATION_S) {
+      return false;
+    }
+
+    const float distance = pf - p0;
+    if (fabsf(distance) <= POSITION_EPSILON_DEG) {
+      if (fabsf(v0) <= VELOCITY_EPSILON_DEG_S &&
+          fabsf(a0) <= ACCELERATION_EPSILON_DEG_S2) {
+        trajectory = Trajectory{};
+        return true;
+      }
+      return false;
+    }
+    if (fabsf(v0) > VELOCITY_EPSILON_DEG_S && distance * v0 < 0.0f) {
+      return false;
+    }
+
+    return buildCoefficients(p0, v0, a0, pf, duration, trajectory) &&
+           trajectoryAdmissible(trajectory, p0, v0, a0, pf);
   }
 
   void stepTrajectory(float dt) {

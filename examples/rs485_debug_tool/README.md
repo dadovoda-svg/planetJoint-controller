@@ -67,6 +67,7 @@ ping <addr>
 move <addr> <angle_deg> <vmax_deg_s> <amax_deg_s2>
 moveb <addr> <angle_deg> <vmax_deg_s> <amax_deg_s2>
 prepmb <addr> <segment_id> <angle_deg> <vmax_deg_s> <amax_deg_s2>
+preph <addr> <segment_id>
 start <segment_id> [addr]
 abortseg <segment_id|all> [addr]
 qqueue <addr>
@@ -76,6 +77,7 @@ zero <addr>
 park <addr>
 stop <addr>
 estop [addr|all]
+clearfault <addr>
 reboot <addr> [magic]
 status <addr>
 qstatus <addr>
@@ -102,13 +104,17 @@ addr=1 seq=1 type=RESPONSE cmd=MOTION_CONFIG_RSP
 
 The offline simulator uses these same defaults for nodes `0..7`.
 
+`clearfault` sends the addressed `CLEAR_FAULT` request. The real node clears
+the latch only after fresh encoder and driver checks, valid persistent joint
+limits, and a measured position inside `jmin..jmax`. The motor remains disabled.
+
 ## Coordinated segment example
 
 Prepare one segment on two joints and start both with one broadcast frame:
 
 ```text
 jointbus> prepmb 1 42 10.0 8.0 15.0
-jointbus> prepmb 2 42 -20.0 8.0 15.0
+jointbus> preph 2 42
 jointbus> qqueue 1
 jointbus> qqueue 2
 jointbus> start 42

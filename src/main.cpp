@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <algorithm>
 #include <SPI.h>
 #include <Wire.h>
 #include <math.h>
@@ -19,6 +20,8 @@ using MagneticEncoder = AS5600;
 #include "SCurvePosVelController.h"
 #include "JointPlanner.h"
 #include "JointMotionApi.h"
+#include "MotionLifecycle.h"
+#include "FaultRecovery.h"
 #include "logger.h"
 #include "JointBusSlave.h"
 
@@ -29,6 +32,7 @@ static constexpr uint32_t USB_BAUD      = 115200;
 #define JOINTBUS_BAUD_921600 0
 #endif
 static constexpr uint32_t JOINTBUS_BAUD = JOINTBUS_BAUD_921600 ? 921600UL : 500000UL;
+static constexpr size_t JOINTBUS_RX_BUFFER_SIZE = 1024;
 static constexpr uint32_t TMC_BAUD      = 230400;
 
 // ===================== PIN MAP =====================
@@ -185,6 +189,7 @@ public:
   MotionMode motionMode() const override;
   bool encoderReady() const override;
   bool driverEnabled() const override;
+  bool positionCommandActive() const override;
   void stopMotion() override;
   bool ensureDriverEnabled() override;
   void latchDriverFault() override;
@@ -198,6 +203,15 @@ public:
                            bool clearFault) override;
   void restartController(float currentDeg, float targetDeg) override;
   bool blendControllerTarget(float targetDeg) override;
+  bool restartControllerTimed(float currentDeg,
+                              float targetDeg,
+                              float durationS) override;
+  bool blendControllerTargetTimed(float targetDeg,
+                                  float durationS) override;
+  bool minimumCoordinatedDuration(float targetDeg,
+                                  float vmaxDegS,
+                                  float amaxDegS2,
+                                  float& durationS) const override;
   void beginPositionMotion(float targetDeg) override;
 };
 
@@ -214,6 +228,44 @@ JointPlanner planner(plannerRuntime, plannerConfig);
 
 static JointBus::SlaveHooks jointBusHooks;
 static JointBus::Slave jointBus(SerialJointBus, 0, jointBusHooks, PIN_RS485_RTS);
+
+void printJointBusStats(bool reset)
+{
+  if (reset) {
+    jointBus.resetDiagnostics();
+    Serial.println("JointBus diagnostics reset");
+    return;
+  }
+  Serial.printf(
+    "jbus addr=%u baud=%lu rxbuf=%u rx=%lu tx=%lu ignored=%lu "
+    "crc=%lu length=%lu version=%lu\r\n",
+    static_cast<unsigned>(jointBus.address()),
+    static_cast<unsigned long>(JOINTBUS_BAUD),
+    static_cast<unsigned>(JOINTBUS_RX_BUFFER_SIZE),
+    static_cast<unsigned long>(jointBus.rxFrames()),
+    static_cast<unsigned long>(jointBus.txFrames()),
+    static_cast<unsigned long>(jointBus.ignoredFrames()),
+    static_cast<unsigned long>(jointBus.crcErrors()),
+    static_cast<unsigned long>(jointBus.lengthErrors()),
+    static_cast<unsigned long>(jointBus.versionErrors()));
+  Serial.printf(
+    "broadcast total=%lu start_rx=%lu start_ok=%lu start_reject=%lu "
+    "last_seq=%u last_nack=0x%02X\r\n",
+    static_cast<unsigned long>(jointBus.broadcastFrames()),
+    static_cast<unsigned long>(jointBus.broadcastStartFrames()),
+    static_cast<unsigned long>(jointBus.broadcastStartAccepted()),
+    static_cast<unsigned long>(jointBus.broadcastStartRejected()),
+    static_cast<unsigned>(jointBus.lastBroadcastStartSeq()),
+    static_cast<unsigned>(jointBus.lastBroadcastStartNack()));
+  Serial.printf(
+    "uart errors=%lu buffer_full=%lu fifo_ovf=%lu frame=%lu parity=%lu break=%lu\r\n",
+    static_cast<unsigned long>(jointBus.uartErrors()),
+    static_cast<unsigned long>(jointBus.uartBufferFullErrors()),
+    static_cast<unsigned long>(jointBus.uartFifoOverflowErrors()),
+    static_cast<unsigned long>(jointBus.uartFrameErrors()),
+    static_cast<unsigned long>(jointBus.uartParityErrors()),
+    static_cast<unsigned long>(jointBus.uartBreakErrors()));
+}
 
 // ===================== STATE =====================
 
@@ -262,7 +314,7 @@ static int32_t stepNum = 0;
 
 float servoTargetZeroedDeg = 0.0f;
 static float servoLastCmdDegS = 0.0f;
-static bool servoHoldActive = false;
+static MotionLifecycleState motionLifecycle;
 bool tmcReady = false;
 
 static bool jointBusLastLimitClipped = false;
@@ -272,6 +324,7 @@ static float activeMotorDirectionSign = DEFAULT_MOTOR_DIRECTION_SIGN;
 
 struct JointBusPreparedSegment {
   bool valid = false;
+  bool hold = false;
   uint8_t segmentId = JointBus::NO_SEGMENT_ID;
   int16_t targetCdeg = 0;
   uint16_t vmaxCdegS = 0;
@@ -281,6 +334,19 @@ struct JointBusPreparedSegment {
 static JointBusPreparedSegment jointBusPreparedSegment;
 static bool jointBusActiveSegmentValid = false;
 static uint8_t jointBusActiveSegmentId = JointBus::NO_SEGMENT_ID;
+static uint8_t jointBusActiveMotionFlags = 0;
+static bool jointBusActiveSegmentHold = false;
+static uint32_t jointBusActiveSegmentStartedMs = 0;
+static uint32_t jointBusActiveSegmentDurationMs = 0;
+
+struct JointBusScheduledStart {
+  bool valid = false;
+  uint8_t segmentId = JointBus::NO_SEGMENT_ID;
+  uint32_t durationMs = 0;
+  uint32_t deadlineUs = 0;
+};
+
+static JointBusScheduledStart jointBusScheduledStart;
 
 MotionMode motionMode = MotionMode::IDLE;
 
@@ -296,9 +362,17 @@ static void setupJointBusHooks();
 static uint8_t readJointBusAddressFromParams();
 static bool applyMotorDirectionFromParams(bool stopBeforeApply);
 static bool applyEncoderDirectionFromParams(bool preserveZeroedPosition);
+static void clearPositionLifecycleState();
+bool setMotorVelocityDegPerSecond(float degreesPerSecond);
 bool startPark();
+FaultClearResult clearMotionFault();
 
 // ===================== PARAMS =====================
+
+static void clearPositionLifecycleState()
+{
+  motionLifecycle.clear();
+}
 
 static bool readParamU8(const char* key, uint8_t& out)
 {
@@ -452,6 +526,29 @@ static bool isJointPositionOutsideFaultWindow(float zeroedDeg)
   return zeroedDeg < (jmin - jtol) || zeroedDeg > (jmax + jtol);
 }
 
+static void latchPlannerConfigurationFault(const char* reason)
+{
+  clearPositionLifecycleState();
+
+  if (tmcReady) {
+    tmc.stopInternalMotion();
+    tmc.disableDriver(false);
+  }
+
+  // Keep the controller in a numerically safe envelope while retaining the
+  // BadLimits code that JointBus exposes as PlannerError.
+  jointCtrl.setPositionLimits(JOINT_MIN_DEG_DEFAULT,
+                              JOINT_MAX_DEG_DEFAULT,
+                              JOINT_LIMIT_STOP_MARGIN_DEG,
+                              JOINT_LIMIT_TOL_DEFAULT);
+  const float measured = jointGetPositionDeg();
+  jointCtrl.latchPlannerFault(isfinite(measured) ? measured : 0.0f);
+  motionMode = MotionMode::FAULT;
+  wsSetState(LedState::FAULT);
+  LOG_ERR("Planner configuration fault: %s\r\n",
+          reason != nullptr ? reason : "invalid joint limits");
+}
+
 bool jointClipTargetToLimits(float requestedDeg, float& clippedDeg)
 {
   float jmin = 0.0f;
@@ -459,8 +556,7 @@ bool jointClipTargetToLimits(float requestedDeg, float& clippedDeg)
   float jtol = 0.0f;
 
   if (!readJointLimitParams(jmin, jmax, jtol)) {
-    motionMode = MotionMode::FAULT;
-    wsSetState(LedState::FAULT);
+    latchPlannerConfigurationFault("invalid jmin/jmax/jtol");
     clippedDeg = requestedDeg;
     return false;
   }
@@ -482,12 +578,7 @@ static bool applyJointLimitsFromParams(bool announce)
   float jtol = 0.0f;
 
   if (!readJointLimitParams(jmin, jmax, jtol)) {
-    motionMode = MotionMode::FAULT;
-    wsSetState(LedState::FAULT);
-    jointCtrl.setPositionLimits(JOINT_MIN_DEG_DEFAULT,
-                                JOINT_MAX_DEG_DEFAULT,
-                                JOINT_LIMIT_STOP_MARGIN_DEG,
-                                JOINT_LIMIT_TOL_DEFAULT);
+    latchPlannerConfigurationFault("invalid jmin/jmax/jtol");
     LOG_ERR("Joint limit configuration invalid: motion fault latched\r\n");
     return false;
   }
@@ -499,6 +590,7 @@ static bool applyJointLimitsFromParams(bool announce)
   }
 
   if (jointReferenced && encoderOk && isJointPositionOutsideFaultWindow(jointGetPositionDeg())) {
+    clearPositionLifecycleState();
     motionMode = MotionMode::FAULT;
     wsSetState(LedState::FAULT);
     LOG_ERR("Current joint position %.3f deg is outside limits [%.3f, %.3f] with jtol=%.3f\r\n",
@@ -523,9 +615,11 @@ static void applyEncoderScaleFromParams(bool preserveZeroedPosition)
 
   if (preserveZeroedPosition) {
     encoderZero = jointDeg - oldZeroed;
-    jointCtrl.reset(oldZeroed);
-    jointCtrl.setTarget(oldZeroed);
-    servoTargetZeroedDeg = oldZeroed;
+    if (motionMode != MotionMode::FAULT && !jointCtrl.fault()) {
+      jointCtrl.reset(oldZeroed);
+      jointCtrl.setTarget(oldZeroed);
+      servoTargetZeroedDeg = oldZeroed;
+    }
   }
 
   LOG_NFO("Encoder scale: 360.000 encoder deg = %.6f joint deg\r\n",
@@ -560,9 +654,11 @@ static bool applyEncoderDirectionFromParams(bool preserveZeroedPosition)
   if (preserveZeroedPosition && changed && encoderOk) {
     encoderZero = jointDeg - oldZeroed;
     params.set("zoff", encoderZero);
-    jointCtrl.reset(oldZeroed);
-    jointCtrl.setTarget(oldZeroed);
-    servoTargetZeroedDeg = oldZeroed;
+    if (motionMode != MotionMode::FAULT && !jointCtrl.fault()) {
+      jointCtrl.reset(oldZeroed);
+      jointCtrl.setTarget(oldZeroed);
+      servoTargetZeroedDeg = oldZeroed;
+    }
   }
 
   LOG_NFO("Encoder direction sign edir=%+.0f%s\r\n",
@@ -764,9 +860,11 @@ static void applyZeroOffsetFromParams(bool rebaseController)
   if (rebaseController && encoderOk) {
     stopMotion();
     const float currentZeroedDeg = jointGetPositionDeg();
-    jointCtrl.reset(currentZeroedDeg);
-    jointCtrl.setTarget(currentZeroedDeg);
-    servoTargetZeroedDeg = currentZeroedDeg;
+    if (motionMode != MotionMode::FAULT && !jointCtrl.fault()) {
+      jointCtrl.reset(currentZeroedDeg);
+      jointCtrl.setTarget(currentZeroedDeg);
+      servoTargetZeroedDeg = currentZeroedDeg;
+    }
   }
 
   LOG_NFO("Logical zero offset zoff=%.6f deg%s\r\n",
@@ -850,7 +948,29 @@ void onConsoleParamSet(const char* key)
   }
 
   if (strcmp(key, "shold") == 0) {
-    servoHoldActive = false;
+    if (!servoHoldEnabled()) {
+      const bool completedHold =
+        !motionLifecycle.positionCommandActive &&
+        motionLifecycle.servoHoldActive &&
+        motionMode == MotionMode::POSITION;
+
+      if (completedHold) {
+        clearPositionLifecycleState();
+      } else {
+        motionLifecycle.disableServoHold();
+      }
+
+      if (completedHold) {
+        setMotorVelocityDegPerSecond(0.0f);
+        tmc.stopInternalMotion();
+        servoLastCmdDegS = 0.0f;
+        if (!motorHoldEnabled()) {
+          tmc.disableDriver(false);
+        }
+        motionMode = MotionMode::IDLE;
+        wsSetState(jointReferenced ? LedState::READY : LedState::BOOT);
+      }
+    }
     LOG_NFO("servo hold at target %s. Use 'save' to persist it.\r\n",
             servoHoldEnabled() ? "enabled" : "disabled");
     return;
@@ -868,10 +988,12 @@ void onConsoleParamSet(const char* key)
     if (directionValue == 0.0f) {
       jointReferenced = true;
       const float currentPosition = jointGetPositionDeg();
-      jointCtrl.reset(currentPosition);
-      jointCtrl.setTarget(currentPosition);
-      servoTargetZeroedDeg = currentPosition;
-      wsSetState(LedState::READY);
+      if (motionMode != MotionMode::FAULT && !jointCtrl.fault()) {
+        jointCtrl.reset(currentPosition);
+        jointCtrl.setTarget(currentPosition);
+        servoTargetZeroedDeg = currentPosition;
+        wsSetState(LedState::READY);
+      }
       LOG_NFO("pkdir=0: absolute-encoder mode enabled; park is not required. Use 'save' to persist it.\r\n");
     } else if (directionValue == 1.0f || directionValue == -1.0f) {
       jointReferenced = false;
@@ -1091,9 +1213,25 @@ float jointGetRefVelocityDegS()
   return jointCtrl.refVel();
 }
 
+static bool nonPositionOperationBusy()
+{
+  return motionMode == MotionMode::PARK ||
+         motionMode == MotionMode::CALIBRATION ||
+         motionMode == MotionMode::VELOCITY_TEST ||
+         motionMode == MotionMode::STEP_TEST;
+}
+
+static bool jointCommandBusy()
+{
+  // External BUSY covers the latched position command plus exclusive
+  // non-position operations. Completed servo hold is intentionally excluded.
+  return positionMotionCommandBusy(motionLifecycle) ||
+         nonPositionOperationBusy();
+}
+
 bool jointIsBusy()
 {
-  return motionMode == MotionMode::POSITION;
+  return jointCommandBusy();
 }
 
 bool jointIsSettled()
@@ -1158,6 +1296,8 @@ bool ensureDriverEnabled()
 
 static void latchJointLimitFault(float zeroedDeg)
 {
+  clearPositionLifecycleState();
+
   float jmin = 0.0f;
   float jmax = 0.0f;
   float jtol = 0.0f;
@@ -1180,24 +1320,28 @@ static void latchJointLimitFault(float zeroedDeg)
 
 void stopMotion()
 {
+  const bool preserveFault =
+      motionMode == MotionMode::FAULT || jointCtrl.fault();
   parkPhase = ParkPhase::IDLE;
   parkCommandVelocityDegS = 0.0f;
   testEnabled = false;
   testStepEnabled = false;
   stepNum = 0;
   servoLastCmdDegS = 0.0f;
-  servoHoldActive = false;
+  clearPositionLifecycleState();
 
   tmc.stopInternalMotion();
   tmc.disableDriver(false); // keep configured chopper state; hardware bridge disabled
 
-  if (motionMode != MotionMode::FAULT) {
+  if (!preserveFault) {
     motionMode = MotionMode::IDLE;
+    // The position controller always works in zeroed joint coordinates.
+    jointCtrl.reset(jointGetPositionDeg());
+    wsSetState(jointReferenced ? LedState::READY : LedState::BOOT);
+  } else {
+    motionMode = MotionMode::FAULT;
+    wsSetState(LedState::FAULT);
   }
-
-  // The position controller always works in zeroed joint coordinates.
-  jointCtrl.reset(jointGetPositionDeg());
-  wsSetState(jointReferenced ? LedState::READY : LedState::BOOT);
 }
 
 bool FirmwareJointPlannerRuntime::isReferenced() const
@@ -1220,6 +1364,11 @@ bool FirmwareJointPlannerRuntime::driverEnabled() const
   return tmc.status() == Tmc2209Driver::Status::Enabled;
 }
 
+bool FirmwareJointPlannerRuntime::positionCommandActive() const
+{
+  return motionLifecycle.positionCommandActive;
+}
+
 void FirmwareJointPlannerRuntime::stopMotion()
 {
   ::stopMotion();
@@ -1232,6 +1381,7 @@ bool FirmwareJointPlannerRuntime::ensureDriverEnabled()
 
 void FirmwareJointPlannerRuntime::latchDriverFault()
 {
+  clearPositionLifecycleState();
   ::motionMode = MotionMode::FAULT;
   wsSetState(LedState::FAULT);
 }
@@ -1279,10 +1429,40 @@ bool FirmwareJointPlannerRuntime::blendControllerTarget(float targetDeg)
   return jointCtrl.setTargetBlended(targetDeg);
 }
 
+bool FirmwareJointPlannerRuntime::restartControllerTimed(float currentDeg,
+                                                         float targetDeg,
+                                                         float durationS)
+{
+  return jointCtrl.setTargetFromRestWithDuration(
+    currentDeg, targetDeg, durationS);
+}
+
+bool FirmwareJointPlannerRuntime::blendControllerTargetTimed(float targetDeg,
+                                                             float durationS)
+{
+  return jointCtrl.setTargetBlendedWithDuration(targetDeg, durationS);
+}
+
+bool FirmwareJointPlannerRuntime::minimumCoordinatedDuration(
+    float targetDeg,
+    float vmaxDegS,
+    float amaxDegS2,
+    float& durationS) const
+{
+  return jointCtrl.minimumCoordinatedDuration(
+    targetDeg,
+    vmaxDegS,
+    amaxDegS2,
+    jointGetPositionDeg(),
+    motionLifecycle.positionCommandActive,
+    durationS);
+}
+
 void FirmwareJointPlannerRuntime::beginPositionMotion(float targetDeg)
 {
   servoTargetZeroedDeg = targetDeg;
   lastServoUs = micros();
+  motionLifecycle.beginPositionCommand();
   ::motionMode = MotionMode::POSITION;
 }
 
@@ -1320,7 +1500,7 @@ static void latchEmergencyStopFault(const char* source)
   testStepEnabled = false;
   stepNum = 0;
   servoLastCmdDegS = 0.0f;
-  servoHoldActive = false;
+  clearPositionLifecycleState();
 
   if (tmcReady) {
     setMotorVelocityDegPerSecond(0.0f);
@@ -1345,7 +1525,9 @@ void jointControllerInit(float currentJointDeg)
 {
   applyControllerParamsFromParams();
 
-  applyJointLimitsFromParams(true);
+  if (!applyJointLimitsFromParams(true)) {
+    return;
+  }
   jointCtrl.reset(currentJointDeg);
 
   LOG_NFO("Joint PID + analytic quintic S-curve controller initialized\r\n");
@@ -1418,11 +1600,13 @@ bool toggleTest(float degreesPerSecond = 0.5f)
   if (testEnabled) {
     if (!ensureDriverEnabled()) {
       testEnabled = false;
+      clearPositionLifecycleState();
       motionMode = MotionMode::FAULT;
       wsSetState(LedState::FAULT);
       return false;
     }
 
+    clearPositionLifecycleState();
     motionMode = MotionMode::VELOCITY_TEST;
     wsSetState(LedState::TEST);
     setMotorVelocityDegPerSecond(degreesPerSecond);
@@ -1450,11 +1634,13 @@ bool moveStep(float steps = 1.0f)
   if (testStepEnabled) {
     if (!ensureDriverEnabled()) {
       testStepEnabled = false;
+      clearPositionLifecycleState();
       motionMode = MotionMode::FAULT;
       wsSetState(LedState::FAULT);
       return false;
     }
 
+    clearPositionLifecycleState();
     motionMode = MotionMode::STEP_TEST;
     wsSetState(LedState::TEST);
 
@@ -1498,6 +1684,78 @@ static bool updateEncoderSampleNow(float& jointDegOut)
 
   wsSetState(LedState::ENCODER_ERROR);
   return false;
+}
+
+FaultClearResult clearMotionFault()
+{
+  const bool faultActive = jointHasFault() ||
+                           motionMode == MotionMode::FAULT ||
+                           !encoderOk || !tmcReady;
+
+  if (!faultActive) {
+    return FaultClearResult::AlreadyClear;
+  }
+
+  // Fault recovery always starts from a de-energized, stationary bridge.
+  clearPositionLifecycleState();
+  jointBusClearCoordinatedSegments();
+  if (tmcReady) {
+    tmc.stopInternalMotion();
+    tmc.disableDriver(false);
+  }
+
+  const Tmc2209Driver::Status driverStatus = tmc.status();
+  const bool driverStateValid =
+      driverStatus == Tmc2209Driver::Status::Configured ||
+      driverStatus == Tmc2209Driver::Status::Enabled;
+  const bool driverValid = tmcReady && driverStateValid && tmc.probe();
+
+  float measuredAbsoluteDeg = 0.0f;
+  const bool encoderValid = updateEncoderSampleNow(measuredAbsoluteDeg) &&
+                            isfinite(measuredAbsoluteDeg);
+  const float currentZeroedDeg = encoderValid
+      ? measuredAbsoluteDeg - encoderZero
+      : 0.0f;
+
+  float jmin = 0.0f;
+  float jmax = 0.0f;
+  float jtol = 0.0f;
+  const bool limitsValid = readJointLimitParams(jmin, jmax, jtol);
+
+  FaultRecoverySnapshot snapshot;
+  snapshot.faultActive = faultActive;
+  snapshot.encoderValid = encoderValid;
+  snapshot.driverValid = driverValid;
+  snapshot.limitsValid = limitsValid;
+  snapshot.positionDeg = currentZeroedDeg;
+  snapshot.minDeg = jmin;
+  snapshot.maxDeg = jmax;
+
+  const FaultClearResult result = evaluateFaultRecovery(snapshot);
+  if (result == FaultClearResult::InvalidLimits) {
+    latchPlannerConfigurationFault("CLEAR_FAULT rejected invalid jmin/jmax/jtol");
+    return result;
+  }
+  if (result != FaultClearResult::Cleared &&
+      result != FaultClearResult::AlreadyClear) {
+    LOG_ERR("CLEAR_FAULT rejected: %s\r\n", faultClearResultName(result));
+    return result;
+  }
+
+  jointCtrl.setPositionLimits(jmin, jmax,
+                              JOINT_LIMIT_STOP_MARGIN_DEG, jtol);
+  jointCtrl.reset(currentZeroedDeg);
+  jointCtrl.setTarget(currentZeroedDeg);
+  servoTargetZeroedDeg = currentZeroedDeg;
+  servoLastCmdDegS = 0.0f;
+  motionMode = MotionMode::IDLE;
+  jointBusLastLimitClipped = false;
+  wsSetState(jointReferenced ? LedState::READY : LedState::BOOT);
+
+  LOG_NFO("Motion fault %s at zeroed=%.3f deg; driver disabled\r\n",
+          result == FaultClearResult::Cleared ? "cleared" : "already clear",
+          currentZeroedDeg);
+  return result;
 }
 
 static bool updateStdegParameter(float newStepsPerDegree)
@@ -1564,6 +1822,7 @@ bool calibrateStepsPerDegree(float targetDegrees = STDEG_CALIBRATION_TARGET_DEG)
   float startDeg = 0.0f;
   if (!updateEncoderSampleNow(startDeg)) {
     Serial.println("[CAL] Failed to read encoder before calibration move");
+    clearPositionLifecycleState();
     motionMode = MotionMode::FAULT;
     tmc.disableDriver(false);
     wsSetState(LedState::ENCODER_ERROR);
@@ -1572,6 +1831,7 @@ bool calibrateStepsPerDegree(float targetDegrees = STDEG_CALIBRATION_TARGET_DEG)
 
   if (!ensureDriverEnabled()) {
     Serial.println("[CAL] Failed to enable TMC2209 power stage");
+    clearPositionLifecycleState();
     motionMode = MotionMode::FAULT;
     tmc.disableDriver(false);
     wsSetState(LedState::FAULT);
@@ -1608,6 +1868,7 @@ bool calibrateStepsPerDegree(float targetDegrees = STDEG_CALIBRATION_TARGET_DEG)
 
   if (!finalReadOk) {
     Serial.println("[CAL] Failed to read encoder after calibration move");
+    clearPositionLifecycleState();
     motionMode = MotionMode::FAULT;
     wsSetState(LedState::ENCODER_ERROR);
     return false;
@@ -1623,6 +1884,7 @@ bool calibrateStepsPerDegree(float targetDegrees = STDEG_CALIBRATION_TARGET_DEG)
 
   if (absDeltaDeg < STDEG_CALIBRATION_MIN_DELTA_DEG) {
     Serial.println("[CAL] Measured movement too small: calibration rejected");
+    clearPositionLifecycleState();
     motionMode = MotionMode::FAULT;
     wsSetState(LedState::FAULT);
     return false;
@@ -1645,6 +1907,7 @@ bool calibrateStepsPerDegree(float targetDegrees = STDEG_CALIBRATION_TARGET_DEG)
     wsSetState(LedState::READY);
     jointCtrl.reset(jointGetPositionDeg());
   } else {
+    clearPositionLifecycleState();
     motionMode = MotionMode::FAULT;
     wsSetState(LedState::FAULT);
   }
@@ -1654,6 +1917,10 @@ bool calibrateStepsPerDegree(float targetDegrees = STDEG_CALIBRATION_TARGET_DEG)
 
 bool setZero()
 {
+  if (motionMode == MotionMode::FAULT || jointCtrl.fault()) {
+    Serial.println("[ERR] Zero rejected: clear the fault first");
+    return false;
+  }
   if (!jointReferenced) {
     Serial.println("[ERR] Zero rejected: execute park first");
     return false;
@@ -1662,7 +1929,7 @@ bool setZero()
   testStepEnabled = false;
   stepNum = 0;
   servoLastCmdDegS = 0.0f;
-  servoHoldActive = false;
+  clearPositionLifecycleState();
 
   tmc.stopInternalMotion();
   if (!motorHoldEnabled()) {
@@ -1776,6 +2043,27 @@ static int16_t jointBusDegToCdeg(float valueDeg)
   return static_cast<int16_t>(lroundf(clipped * 100.0f));
 }
 
+static int16_t jointBusDegToDdeg(float valueDeg)
+{
+  if (!isfinite(valueDeg)) {
+    return 0;
+  }
+  const float clipped = constrain(valueDeg, -3276.8f, 3276.7f);
+  return static_cast<int16_t>(lroundf(clipped * 10.0f));
+}
+
+static uint32_t jointBusSecondsToMilliseconds(float seconds)
+{
+  if (!isfinite(seconds) || seconds <= 0.0f) {
+    return 0;
+  }
+  const double milliseconds = static_cast<double>(seconds) * 1000.0;
+  if (milliseconds >= static_cast<double>(UINT32_MAX)) {
+    return UINT32_MAX;
+  }
+  return static_cast<uint32_t>(milliseconds + 0.5);
+}
+
 static bool jointBusDegToCdegChecked(float valueDeg, int16_t& valueCdeg)
 {
   if (!isfinite(valueDeg) || valueDeg < -327.68f || valueDeg > 327.67f) {
@@ -1823,17 +2111,14 @@ static uint8_t readJointBusAddressFromParams()
 
 static bool jointBusMotionBusy()
 {
-  const bool positionCommandBusy = (motionMode == MotionMode::POSITION) && !jointCtrl.isSettled();
-  return positionCommandBusy ||
-         motionMode == MotionMode::PARK ||
-         motionMode == MotionMode::CALIBRATION ||
-         motionMode == MotionMode::VELOCITY_TEST ||
-         motionMode == MotionMode::STEP_TEST;
+  return jointCommandBusy();
 }
 
 static void jointBusClearPreparedSegment()
 {
+  jointBusScheduledStart = JointBusScheduledStart{};
   jointBusPreparedSegment.valid = false;
+  jointBusPreparedSegment.hold = false;
   jointBusPreparedSegment.segmentId = JointBus::NO_SEGMENT_ID;
   jointBusPreparedSegment.targetCdeg = 0;
   jointBusPreparedSegment.vmaxCdegS = 0;
@@ -1845,13 +2130,32 @@ static void jointBusClearCoordinatedSegments()
   jointBusClearPreparedSegment();
   jointBusActiveSegmentValid = false;
   jointBusActiveSegmentId = JointBus::NO_SEGMENT_ID;
+  jointBusActiveMotionFlags = 0;
+  jointBusActiveSegmentHold = false;
+  jointBusActiveSegmentStartedMs = 0;
+  jointBusActiveSegmentDurationMs = 0;
 }
 
 static void jointBusSegmentQueueUpdate()
 {
+  if (jointBusActiveSegmentValid && jointBusActiveSegmentHold) {
+    const bool durationElapsed = jointBusActiveSegmentDurationMs == 0 ||
+      static_cast<uint32_t>(millis() - jointBusActiveSegmentStartedMs) >=
+        jointBusActiveSegmentDurationMs;
+    if (durationElapsed && !jointBusMotionBusy()) {
+      jointBusActiveSegmentValid = false;
+      jointBusActiveSegmentId = JointBus::NO_SEGMENT_ID;
+      jointBusActiveMotionFlags = 0;
+      jointBusActiveSegmentHold = false;
+      jointBusActiveSegmentStartedMs = 0;
+      jointBusActiveSegmentDurationMs = 0;
+    }
+    return;
+  }
   if (jointBusActiveSegmentValid && !jointBusMotionBusy()) {
     jointBusActiveSegmentValid = false;
     jointBusActiveSegmentId = JointBus::NO_SEGMENT_ID;
+    jointBusActiveMotionFlags = 0;
   }
 }
 
@@ -1866,6 +2170,8 @@ static JointBus::NackCode jointBusNackForMoveResult(JointMoveResult result)
       return JointBus::NackCode::FaultActive;
     case JointMoveResult::InvalidCommand:
       return JointBus::NackCode::BadPayload;
+    case JointMoveResult::DurationInfeasible:
+      return JointBus::NackCode::DurationInfeasible;
     case JointMoveResult::EncoderUnavailable:
     case JointMoveResult::InvalidLimits:
     case JointMoveResult::DriverError:
@@ -1988,6 +2294,7 @@ static JointBus::CommandResult jointBusPrepareMoveB(void* context,
   }
 
   jointBusPreparedSegment.valid = true;
+  jointBusPreparedSegment.hold = false;
   jointBusPreparedSegment.segmentId = segmentId;
   jointBusPreparedSegment.targetCdeg = jointBusDegToCdeg(clippedDeg);
   jointBusPreparedSegment.vmaxCdegS = vmaxCdegS;
@@ -2003,10 +2310,49 @@ static JointBus::CommandResult jointBusPrepareMoveB(void* context,
   return JointBus::CommandResult::ok(ack, segmentId);
 }
 
-static JointBus::CommandResult jointBusStartSegment(void* context, uint8_t segmentId)
+static JointBus::CommandResult jointBusPrepareHold(void* context,
+                                                   uint8_t segmentId)
 {
   (void)context;
+  if (segmentId == JointBus::NO_SEGMENT_ID) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::BadPayload);
+  }
+  if (jointBusPreparedSegment.valid) {
+    return JointBus::CommandResult::fail(
+      JointBus::NackCode::QueueFull, jointBusPreparedSegment.segmentId);
+  }
+  if (jointHasFault()) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::FaultActive);
+  }
+  if (!jointReferenced) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::NotHomed);
+  }
+  if (!encoderOk || !tmcReady) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::InternalError);
+  }
+  if (motionMode == MotionMode::CALIBRATION ||
+      motionMode == MotionMode::PARK ||
+      motionMode == MotionMode::VELOCITY_TEST ||
+      motionMode == MotionMode::STEP_TEST) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::Busy);
+  }
 
+  jointBusPreparedSegment = JointBusPreparedSegment{};
+  jointBusPreparedSegment.valid = true;
+  jointBusPreparedSegment.hold = true;
+  jointBusPreparedSegment.segmentId = segmentId;
+  jointBusPreparedSegment.targetCdeg =
+    jointBusDegToCdeg(jointGetTargetDeg());
+  LOG_NFO("JointBus HOLD prepared id=%u target=%.3f deg\r\n",
+          static_cast<unsigned>(segmentId), jointGetTargetDeg());
+  return JointBus::CommandResult::ok(
+    JointBus::AckCode::HoldPrepared, segmentId);
+}
+
+static JointBus::CommandResult jointBusStartPreparedSegment(
+    uint8_t segmentId,
+    uint32_t fixedDurationMs)
+{
   if (!jointBusPreparedSegment.valid) {
     return JointBus::CommandResult::fail(JointBus::NackCode::NoPreparedSegment);
   }
@@ -2021,26 +2367,188 @@ static JointBus::CommandResult jointBusStartSegment(void* context, uint8_t segme
     return JointBus::CommandResult::fail(JointBus::NackCode::NotHomed);
   }
 
+  if (jointBusPreparedSegment.hold) {
+    jointBusActiveSegmentValid = true;
+    jointBusActiveSegmentId = segmentId;
+    jointBusActiveMotionFlags = JointBus::MSTATE_HOLD_AXIS;
+    jointBusActiveSegmentHold = true;
+    jointBusActiveSegmentStartedMs = millis();
+    jointBusActiveSegmentDurationMs = fixedDurationMs;
+    jointBusClearPreparedSegment();
+    LOG_NFO("JointBus HOLD started id=%u duration=%lu ms\r\n",
+            static_cast<unsigned>(segmentId),
+            static_cast<unsigned long>(fixedDurationMs));
+    return JointBus::CommandResult::ok(
+      JointBus::AckCode::SegmentStarted, segmentId);
+  }
+
   const float targetDeg = jointBusCdegToDeg(jointBusPreparedSegment.targetCdeg);
   const float vmaxDegS = static_cast<float>(jointBusPreparedSegment.vmaxCdegS) * 0.01f;
   const float amaxDegS2 = static_cast<float>(jointBusPreparedSegment.amaxCdegS2) * 0.01f;
 
-  const JointMoveOutcome outcome = jointMoveToBlended(targetDeg, vmaxDegS, amaxDegS2);
+  JointMoveOutcome outcome;
+  if (fixedDurationMs != 0) {
+    JointMoveCommand command;
+    command.targetDeg = targetDeg;
+    command.vmaxDegS = vmaxDegS;
+    command.amaxDegS2 = amaxDegS2;
+    outcome = planner.moveToBlendedTimed(
+      command, static_cast<float>(fixedDurationMs) * 0.001f);
+  } else {
+    outcome = jointMoveToBlended(targetDeg, vmaxDegS, amaxDegS2);
+  }
   if (!outcome.accepted()) {
     return JointBus::CommandResult::fail(jointBusNackForMoveResult(outcome.result));
   }
 
   jointBusActiveSegmentValid = true;
   jointBusActiveSegmentId = segmentId;
+  jointBusActiveMotionFlags = 0;
+  jointBusActiveSegmentHold = false;
+  jointBusActiveSegmentStartedMs = millis();
+  jointBusActiveSegmentDurationMs = fixedDurationMs;
+  if (outcome.result == JointMoveResult::BlendAccepted) {
+    jointBusActiveMotionFlags |= JointBus::MSTATE_BLEND_ACCEPTED;
+  } else if (outcome.result == JointMoveResult::SafeReplan) {
+    jointBusActiveMotionFlags |= JointBus::MSTATE_SAFE_REPLAN;
+  }
   jointBusClearPreparedSegment();
 
-  LOG_NFO("JointBus segment started id=%u target=%.3f deg vmax=%.3f deg/s amax=%.3f deg/s2\r\n",
+  LOG_NFO("JointBus segment started id=%u target=%.3f deg vmax=%.3f deg/s amax=%.3f deg/s2 duration=%lu ms\r\n",
           static_cast<unsigned>(segmentId),
           targetDeg,
           vmaxDegS,
-          amaxDegS2);
+          amaxDegS2,
+          static_cast<unsigned long>(fixedDurationMs));
 
   return JointBus::CommandResult::ok(JointBus::AckCode::SegmentStarted, segmentId);
+}
+
+static JointBus::CommandResult jointBusStartSegment(void* context,
+                                                    uint8_t segmentId)
+{
+  (void)context;
+  return jointBusStartPreparedSegment(segmentId, 0);
+}
+
+static JointBus::CommandResult jointBusScheduleSegment(
+    void* context,
+    uint8_t segmentId,
+    uint32_t durationMs,
+    uint32_t delayUs)
+{
+  (void)context;
+  if (!jointBusPreparedSegment.valid) {
+    return JointBus::CommandResult::fail(
+      JointBus::NackCode::NoPreparedSegment);
+  }
+  if (jointBusPreparedSegment.segmentId != segmentId) {
+    return JointBus::CommandResult::fail(
+      JointBus::NackCode::SegmentMismatch,
+      jointBusPreparedSegment.segmentId);
+  }
+  if (jointBusScheduledStart.valid) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::Busy);
+  }
+  if (durationMs == 0 ||
+      delayUs < JointBus::MIN_SCHEDULE_DELAY_US ||
+      delayUs > JointBus::MAX_SCHEDULE_DELAY_US) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::BadPayload);
+  }
+  if (jointHasFault()) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::FaultActive);
+  }
+  if (!jointReferenced) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::NotHomed);
+  }
+
+  jointBusScheduledStart.valid = true;
+  jointBusScheduledStart.segmentId = segmentId;
+  jointBusScheduledStart.durationMs = durationMs;
+  jointBusScheduledStart.deadlineUs = micros() + delayUs;
+  LOG_DBG("JointBus segment scheduled id=%u duration=%lu ms delay=%lu us\r\n",
+          static_cast<unsigned>(segmentId),
+          static_cast<unsigned long>(durationMs),
+          static_cast<unsigned long>(delayUs));
+  return JointBus::CommandResult::ok(
+    JointBus::AckCode::SegmentScheduled, segmentId);
+}
+
+static void jointBusScheduledStartUpdate()
+{
+  if (!jointBusScheduledStart.valid ||
+      static_cast<int32_t>(micros() -
+                           jointBusScheduledStart.deadlineUs) < 0) {
+    return;
+  }
+
+  const uint8_t segmentId = jointBusScheduledStart.segmentId;
+  const uint32_t durationMs = jointBusScheduledStart.durationMs;
+  jointBusScheduledStart.valid = false;
+  const JointBus::CommandResult result =
+    jointBusStartPreparedSegment(segmentId, durationMs);
+  if (result.accepted) {
+    return;
+  }
+
+  LOG_ERR("JointBus scheduled start failed id=%u nack=0x%02X\r\n",
+          static_cast<unsigned>(segmentId),
+          static_cast<unsigned>(result.nack));
+
+  // A duration can become infeasible between SEGMENT_TIMING and the delayed
+  // start if the previous trajectory advances.  This is a recoverable
+  // coordination miss, not a local controller fault.  Stop safely and retain
+  // the prepared slot so the master can abort/re-prepare and retry it.
+  if (result.nack == JointBus::NackCode::DurationInfeasible) {
+    stopMotion();
+    jointBusActiveSegmentValid = false;
+    jointBusActiveSegmentId = JointBus::NO_SEGMENT_ID;
+    jointBusActiveMotionFlags = 0;
+    return;
+  }
+
+  stopMotion();
+  jointCtrl.latchPlannerFault(jointGetPositionDeg());
+  motionMode = MotionMode::FAULT;
+  wsSetState(LedState::FAULT);
+  jointBusClearCoordinatedSegments();
+}
+
+static bool jointBusSegmentTiming(void* context,
+                                  uint8_t segmentId,
+                                  JointBus::SegmentTiming& outTiming)
+{
+  (void)context;
+  if (!jointBusPreparedSegment.valid ||
+      jointBusPreparedSegment.segmentId != segmentId ||
+      jointBusScheduledStart.valid) {
+    return false;
+  }
+
+  if (jointBusPreparedSegment.hold) {
+    outTiming.segmentId = segmentId;
+    outTiming.minimumDurationMs = 0;
+    return true;
+  }
+
+  JointMoveCommand command;
+  command.targetDeg = jointBusCdegToDeg(
+    jointBusPreparedSegment.targetCdeg);
+  command.vmaxDegS = static_cast<float>(
+    jointBusPreparedSegment.vmaxCdegS) * 0.01f;
+  command.amaxDegS2 = static_cast<float>(
+    jointBusPreparedSegment.amaxCdegS2) * 0.01f;
+  float durationS = 0.0f;
+  if (!planner.minimumBlendedDuration(command, durationS) ||
+      !isfinite(durationS) || durationS < 0.0f) {
+    return false;
+  }
+
+  outTiming.segmentId = segmentId;
+  outTiming.minimumDurationMs = durationS <= 0.0f
+    ? 0
+    : static_cast<uint32_t>(ceilf(durationS * 1000.0f));
+  return true;
 }
 
 static JointBus::CommandResult jointBusAbortSegment(void* context, uint8_t segmentId)
@@ -2083,10 +2591,59 @@ static bool jointBusQueueStatus(void* context, JointBus::QueueStatus& outStatus)
   if (jointBusPreparedSegment.valid) {
     outStatus.flags |= JointBus::QQUEUE_PREPARED_VALID;
   }
+  if (jointBusPreparedSegment.valid && jointBusPreparedSegment.hold) {
+    outStatus.flags |= JointBus::QQUEUE_PREPARED_HOLD;
+  }
+  if (jointBusActiveSegmentValid && jointBusActiveSegmentHold) {
+    outStatus.flags |= JointBus::QQUEUE_ACTIVE_HOLD;
+  }
+  if (jointBusScheduledStart.valid) {
+    outStatus.flags |= JointBus::QQUEUE_START_PENDING;
+  }
   if (jointBusActiveSegmentValid && jointBusMotionBusy()) {
     outStatus.flags |= JointBus::QQUEUE_ACTIVE_BUSY;
   }
 
+  return true;
+}
+
+static bool jointBusMotionState(void* context,
+                                JointBus::MotionState& outState)
+{
+  (void)context;
+  jointBusSegmentQueueUpdate();
+
+  outState.activeSegmentId = jointBusActiveSegmentValid
+      ? jointBusActiveSegmentId
+      : JointBus::NO_SEGMENT_ID;
+  outState.flags = jointBusActiveMotionFlags;
+  if (jointBusActiveSegmentValid) {
+    outState.flags |= JointBus::MSTATE_ACTIVE_VALID;
+  }
+  if (jointBusActiveSegmentValid && jointBusActiveSegmentHold) {
+    outState.flags |= JointBus::MSTATE_HOLD_AXIS;
+  }
+  if (jointCtrl.trajectoryActive()) {
+    outState.flags |= JointBus::MSTATE_TRAJECTORY_ACTIVE;
+  } else if (jointBusActiveSegmentValid &&
+             positionMotionCommandBusy(motionLifecycle)) {
+    outState.flags |= JointBus::MSTATE_SERVO_SETTLING;
+  }
+
+  outState.refPosCdeg = jointBusDegToCdeg(jointCtrl.refPos());
+  outState.refVelCdegS = jointBusDegToCdeg(jointCtrl.refVel());
+  outState.refAccDdegS2 = jointBusDegToDdeg(jointCtrl.refAcc());
+  if (jointBusActiveSegmentValid && jointBusActiveSegmentHold) {
+    outState.elapsedMs = std::min<uint32_t>(
+      static_cast<uint32_t>(millis() - jointBusActiveSegmentStartedMs),
+      jointBusActiveSegmentDurationMs);
+    outState.durationMs = jointBusActiveSegmentDurationMs;
+  } else {
+    outState.elapsedMs = jointBusSecondsToMilliseconds(
+        jointCtrl.trajectoryElapsed());
+    outState.durationMs = jointBusSecondsToMilliseconds(
+        jointCtrl.trajectoryDuration());
+  }
   return true;
 }
 
@@ -2167,6 +2724,35 @@ static JointBus::CommandResult jointBusEmergencyStop(void* context)
   return JointBus::CommandResult::ok(JointBus::AckCode::EmergencyStopped);
 }
 
+static JointBus::CommandResult jointBusClearFault(void* context)
+{
+  (void)context;
+  const FaultClearResult result = clearMotionFault();
+  switch (result) {
+    case FaultClearResult::Cleared:
+      return JointBus::CommandResult::ok(JointBus::AckCode::FaultCleared);
+    case FaultClearResult::AlreadyClear:
+      return JointBus::CommandResult::ok(JointBus::AckCode::AlreadyDone);
+    case FaultClearResult::InvalidLimits:
+      return JointBus::CommandResult::fail(
+          JointBus::NackCode::BadPayload,
+          static_cast<uint8_t>(JointBus::JointFault::PlannerError));
+    case FaultClearResult::PositionOutsideLimits:
+      return JointBus::CommandResult::fail(
+          JointBus::NackCode::RejectedByState,
+          static_cast<uint8_t>(JointBus::JointFault::PositionLimit));
+    case FaultClearResult::EncoderUnavailable:
+      return JointBus::CommandResult::fail(
+          JointBus::NackCode::RejectedByState,
+          static_cast<uint8_t>(JointBus::JointFault::EncoderError));
+    case FaultClearResult::DriverUnavailable:
+      return JointBus::CommandResult::fail(
+          JointBus::NackCode::RejectedByState,
+          static_cast<uint8_t>(JointBus::JointFault::DriverError));
+  }
+  return JointBus::CommandResult::fail(JointBus::NackCode::InternalError);
+}
+
 static JointBus::CommandResult jointBusReboot(void* context, uint16_t magic)
 {
   (void)context;
@@ -2191,14 +2777,14 @@ static JointBus::JointState jointBusCurrentState()
   }
 
   if (motionMode == MotionMode::POSITION) {
-    // In servo-hold mode the position controller intentionally remains armed
-    // after the target has been reached, so it can correct small disturbances.
-    // This must not be reported as SETTLING/BUSY to the external JointBus
-    // master: once isSettled() is true, the commanded move is complete.
-    if (jointCtrl.isSettled()) {
-      return JointBus::JointState::Holding;
+    switch (positionLifecycleExternalState(motionLifecycle, false)) {
+      case PositionLifecycleExternalState::Moving:
+        return JointBus::JointState::Moving;
+      case PositionLifecycleExternalState::Holding:
+        return JointBus::JointState::Holding;
+      case PositionLifecycleExternalState::Fault:
+        return JointBus::JointState::Fault;
     }
-    return JointBus::JointState::Moving;
   }
 
   if (motionMode == MotionMode::CALIBRATION ||
@@ -2212,7 +2798,8 @@ static JointBus::JointState jointBusCurrentState()
   }
 
   const Tmc2209Driver::Status driverStatus = tmc.status();
-  if (servoHoldActive || driverStatus == Tmc2209Driver::Status::Enabled) {
+  if (motionLifecycle.servoHoldActive ||
+      driverStatus == Tmc2209Driver::Status::Enabled) {
     return JointBus::JointState::Holding;
   }
 
@@ -2263,20 +2850,19 @@ static bool jointBusQuickStatus(void* context, uint8_t& outQuickStatus)
 
   uint8_t flags = 0;
   const bool fault = jointHasFault() || motionMode == MotionMode::FAULT || !encoderOk || !tmcReady;
-  const bool positionCommandBusy = (motionMode == MotionMode::POSITION) && !jointCtrl.isSettled();
-  const bool busy = positionCommandBusy ||
-                    motionMode == MotionMode::PARK ||
-                    motionMode == MotionMode::CALIBRATION ||
-                    motionMode == MotionMode::VELOCITY_TEST ||
-                    motionMode == MotionMode::STEP_TEST;
+  const MotionCommandExternalStatus commandStatus =
+      motionCommandExternalStatus(
+          motionLifecycle,
+          nonPositionOperationBusy(),
+          fault);
 
-  if (busy) {
+  if (commandStatus.busy) {
     flags |= JointBus::QSTAT_BUSY;
   }
-  if (!busy && !fault) {
+  if (commandStatus.done) {
     flags |= JointBus::QSTAT_DONE;
   }
-  if (fault) {
+  if (commandStatus.fault) {
     flags |= JointBus::QSTAT_FAULT;
   }
   if (tmc.status() == Tmc2209Driver::Status::Enabled) {
@@ -2323,14 +2909,19 @@ static void setupJointBusHooks()
   hooks.move = jointBusMove;
   hooks.moveb = jointBusMoveB;
   hooks.prepareMoveB = jointBusPrepareMoveB;
+  hooks.prepareHold = jointBusPrepareHold;
   hooks.startSegment = jointBusStartSegment;
+  hooks.scheduleSegment = jointBusScheduleSegment;
   hooks.abortSegment = jointBusAbortSegment;
   hooks.queueStatus = jointBusQueueStatus;
+  hooks.motionState = jointBusMotionState;
+  hooks.segmentTiming = jointBusSegmentTiming;
   hooks.home = jointBusHome;
   hooks.zero = jointBusZero;
   hooks.park = jointBusPark;
   hooks.stop = jointBusStop;
   hooks.emergencyStop = jointBusEmergencyStop;
+  hooks.clearFault = jointBusClearFault;
   hooks.reboot = jointBusReboot;
   hooks.status = jointBusStatus;
   hooks.quickStatus = jointBusQuickStatus;
@@ -2363,6 +2954,7 @@ static float directedEncoderDistance(float currentDeg, float targetDeg, int dire
 
 static void abortPark(const char* reason)
 {
+  clearPositionLifecycleState();
   setMotorVelocityDegPerSecond(0.0f);
   tmc.stopInternalMotion();
   tmc.disableDriver(false);
@@ -2449,6 +3041,7 @@ bool startPark()
 
 static void completePark()
 {
+  clearPositionLifecycleState();
   const float parkPosition = readParamFloatOrDefault("pkpos", PARK_DEFAULT_JOINT_POSITION_DEG);
   const float absoluteJointAtPark = encoderZero + parkPosition;
 
@@ -2581,6 +3174,7 @@ void servoUpdate()
   encoderDeg = encoder.lastDegrees();
 
   if (!encoderOk) {
+    clearPositionLifecycleState();
     setMotorVelocityDegPerSecond(0.0f);
     tmc.disableDriver(false);
     motionMode = MotionMode::FAULT;
@@ -2610,12 +3204,14 @@ void servoUpdate()
   const float vCmdDegS = jointCtrl.update(currentZeroedDeg, dt);
 
   if (!setMotorVelocityDegPerSecond(vCmdDegS)) {
+    clearPositionLifecycleState();
     motionMode = MotionMode::FAULT;
     wsSetState(LedState::FAULT);
     return;
   }
 
   if (jointCtrl.fault()) {
+    clearPositionLifecycleState();
     setMotorVelocityDegPerSecond(0.0f);
     tmc.disableDriver(false);
     motionMode = MotionMode::FAULT;
@@ -2624,25 +3220,21 @@ void servoUpdate()
     return;
   }
 
-  if (jointCtrl.isSettled()) {
+  const bool settledNow = jointCtrl.isSettled();
+  const bool inDeadband = jointCtrl.inDeadband();
+  const bool holdEnabled = servoHoldEnabled();
+  const MotionLifecycleEvent lifecycleEvent =
+    updateMotionLifecycle(motionLifecycle,
+                          settledNow,
+                          holdEnabled,
+                          inDeadband);
+
+  if (lifecycleEvent == MotionLifecycleEvent::CommandCompletedHold) {
     wsSetState(LedState::READY);
-
-    if (servoHoldEnabled()) {
-      if (!servoHoldActive) {
-        servoHoldActive = true;
-        LOG_NFO("Move complete zeroed=%.3f deg servo-hold active\r\n",
-                jointGetPositionDeg());
-      }
-      // Servo hold keeps applying PID correction after the analytic profile.
-      // Only a latched configured deadband is allowed to suppress the command.
-      if (jointCtrl.inDeadband()) {
-        setMotorVelocityDegPerSecond(0.0f);
-        tmc.stopInternalMotion();
-        servoLastCmdDegS = 0.0f;
-      }
-      return;
-    }
-
+    LOG_NFO("Move complete zeroed=%.3f deg servo-hold active\r\n",
+            jointGetPositionDeg());
+  } else if (lifecycleEvent ==
+             MotionLifecycleEvent::CommandCompletedNoHold) {
     setMotorVelocityDegPerSecond(0.0f);
     tmc.stopInternalMotion();
     servoLastCmdDegS = 0.0f;
@@ -2652,12 +3244,43 @@ void servoUpdate()
     }
 
     motionMode = MotionMode::IDLE;
-    servoHoldActive = false;
+    motionLifecycle.disableServoHold();
+    wsSetState(LedState::READY);
     LOG_NFO("Move complete zeroed=%.3f deg motor=%s\r\n",
             jointGetPositionDeg(),
             motorHoldEnabled() ? "hold" : "disabled");
-  } else if (!servoHoldEnabled()) {
-    servoHoldActive = false;
+    return;
+  } else if (lifecycleEvent ==
+             MotionLifecycleEvent::ServoCorrectionStarted) {
+    LOG_NFO("Servo correction started error=%.3f deg cmd=%.3f deg/s\r\n",
+            jointCtrl.target() - jointGetPositionDeg(),
+            servoLastCmdDegS);
+  } else if (lifecycleEvent ==
+             MotionLifecycleEvent::ServoCorrectionCompleted) {
+    LOG_NFO("Servo correction complete zeroed=%.3f deg error=%.3f deg\r\n",
+            jointGetPositionDeg(),
+            jointCtrl.target() - jointGetPositionDeg());
+  }
+
+  if (motionLifecycle.servoHoldActive && holdEnabled) {
+    if (inDeadband) {
+      setMotorVelocityDegPerSecond(0.0f);
+      tmc.stopInternalMotion();
+      servoLastCmdDegS = 0.0f;
+    }
+
+    if (motionLifecycle.servoCorrectionActive) {
+      const uint32_t nowMs = millis();
+      if (motionLifecycle.lastServoCorrectionDebugMs == 0 ||
+          static_cast<uint32_t>(
+            nowMs - motionLifecycle.lastServoCorrectionDebugMs) >= 250U) {
+        motionLifecycle.lastServoCorrectionDebugMs = nowMs;
+        LOG_DBG("Servo correction error=%.3f deg meas_vel=%.3f deg/s cmd=%.3f deg/s\r\n",
+                jointCtrl.target() - jointGetPositionDeg(),
+                jointGetMeasuredVelocityDegS(),
+                servoLastCmdDegS);
+      }
+    }
   }
 }
 
@@ -2677,6 +3300,11 @@ void setup()
   delay(500);
 
   Serial.println();
+
+  // Load and apply persistent loglvl before normal boot diagnostics. If NVS
+  // initialization itself fails, the compile-time logger level reports it.
+  paramsInit();
+
   #if MAGNETIC_ENCODER_TYPE == MAGNETIC_ENCODER_AS5048A
   LOG_NFO("PlanetJoint ESP32-S3 - AS5048A analytic quintic S-curve build\r\n");
 #else
@@ -2684,10 +3312,9 @@ void setup()
 #endif
   LOG_NFO("USB CDC console ready\r\n");
 
-  paramsInit();
-
   setupJointBusHooks();
   jointBus.setAddress(readJointBusAddressFromParams());
+  SerialJointBus.setRxBufferSize(JOINTBUS_RX_BUFFER_SIZE);
   if (jointBus.begin(JOINTBUS_BAUD)) {
     jointBus.flushRx();
     LOG_NFO("JointBus slave initialized on UART0, baud=%lu, addr=%u, RTS/DE GPIO=%d, hw_rs485=%u\r\n",
@@ -2701,6 +3328,7 @@ void setup()
 
   if (!tmcInit()) {
     LOG_ERR("Failed to initialize TMC2209 driver\r\n");
+    clearPositionLifecycleState();
     wsSetState(LedState::FAULT);
     motionMode = MotionMode::FAULT;
   } else {
@@ -2731,6 +3359,7 @@ void setup()
               startupPositionDeg);
     }
   } else {
+    clearPositionLifecycleState();
     wsSetState(LedState::ENCODER_ERROR);
     motionMode = MotionMode::FAULT;
   }
@@ -2760,6 +3389,7 @@ void loop()
 
   console.update();
   jointBus.update();
+  jointBusScheduledStartUpdate();
 
   if (jointBusRebootPending && static_cast<uint32_t>(now - jointBusRebootRequestedMs) >= 150U) {
     Serial.flush();

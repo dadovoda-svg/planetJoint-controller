@@ -6,6 +6,7 @@
 #include <esp_system.h>
 
 #include "JointMotionApi.h"
+#include "FaultRecovery.h"
 
 extern bool toggleTrace();
 extern bool setTraceEnabled(bool enabled);
@@ -19,7 +20,9 @@ extern float getStdegCalibrationDefaultTargetDeg();
 extern bool setZero();
 extern bool startPark();
 extern void stopMotion();
+extern FaultClearResult clearMotionFault();
 extern void printServoStatus();
+extern void printJointBusStats(bool reset);
 
 const SerialConsole::Command SerialConsole::_commands[] = {
   {
@@ -137,10 +140,22 @@ const SerialConsole::Command SerialConsole::_commands[] = {
     &SerialConsole::cmdStop
   },
   {
+    "clearfault",
+    "clearfault",
+    "Clear a fault after all safety conditions have recovered",
+    &SerialConsole::cmdClearFault
+  },
+  {
     "servo",
     "servo",
     "Print position controller status",
     &SerialConsole::cmdServo
+  },
+  {
+    "jbstats",
+    "jbstats [reset]",
+    "Print or reset JointBus RX and broadcast diagnostics",
+    &SerialConsole::cmdJointBusStats
   }
 };
 
@@ -868,6 +883,26 @@ void SerialConsole::cmdStop(int argc, char* argv[])
   _serial.println("OK stopped");
 }
 
+void SerialConsole::cmdClearFault(int argc, char* argv[])
+{
+  (void)argv;
+
+  if (argc != 1) {
+    _serial.println("ERR usage: clearfault");
+    return;
+  }
+
+  const FaultClearResult result = clearMotionFault();
+  if (result == FaultClearResult::Cleared) {
+    _serial.println("OK fault cleared; motor remains disabled");
+  } else if (result == FaultClearResult::AlreadyClear) {
+    _serial.println("OK fault already clear; motor remains disabled");
+  } else {
+    _serial.print("ERR fault not cleared: ");
+    _serial.println(faultClearResultName(result));
+  }
+}
+
 void SerialConsole::cmdServo(int argc, char* argv[])
 {
   (void)argv;
@@ -878,6 +913,19 @@ void SerialConsole::cmdServo(int argc, char* argv[])
   }
 
   printServoStatus();
+}
+
+void SerialConsole::cmdJointBusStats(int argc, char* argv[])
+{
+  if (argc == 1) {
+    printJointBusStats(false);
+    return;
+  }
+  if (argc == 2 && strcmp(argv[1], "reset") == 0) {
+    printJointBusStats(true);
+    return;
+  }
+  _serial.println("ERR usage: jbstats [reset]");
 }
 
 bool SerialConsole::parseKeyValueLine(

@@ -40,6 +40,7 @@ enum class JointMoveResult : uint8_t {
   EncoderUnavailable,
   InvalidCommand,
   InvalidLimits,
+  DurationInfeasible,
   DriverError
 };
 
@@ -73,6 +74,7 @@ public:
   virtual MotionMode motionMode() const = 0;
   virtual bool encoderReady() const = 0;
   virtual bool driverEnabled() const = 0;
+  virtual bool positionCommandActive() const = 0;
 
   virtual void stopMotion() = 0;
   virtual bool ensureDriverEnabled() = 0;
@@ -89,6 +91,15 @@ public:
                                    bool clearFault) = 0;
   virtual void restartController(float currentDeg, float targetDeg) = 0;
   virtual bool blendControllerTarget(float targetDeg) = 0;
+  virtual bool restartControllerTimed(float currentDeg,
+                                      float targetDeg,
+                                      float durationS) = 0;
+  virtual bool blendControllerTargetTimed(float targetDeg,
+                                          float durationS) = 0;
+  virtual bool minimumCoordinatedDuration(float targetDeg,
+                                          float vmaxDegS,
+                                          float amaxDegS2,
+                                          float& durationS) const = 0;
   virtual void beginPositionMotion(float targetDeg) = 0;
 };
 
@@ -102,6 +113,10 @@ public:
 
   JointMoveOutcome moveToBlended(const JointMoveCommand& cmd);
   JointMoveOutcome moveToBlended(float targetDeg, float vmaxDegS, float amaxDegS2);
+  JointMoveOutcome moveToBlendedTimed(const JointMoveCommand& cmd,
+                                      float durationS);
+  bool minimumBlendedDuration(const JointMoveCommand& cmd,
+                              float& durationS) const;
 
 private:
   enum class RetargetMode : uint8_t { Restart, BlendIfSafe };
@@ -111,7 +126,9 @@ private:
     JointTargetAdjustment targetAdjustment = JointTargetAdjustment::None;
   };
 
-  JointMoveOutcome executeMove(const JointMoveCommand& cmd, RetargetMode mode);
+  JointMoveOutcome executeMove(const JointMoveCommand& cmd,
+                               RetargetMode mode,
+                               float fixedDurationS = 0.0f);
   JointMoveResult validateAndPrepare(const JointMoveCommand& cmd, PreparedMove& prepared) const;
   JointMoveOutcome makeOutcome(JointMoveResult result,
                                const JointMoveCommand& requested,

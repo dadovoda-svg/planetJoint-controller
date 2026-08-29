@@ -26,6 +26,28 @@ For the single-call motion configuration query (`jmin`, `jmax`, `vmax`, `amax`),
 README_JOINTBUS_MOTION_CONFIG.md
 ```
 
+For analytic trajectory state and the actual-duration watchdog handshake, see:
+
+```text
+README_JOINTBUS_MOTION_STATE.md
+```
+
+For common-duration negotiation and delayed broadcast start, see:
+
+```text
+README_JOINTBUS_TIMED_SEGMENTS.md
+```
+
+The coordinated protocol also provides `PREPARE_HOLD` for axes whose target
+does not change. HOLD participates in the shared segment timing without
+replacing the existing PID target or creating a zero-length polynomial.
+
+For safe recovery from a latched fault, see:
+
+```text
+README_JOINTBUS_CLEAR_FAULT.md
+```
+
 For RS485 speed considerations, see:
 
 ```text

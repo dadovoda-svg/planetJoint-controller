@@ -73,8 +73,10 @@ private:
   void cmdMove(int argc, char* argv[]);
   void cmdMoveBlended(int argc, char* argv[]);
   void cmdStop(int argc, char* argv[]);
+  void cmdClearFault(int argc, char* argv[]);
   void cmdServo(int argc, char* argv[]);
   void cmdReboot(int argc, char* argv[]);
+  void cmdJointBusStats(int argc, char* argv[]);
 
   bool parseKeyValueLine(
     const char* line,

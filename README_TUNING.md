@@ -41,6 +41,10 @@ export, remove its `sct=<value>` line.
 | `dbvel` | deadband velocity threshold, deg/s | `0.20` |
 | `vtau` | measured velocity low-pass filter tau, seconds | `0.050` |
 
+`dbent` and `dbvel` qualify entry into deadband. Once deadband is latched,
+`dbext` alone controls its positional exit. This prevents encoder quantization
+from releasing hold inside the configured exit threshold.
+
 Existing motor/driver parameters are still present:
 
 | Key | Meaning |

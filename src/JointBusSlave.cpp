@@ -25,6 +25,17 @@ bool Slave::begin(uint32_t baud, uint32_t config, int8_t rxPin, int8_t txPin) {
     }
 
     _serial.begin(baud, config, rxPin, txPin);
+    _serial.onReceiveError([this](hardwareSerial_error_t error) {
+        ++_uartErrors;
+        switch (error) {
+        case UART_BUFFER_FULL_ERROR: ++_uartBufferFullErrors; break;
+        case UART_FIFO_OVF_ERROR: ++_uartFifoOverflowErrors; break;
+        case UART_FRAME_ERROR: ++_uartFrameErrors; break;
+        case UART_PARITY_ERROR: ++_uartParityErrors; break;
+        case UART_BREAK_ERROR: ++_uartBreakErrors; break;
+        default: break;
+        }
+    });
 
     if (_rs485RtsPin < 0) {
         return true;
@@ -48,6 +59,27 @@ bool Slave::begin(uint32_t baud, uint32_t config, int8_t rxPin, int8_t txPin) {
 
 void Slave::setAddress(uint8_t address) {
     _address = address & 0x0F;
+}
+
+void Slave::resetDiagnostics() {
+    _rxFrames = 0;
+    _txFrames = 0;
+    _crcErrors = 0;
+    _lengthErrors = 0;
+    _versionErrors = 0;
+    _ignoredFrames = 0;
+    _broadcastFrames = 0;
+    _broadcastStartFrames = 0;
+    _broadcastStartAccepted = 0;
+    _broadcastStartRejected = 0;
+    _lastBroadcastStartSeq = 0;
+    _lastBroadcastStartNack = NackCode::InternalError;
+    _uartErrors = 0;
+    _uartBufferFullErrors = 0;
+    _uartFifoOverflowErrors = 0;
+    _uartFrameErrors = 0;
+    _uartParityErrors = 0;
+    _uartBreakErrors = 0;
 }
 
 void Slave::flushRx() {
@@ -89,6 +121,9 @@ void Slave::update() {
 
 void Slave::handleFrame(const Frame& request) {
     const bool isBroadcast = (request.address == BROADCAST_ADDRESS);
+    if (isBroadcast) {
+        ++_broadcastFrames;
+    }
 
     if (request.address != _address && !isBroadcast) {
         ++_ignoredFrames;
@@ -139,18 +174,45 @@ void Slave::handleFrame(const Frame& request) {
         break;
     }
 
+    case Command::PrepareHold: {
+        const CommandResult r = dispatchPrepareHold(request);
+        r.accepted ? sendAck(request.seq, r.ack, r.detail) : sendNack(request.seq, r.nack, r.detail);
+        break;
+    }
+
     case Command::StartSegment: {
-        if (request.payloadLen != 1) {
+        if (isBroadcast) {
+            ++_broadcastStartFrames;
+            _lastBroadcastStartSeq = request.seq;
+        }
+        if (request.payloadLen != 1 &&
+            request.payloadLen != TIMED_START_PAYLOAD_SIZE) {
             if (!isBroadcast) {
                 sendNack(request.seq, NackCode::BadLength);
             }
             break;
         }
         const uint8_t segmentId = request.payload[0];
-        const CommandResult r = _hooks.startSegment ? _hooks.startSegment(_hooks.context, segmentId)
-                                                    : CommandResult::fail(NackCode::BadCommand);
+        CommandResult r;
+        if (request.payloadLen == TIMED_START_PAYLOAD_SIZE) {
+            const uint32_t durationMs = getU32LE(&request.payload[1]);
+            const uint32_t delayUs = getU32LE(&request.payload[5]);
+            r = _hooks.scheduleSegment
+                ? _hooks.scheduleSegment(
+                    _hooks.context, segmentId, durationMs, delayUs)
+                : CommandResult::fail(NackCode::BadCommand);
+        } else {
+            r = _hooks.startSegment
+                ? _hooks.startSegment(_hooks.context, segmentId)
+                : CommandResult::fail(NackCode::BadCommand);
+        }
         if (!isBroadcast) {
             r.accepted ? sendAck(request.seq, r.ack, r.detail) : sendNack(request.seq, r.nack, r.detail);
+        } else if (r.accepted) {
+            ++_broadcastStartAccepted;
+        } else {
+            ++_broadcastStartRejected;
+            _lastBroadcastStartNack = r.nack;
         }
         break;
     }
@@ -181,6 +243,37 @@ void Slave::handleFrame(const Frame& request) {
             sendQueueStatus(request.seq, status);
         } else {
             sendNack(request.seq, NackCode::InternalError);
+        }
+        break;
+    }
+
+    case Command::MotionState: {
+        if (request.payloadLen != 0) {
+            sendNack(request.seq, NackCode::BadLength);
+            break;
+        }
+        MotionState state;
+        if (_hooks.motionState &&
+            _hooks.motionState(_hooks.context, state)) {
+            sendMotionState(request.seq, state);
+        } else {
+            sendNack(request.seq, NackCode::InternalError);
+        }
+        break;
+    }
+
+    case Command::SegmentTiming: {
+        if (request.payloadLen != 1) {
+            sendNack(request.seq, NackCode::BadLength);
+            break;
+        }
+        SegmentTiming timing;
+        if (_hooks.segmentTiming &&
+            _hooks.segmentTiming(
+                _hooks.context, request.payload[0], timing)) {
+            sendSegmentTiming(request.seq, timing);
+        } else {
+            sendNack(request.seq, NackCode::RejectedByState);
         }
         break;
     }
@@ -241,6 +334,19 @@ void Slave::handleFrame(const Frame& request) {
         if (!isBroadcast) {
             r.accepted ? sendAck(request.seq, r.ack, r.detail) : sendNack(request.seq, r.nack, r.detail);
         }
+        break;
+    }
+
+    case Command::ClearFault: {
+        if (request.payloadLen != 0) {
+            sendNack(request.seq, NackCode::BadLength);
+            break;
+        }
+        const CommandResult r = _hooks.clearFault
+            ? _hooks.clearFault(_hooks.context)
+            : CommandResult::fail(NackCode::BadCommand);
+        r.accepted ? sendAck(request.seq, r.ack, r.detail)
+                   : sendNack(request.seq, r.nack, r.detail);
         break;
     }
 
@@ -360,6 +466,19 @@ CommandResult Slave::dispatchPrepareMoveB(const Frame& request) {
         : CommandResult::fail(NackCode::BadCommand);
 }
 
+CommandResult Slave::dispatchPrepareHold(const Frame& request) {
+    if (request.payloadLen != 1) {
+        return CommandResult::fail(NackCode::BadLength);
+    }
+    const uint8_t segmentId = request.payload[0];
+    if (segmentId == NO_SEGMENT_ID) {
+        return CommandResult::fail(NackCode::BadPayload);
+    }
+    return _hooks.prepareHold
+        ? _hooks.prepareHold(_hooks.context, segmentId)
+        : CommandResult::fail(NackCode::BadCommand);
+}
+
 void Slave::sendAck(uint8_t seq, AckCode code, uint8_t detail) {
     Frame f;
     f.address = _address;
@@ -424,6 +543,28 @@ void Slave::sendQueueStatus(uint8_t seq, const QueueStatus& status) {
     f.payload[2] = status.activeSegmentId;
     f.payload[3] = status.preparedSegmentId;
     f.payload[4] = status.flags;
+    sendFrame(f);
+}
+
+void Slave::sendMotionState(uint8_t seq, const MotionState& state) {
+    Frame f;
+    f.address = _address;
+    f.type = FrameType::Response;
+    f.seq = seq;
+    f.command = Command::MotionStateRsp;
+    f.payloadLen = MOTION_STATE_PAYLOAD_SIZE;
+    encodeMotionStatePayload(state, f.payload);
+    sendFrame(f);
+}
+
+void Slave::sendSegmentTiming(uint8_t seq, const SegmentTiming& timing) {
+    Frame f;
+    f.address = _address;
+    f.type = FrameType::Response;
+    f.seq = seq;
+    f.command = Command::SegmentTimingRsp;
+    f.payloadLen = SEGMENT_TIMING_PAYLOAD_SIZE;
+    encodeSegmentTimingPayload(timing, f.payload);
     sendFrame(f);
 }
 

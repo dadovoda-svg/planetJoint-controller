@@ -254,6 +254,7 @@ Trace lines are separate from logger lines. Trace lines remain plotter-friendly 
 | `move <target_deg> <vmax_deg_s> <amax_deg_s2>` | Planner-style move with explicit motion limits |
 | `moveb <target_deg> <vmax_deg_s> <amax_deg_s2>` | Planner-style smart retarget move |
 | `stop` | Stop all motion and disable the motor bridge |
+| `clearfault` | Clear a latched fault after fresh safety validation |
 | `servo` | Print controller status |
 | `trace` | Toggle trace output using the current trace mode |
 | `trace on` | Enable trace output |

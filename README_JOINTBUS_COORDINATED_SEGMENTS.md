@@ -23,6 +23,12 @@ This is enough for first coordinated blending tests:
 
 The implementation intentionally avoids deeper queues for now. The protocol exposes queue status fields so a future firmware can increase the internal depth without changing the external model too much.
 
+Before broadcast start, the matching arm master obtains the minimum admissible
+duration from every slave through `SEGMENT_TIMING`, selects one guarded common
+duration, and sends it with a 10 ms relative start delay. After start it
+verifies the active segment, MOVE/HOLD mode, and installed duration through
+`MOTION_STATE`.
+
 ## Broadcast address
 
 Address `15` is reserved as the JointBus broadcast address:
@@ -53,7 +59,12 @@ For this reason, normal nodes should use addresses `0..14`. The current six-axis
 0x0C ABORT_SEGMENT
 0x0D QUEUE_STATUS
 0x0E EMERGENCY_STOP
+0x10 MOTION_STATE
+0x11 SEGMENT_TIMING
+0x13 PREPARE_HOLD
 0x8D QUEUE_STATUS_RSP
+0x90 MOTION_STATE_RSP
+0x91 SEGMENT_TIMING_RSP
 ```
 
 Existing commands remain available:
@@ -97,6 +108,28 @@ NACK BUSY                 park/calibration/test mode is active
 
 The prepared target is clipped locally to `jmin/jmax` exactly like normal `MOVE/MOVEB` commands.
 
+## PREPARE_HOLD
+
+Addressed command. Payload is the one-byte segment ID. It reserves the same
+prepared slot as `PREPARE_MOVEB`, but deliberately does not replace the
+controller target or create a polynomial:
+
+```text
+uint8_t segment_id        0..254, 255 is reserved
+```
+
+Success returns `ACK HOLD_PREPARED`. On timed start the node participates in
+the common segment ID and duration while preserving its existing PID target.
+This is important when the preceding blended segment is still settling: HOLD
+does not interrupt it, and the logical active slot is released only after both
+the common duration and the underlying motion have completed.
+
+The matching arm planner selects HOLD when the new target is within an
+inclusive `±2 cdeg` (`±0.02 deg`) deadband around the planned start. It snaps
+the local logical target back to that start; larger deltas remain normal
+`PREPARE_MOVEB` segments. This selection policy belongs to the master; the
+slave executes the explicit command it receives.
+
 ## START_SEGMENT
 
 Payload, 1 byte:
@@ -117,6 +150,9 @@ Each slave starts its prepared segment only if the prepared segment id matches t
 Addressed `START_SEGMENT` is also supported for debugging and returns `ACK` / `NACK`. The arm-level planner should use broadcast start.
 
 Internally, the segment starts through the existing `jointMoveToBlended()` path. This keeps the current per-joint blending behavior.
+
+The extended nine-byte form adds a common duration and a relative start delay.
+See `README_JOINTBUS_TIMED_SEGMENTS.md`.
 
 ## ABORT_SEGMENT
 
@@ -159,9 +195,25 @@ Queue flags:
 bit 0 ACTIVE_VALID
 bit 1 PREPARED_VALID
 bit 2 ACTIVE_BUSY
+bit 3 START_PENDING
+bit 4 PREPARED_HOLD
+bit 5 ACTIVE_HOLD
 ```
 
 This is intentionally separate from `QSTATUS`: compact motion polling stays very small, while queue details are available when needed.
+
+## MOTION_STATE
+
+Addressed command with an empty request payload. Its 16-byte response exposes
+the active segment, analytic reference position/velocity/acceleration,
+polynomial elapsed time and duration, plus blend/safe-replan/settling flags.
+See `README_JOINTBUS_MOTION_STATE.md` for the complete wire format.
+
+## SEGMENT_TIMING
+
+Addressed one-byte segment-ID request. The response returns that ID and the
+minimum currently admissible duration in milliseconds. See
+`README_JOINTBUS_TIMED_SEGMENTS.md` for negotiation and scheduled-start rules.
 
 ## Baud rate selection
 

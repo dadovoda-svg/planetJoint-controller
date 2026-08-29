@@ -56,9 +56,10 @@ When `shold = 1`:
 1. The move reaches the target.
 2. The controller commands zero velocity.
 3. The firmware remains in `POSITION` mode.
-4. The configured `dbent`, `dbext`, and `dbvel` determine when output is
-   suppressed and when correction resumes.
-5. The `stop` command still disables the motor bridge and exits active hold.
+4. The configured `dbent` and `dbvel` qualify when output is suppressed.
+5. Once deadband is latched, correction resumes only when position error
+   exceeds the configured `dbext`.
+6. The `stop` command still disables the motor bridge and exits active hold.
 
 ## Status output
 

@@ -113,6 +113,17 @@ void testLimitsAndShortMove()
   }
 }
 
+void testInvalidPositionLimitsLatchPlannerFault()
+{
+  SCurvePosVelController controller;
+  configure(controller, 3.5f, 9.0f);
+  controller.reset(0.0f);
+  controller.setPositionLimits(10.0f, -10.0f, 0.5f, 1.0f);
+  CHECK(controller.fault());
+  CHECK(controller.faultCode() ==
+        SCurvePosVelController::FaultCode::BadLimits);
+}
+
 void testNoTerminalSnap()
 {
   SCurvePosVelController controller;
@@ -258,6 +269,35 @@ void testDeadbandSettledAndFaultReset()
   CHECK(std::fabs(controller.refPos() - 2.0f) < EPS);
 }
 
+void testDeadbandUsesConfiguredPositionHysteresis()
+{
+  SCurvePosVelController controller;
+  configure(controller, 4.0f, 10.0f);
+  controller.reset(0.0f);
+  controller.setDeadband(0.15f, 0.30f, 0.25f);
+  controller.setTarget(0.0f);
+
+  const float dt = 0.005f;
+  (void)controller.update(0.0f, dt);
+  CHECK(controller.inDeadband());
+
+  // Encoder-sized position jumps imply a velocity far above dbvel, but a
+  // latched deadband must remain active until the configured dbext is crossed.
+  CHECK(std::fabs(controller.update(0.057f, dt)) < EPS);
+  CHECK(controller.inDeadband());
+  CHECK(std::fabs(controller.update(0.299f, dt)) < EPS);
+  CHECK(controller.inDeadband());
+
+  (void)controller.update(0.301f, dt);
+  CHECK(!controller.inDeadband());
+
+  // dbent and dbvel still qualify re-entry.
+  (void)controller.update(0.10f, dt);
+  CHECK(!controller.inDeadband());
+  (void)controller.update(0.10f, dt);
+  CHECK(controller.inDeadband());
+}
+
 uint32_t random_state = 0x12345678u;
 
 float randomUnit()
@@ -352,18 +392,68 @@ void testRandomizedForwardRetargets()
   CHECK(accepted >= 100);
 }
 
+void testFixedDurationProfiles()
+{
+  SCurvePosVelController controller;
+  configure(controller, 10.0f, 20.0f);
+  controller.reset(0.0f);
+
+  float minimumS = 0.0f;
+  CHECK(controller.minimumCoordinatedDuration(
+    30.0f, 10.0f, 20.0f, 0.0f, false, minimumS));
+  CHECK(minimumS > 0.0f);
+
+  const float commonS = minimumS * 1.2f;
+  CHECK(controller.setTargetFromRestWithDuration(
+    0.0f, 30.0f, commonS));
+  CHECK(std::fabs(controller.trajectoryDuration() - commonS) < 1.0e-5f);
+
+  const float oldTarget = controller.target();
+  const float oldDuration = controller.trajectoryDuration();
+  CHECK(!controller.setTargetBlendedWithDuration(60.0f, 0.001f));
+  CHECK(std::fabs(controller.target() - oldTarget) < EPS);
+  CHECK(std::fabs(controller.trajectoryDuration() - oldDuration) < EPS);
+}
+
+void testCoordinatedDurationCoversActiveEndpointFallback()
+{
+  SCurvePosVelController controller;
+  configure(controller, 0.05f, 0.10f);
+  controller.reset(-0.02f);
+  controller.setTarget(0.0f);
+  CHECK(controller.trajectoryActive());
+
+  float minimumS = 0.0f;
+  CHECK(controller.minimumCoordinatedDuration(
+    -0.10f, 0.05f, 0.10f, -0.02f, true, minimumS));
+
+  // The old trajectory may reach 0 deg before the delayed START.  A new
+  // rest-to-rest quintic from there needs 1.875 * 0.1 / 0.05 = 3.75 s.
+  CHECK(minimumS >= 3.749f);
+
+  SCurvePosVelController fallback;
+  configure(fallback, 0.05f, 0.10f);
+  fallback.reset(0.0f);
+  CHECK(fallback.setTargetFromRestWithDuration(
+    0.0f, -0.10f, minimumS));
+}
+
 } // namespace
 
 int main()
 {
   testPositiveAndNegativeRestToRest();
   testLimitsAndShortMove();
+  testInvalidPositionLimitsLatchPlannerFault();
   testNoTerminalSnap();
   testForwardAndReverseBlend();
   testInfeasibleBlendAndActiveLimitUpdate();
   testDeadbandSettledAndFaultReset();
+  testDeadbandUsesConfiguredPositionHysteresis();
   testRandomizedRestProfiles();
   testRandomizedForwardRetargets();
+  testFixedDurationProfiles();
+  testCoordinatedDurationCoversActiveEndpointFallback();
 
   if (failures != 0) {
     std::printf("quintic controller tests failed: %d\n", failures);
