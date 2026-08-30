@@ -51,6 +51,7 @@ enum class Command : uint8_t {
     SegmentTiming = 0x11,
     ClearFault   = 0x12,
     PrepareHold  = 0x13,
+    HoldPosition = 0x14,
     Ping       = 0x7F,
 
     Ack        = 0x80,

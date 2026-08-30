@@ -322,6 +322,19 @@ void Slave::handleFrame(const Frame& request) {
         break;
     }
 
+    case Command::HoldPosition: {
+        if (request.payloadLen != 0) {
+            sendNack(request.seq, NackCode::BadLength);
+            break;
+        }
+        const CommandResult r = _hooks.holdPosition
+            ? _hooks.holdPosition(_hooks.context)
+            : CommandResult::fail(NackCode::BadCommand);
+        r.accepted ? sendAck(request.seq, r.ack, r.detail)
+                   : sendNack(request.seq, r.nack, r.detail);
+        break;
+    }
+
     case Command::EmergencyStop: {
         if (request.payloadLen != 0) {
             if (!isBroadcast) {

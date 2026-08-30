@@ -62,6 +62,7 @@ For this reason, normal nodes should use addresses `0..14`. The current six-axis
 0x10 MOTION_STATE
 0x11 SEGMENT_TIMING
 0x13 PREPARE_HOLD
+0x14 HOLD_POSITION
 0x8D QUEUE_STATUS_RSP
 0x90 MOTION_STATE_RSP
 0x91 SEGMENT_TIMING_RSP
@@ -81,6 +82,12 @@ QSTATUS
 PING
 NOP
 ```
+
+`HOLD_POSITION` is addressed-only and has no payload. It clears active,
+prepared, and scheduled segment state, rebases the controller on the measured
+joint position, and forces active servo hold without latching a fault. This is
+the recoverable timed-start synchronization command; `STOP` retains its
+motor-release behavior.
 
 ## PREPARE_MOVEB
 

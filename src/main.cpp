@@ -2716,6 +2716,44 @@ static JointBus::CommandResult jointBusStop(void* context)
   return JointBus::CommandResult::ok(JointBus::AckCode::Accepted);
 }
 
+static JointBus::CommandResult jointBusHoldPosition(void* context)
+{
+  (void)context;
+
+  if (jointHasFault()) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::FaultActive);
+  }
+  if (!jointReferenced) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::NotHomed);
+  }
+  if (!encoderOk || !tmcReady) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::InternalError);
+  }
+  if (nonPositionOperationBusy()) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::Busy);
+  }
+
+  const float holdPositionDeg = jointGetPositionDeg();
+  if (!ensureDriverEnabled() ||
+      !setMotorVelocityDegPerSecond(0.0f)) {
+    return JointBus::CommandResult::fail(JointBus::NackCode::InternalError);
+  }
+  tmc.stopInternalMotion();
+
+  jointCtrl.reset(holdPositionDeg);
+  jointCtrl.setTarget(holdPositionDeg);
+  servoTargetZeroedDeg = holdPositionDeg;
+  servoLastCmdDegS = 0.0f;
+  lastServoUs = micros();
+  motionLifecycle.beginForcedServoHold();
+  motionMode = MotionMode::POSITION;
+  jointBusClearCoordinatedSegments();
+  wsSetState(LedState::READY);
+
+  LOG_NFO("JointBus hold position zeroed=%.3f deg\r\n", holdPositionDeg);
+  return JointBus::CommandResult::ok(JointBus::AckCode::Accepted);
+}
+
 
 static JointBus::CommandResult jointBusEmergencyStop(void* context)
 {
@@ -2920,6 +2958,7 @@ static void setupJointBusHooks()
   hooks.zero = jointBusZero;
   hooks.park = jointBusPark;
   hooks.stop = jointBusStop;
+  hooks.holdPosition = jointBusHoldPosition;
   hooks.emergencyStop = jointBusEmergencyStop;
   hooks.clearFault = jointBusClearFault;
   hooks.reboot = jointBusReboot;
@@ -3222,7 +3261,8 @@ void servoUpdate()
 
   const bool settledNow = jointCtrl.isSettled();
   const bool inDeadband = jointCtrl.inDeadband();
-  const bool holdEnabled = servoHoldEnabled();
+  const bool holdEnabled =
+      servoHoldEnabled() || motionLifecycle.forcedServoHold;
   const MotionLifecycleEvent lifecycleEvent =
     updateMotionLifecycle(motionLifecycle,
                           settledNow,

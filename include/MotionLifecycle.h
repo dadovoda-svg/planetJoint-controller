@@ -25,6 +25,7 @@ struct MotionCommandExternalStatus {
 struct MotionLifecycleState {
   bool positionCommandActive = false;
   bool servoHoldActive = false;
+  bool forcedServoHold = false;
   bool servoCorrectionArmed = false;
   bool servoCorrectionActive = false;
   uint32_t lastServoCorrectionDebugMs = 0;
@@ -32,6 +33,7 @@ struct MotionLifecycleState {
   void clear() {
     positionCommandActive = false;
     servoHoldActive = false;
+    forcedServoHold = false;
     servoCorrectionArmed = false;
     servoCorrectionActive = false;
     lastServoCorrectionDebugMs = 0;
@@ -40,6 +42,7 @@ struct MotionLifecycleState {
   void beginPositionCommand() {
     positionCommandActive = true;
     servoHoldActive = false;
+    forcedServoHold = false;
     servoCorrectionArmed = false;
     servoCorrectionActive = false;
     lastServoCorrectionDebugMs = 0;
@@ -47,7 +50,17 @@ struct MotionLifecycleState {
 
   void disableServoHold() {
     servoHoldActive = false;
+    forcedServoHold = false;
     servoCorrectionArmed = false;
+    servoCorrectionActive = false;
+    lastServoCorrectionDebugMs = 0;
+  }
+
+  void beginForcedServoHold() {
+    positionCommandActive = false;
+    servoHoldActive = true;
+    forcedServoHold = true;
+    servoCorrectionArmed = true;
     servoCorrectionActive = false;
     lastServoCorrectionDebugMs = 0;
   }

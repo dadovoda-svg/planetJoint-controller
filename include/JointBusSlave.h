@@ -48,6 +48,7 @@ struct SlaveHooks {
     CommandResult (*zero)(void* context) = nullptr;
     CommandResult (*park)(void* context) = nullptr;
     CommandResult (*stop)(void* context) = nullptr;
+    CommandResult (*holdPosition)(void* context) = nullptr;
     CommandResult (*reboot)(void* context, uint16_t magic) = nullptr;
     bool (*status)(void* context, Status& outStatus) = nullptr;
     bool (*quickStatus)(void* context, uint8_t& outQuickStatus) = nullptr;

@@ -76,6 +76,7 @@ save
 | `MOVE` | connected to `jointMoveTo()` |
 | `MOVEB` | connected to `jointMoveToBlended()` |
 | `STOP` | connected to `jointStop()` |
+| `HOLD_POSITION` | cancels coordinated motion and actively holds the measured position |
 | `ZERO` | connected to `setZero()` |
 | `PARK` | connected to `startPark()` |
 | `STATUS` | connected to real joint status |
