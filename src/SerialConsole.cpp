@@ -7,6 +7,7 @@
 
 #include "JointMotionApi.h"
 #include "FaultRecovery.h"
+#include "HobbyServoMotion.h"
 
 extern bool toggleTrace();
 extern bool setTraceEnabled(bool enabled);
@@ -22,6 +23,7 @@ extern bool startPark();
 extern void stopMotion();
 extern FaultClearResult clearMotionFault();
 extern void printServoStatus();
+extern HobbyServoMotion::MoveResult moveHobbyServo(uint16_t position, uint8_t speed);
 extern void printJointBusStats(bool reset);
 
 const SerialConsole::Command SerialConsole::_commands[] = {
@@ -150,6 +152,12 @@ const SerialConsole::Command SerialConsole::_commands[] = {
     "servo",
     "Print position controller status",
     &SerialConsole::cmdServo
+  },
+  {
+    "srvmove",
+    "srvmove <0..999> <1..10>",
+    "Move the GPIO3 hobby servo to a normalized position at the selected speed",
+    &SerialConsole::cmdServoMove
   },
   {
     "jbstats",
@@ -366,6 +374,7 @@ void SerialConsole::processImportLine(char* line)
   _serial.print(key);
   _serial.print("=");
   _serial.println(value, 6);
+  notifyParamSet(key);
 }
 
 
@@ -913,6 +922,48 @@ void SerialConsole::cmdServo(int argc, char* argv[])
   }
 
   printServoStatus();
+}
+
+void SerialConsole::cmdServoMove(int argc, char* argv[])
+{
+  if (argc != 3) {
+    _serial.println("ERR usage: srvmove <0..999> <1..10>");
+    return;
+  }
+
+  char* endPtr = nullptr;
+  const long position = strtol(argv[1], &endPtr, 10);
+  if (endPtr == argv[1] || *endPtr != '\0' || position < 0 || position > 999) {
+    _serial.println("ERR position must be an integer in range 0..999");
+    return;
+  }
+
+  endPtr = nullptr;
+  const long speed = strtol(argv[2], &endPtr, 10);
+  if (endPtr == argv[2] || *endPtr != '\0' || speed < 1 || speed > 10) {
+    _serial.println("ERR speed must be an integer in range 1..10");
+    return;
+  }
+
+  const HobbyServoMotion::MoveResult result = moveHobbyServo(
+      static_cast<uint16_t>(position), static_cast<uint8_t>(speed));
+  switch (result) {
+    case HobbyServoMotion::MoveResult::Accepted:
+      _serial.println("OK hobby servo move accepted");
+      return;
+    case HobbyServoMotion::MoveResult::Disabled:
+      _serial.println("ERR hobby servo is disabled; require servo=1 and pkdir=0");
+      return;
+    case HobbyServoMotion::MoveResult::InvalidArgument:
+      _serial.println("ERR invalid hobby servo command");
+      return;
+    case HobbyServoMotion::MoveResult::InvalidConfig:
+      _serial.println("ERR invalid srvmin/srvzero/srvmax configuration");
+      return;
+    case HobbyServoMotion::MoveResult::PwmError:
+      _serial.println("ERR hobby servo PWM write failed");
+      return;
+  }
 }
 
 void SerialConsole::cmdJointBusStats(int argc, char* argv[])

@@ -22,6 +22,7 @@ using MagneticEncoder = AS5600;
 #include "JointMotionApi.h"
 #include "MotionLifecycle.h"
 #include "FaultRecovery.h"
+#include "HobbyServoMotion.h"
 #include "logger.h"
 #include "JointBusSlave.h"
 
@@ -114,6 +115,12 @@ static constexpr float PARK_ENCODER_TOLERANCE_DEG = 0.15f;
 static constexpr uint32_t PARK_RELEASE_TIMEOUT_MS = 60000;
 static constexpr uint32_t PARK_SEARCH_TIMEOUT_MS = 120000;
 static constexpr uint32_t PARK_ALIGN_TIMEOUT_MS = 60000;
+
+// GPIO3 can drive a standard 50 Hz hobby servo only in absolute-encoder mode
+// (pkdir=0). Persisted pulse values are expressed directly in microseconds.
+static constexpr uint32_t HOBBY_SERVO_ZERO_DEFAULT_US = 1500U;
+static constexpr uint32_t HOBBY_SERVO_MIN_DEFAULT_US = 1000U;
+static constexpr uint32_t HOBBY_SERVO_MAX_DEFAULT_US = 2000U;
 
 // ===================== JOINTBUS HOME COMMAND =====================
 
@@ -322,6 +329,21 @@ static bool jointBusRebootPending = false;
 static uint32_t jointBusRebootRequestedMs = 0;
 static float activeMotorDirectionSign = DEFAULT_MOTOR_DIRECTION_SIGN;
 
+struct HobbyServoState {
+  bool attached = false;
+  bool moving = false;
+  uint32_t zeroUs = HOBBY_SERVO_ZERO_DEFAULT_US;
+  uint32_t minUs = HOBBY_SERVO_MIN_DEFAULT_US;
+  uint32_t maxUs = HOBBY_SERVO_MAX_DEFAULT_US;
+  uint32_t currentUs = HOBBY_SERVO_ZERO_DEFAULT_US;
+  uint32_t startUs = HOBBY_SERVO_ZERO_DEFAULT_US;
+  uint32_t targetUs = HOBBY_SERVO_ZERO_DEFAULT_US;
+  uint32_t startedMs = 0;
+  uint32_t durationMs = 0;
+};
+
+static HobbyServoState hobbyServo;
+
 struct JointBusPreparedSegment {
   bool valid = false;
   bool hold = false;
@@ -362,10 +384,13 @@ static void setupJointBusHooks();
 static uint8_t readJointBusAddressFromParams();
 static bool applyMotorDirectionFromParams(bool stopBeforeApply);
 static bool applyEncoderDirectionFromParams(bool preserveZeroedPosition);
+static bool applyHobbyServoParams();
+static void hobbyServoUpdate(uint32_t nowMs);
 static void clearPositionLifecycleState();
 bool setMotorVelocityDegPerSecond(float degreesPerSecond);
 bool startPark();
 FaultClearResult clearMotionFault();
+HobbyServoMotion::MoveResult moveHobbyServo(uint16_t position, uint8_t speed);
 
 // ===================== PARAMS =====================
 
@@ -692,6 +717,185 @@ static void applyLogLevelFromParams(bool announce)
   }
 }
 
+static bool readHobbyServoPulseParam(const char* key, uint32_t& out)
+{
+  float value = 0.0f;
+  if (!params.get(key, value) || !isfinite(value) || value < 1.0f ||
+      value >= static_cast<float>(HobbyServoMotion::PWM_PERIOD_US) ||
+      floorf(value) != value) {
+    return false;
+  }
+  out = static_cast<uint32_t>(value);
+  return true;
+}
+
+static void detachHobbyServo()
+{
+  if (hobbyServo.attached) {
+    ledcDetach(PIN_PARK_SENSOR);
+  }
+  hobbyServo.attached = false;
+  hobbyServo.moving = false;
+  pinMode(PIN_PARK_SENSOR, INPUT_PULLUP);
+}
+
+static bool writeHobbyServoPulse(uint32_t pulseUs)
+{
+  return hobbyServo.attached &&
+         ledcWrite(PIN_PARK_SENSOR, HobbyServoMotion::pulseUsToDuty(pulseUs));
+}
+
+static bool applyHobbyServoParams()
+{
+  float enabledValue = 0.0f;
+  const float parkDirection = readParamFloatOrDefault("pkdir", 0.0f);
+  if (!params.get("servo", enabledValue) || !isfinite(enabledValue) ||
+      (enabledValue != 0.0f && enabledValue != 1.0f)) {
+    params.set("servo", 0.0f);
+    detachHobbyServo();
+    LOG_ERR("Invalid servo value rejected: use 0 or 1\r\n");
+    return false;
+  }
+
+  if (enabledValue == 0.0f) {
+    detachHobbyServo();
+    LOG_NFO("GPIO3 hobby servo output disabled\r\n");
+    return true;
+  }
+
+  if (parkDirection != 0.0f) {
+    params.set("servo", 0.0f);
+    detachHobbyServo();
+    LOG_ERR("Hobby servo rejected: servo=1 requires pkdir=0; servo reset to 0 in RAM\r\n");
+    return false;
+  }
+
+  uint32_t zeroUs = 0;
+  uint32_t minUs = 0;
+  uint32_t maxUs = 0;
+  if (!readHobbyServoPulseParam("srvzero", zeroUs) ||
+      !readHobbyServoPulseParam("srvmin", minUs) ||
+      !readHobbyServoPulseParam("srvmax", maxUs) ||
+      !HobbyServoMotion::validConfig(zeroUs, minUs, maxUs)) {
+    params.set("servo", 0.0f);
+    detachHobbyServo();
+    LOG_ERR("Hobby servo rejected: require integer microseconds with 0 < srvmin <= srvzero <= srvmax < %lu; servo reset to 0 in RAM\r\n",
+            static_cast<unsigned long>(HobbyServoMotion::PWM_PERIOD_US));
+    return false;
+  }
+
+  const bool firstAttach = !hobbyServo.attached;
+  hobbyServo.zeroUs = zeroUs;
+  hobbyServo.minUs = minUs;
+  hobbyServo.maxUs = maxUs;
+
+  if (firstAttach) {
+    pinMode(PIN_PARK_SENSOR, OUTPUT);
+    if (!ledcAttach(PIN_PARK_SENSOR,
+                    HobbyServoMotion::PWM_FREQUENCY_HZ,
+                    HobbyServoMotion::PWM_RESOLUTION_BITS)) {
+      params.set("servo", 0.0f);
+      detachHobbyServo();
+      LOG_ERR("Unable to attach hobby servo PWM to GPIO3; servo reset to 0 in RAM\r\n");
+      return false;
+    }
+    hobbyServo.attached = true;
+    hobbyServo.currentUs = zeroUs;
+    hobbyServo.startUs = zeroUs;
+    hobbyServo.targetUs = zeroUs;
+    hobbyServo.moving = false;
+  } else {
+    hobbyServo.currentUs = std::min(std::max(hobbyServo.currentUs, minUs), maxUs);
+    hobbyServo.startUs = hobbyServo.currentUs;
+    hobbyServo.targetUs = hobbyServo.currentUs;
+    hobbyServo.moving = false;
+  }
+
+  if (!writeHobbyServoPulse(hobbyServo.currentUs)) {
+    params.set("servo", 0.0f);
+    detachHobbyServo();
+    LOG_ERR("Unable to write hobby servo PWM; servo reset to 0 in RAM\r\n");
+    return false;
+  }
+
+  LOG_NFO("GPIO3 hobby servo enabled: pulse=%lu us, srvmin=%lu srvzero=%lu srvmax=%lu\r\n",
+          static_cast<unsigned long>(hobbyServo.currentUs),
+          static_cast<unsigned long>(minUs),
+          static_cast<unsigned long>(zeroUs),
+          static_cast<unsigned long>(maxUs));
+  return true;
+}
+
+HobbyServoMotion::MoveResult moveHobbyServo(uint16_t position, uint8_t speed)
+{
+  if (position > 999U || speed < 1U || speed > 10U) {
+    return HobbyServoMotion::MoveResult::InvalidArgument;
+  }
+  if (!hobbyServo.attached) {
+    return HobbyServoMotion::MoveResult::Disabled;
+  }
+  if (!HobbyServoMotion::validConfig(
+          hobbyServo.zeroUs, hobbyServo.minUs, hobbyServo.maxUs)) {
+    return HobbyServoMotion::MoveResult::InvalidConfig;
+  }
+
+  const uint32_t targetUs = HobbyServoMotion::positionToPulseUs(
+      position, hobbyServo.minUs, hobbyServo.maxUs);
+  const uint32_t durationMs = HobbyServoMotion::moveDurationMs(
+      hobbyServo.currentUs,
+      targetUs,
+      hobbyServo.minUs,
+      hobbyServo.maxUs,
+      speed);
+
+  hobbyServo.startUs = hobbyServo.currentUs;
+  hobbyServo.targetUs = targetUs;
+  hobbyServo.startedMs = millis();
+  hobbyServo.durationMs = durationMs;
+  hobbyServo.moving = durationMs != 0U;
+
+  if (!hobbyServo.moving) {
+    hobbyServo.currentUs = targetUs;
+    if (!writeHobbyServoPulse(targetUs)) {
+      params.set("servo", 0.0f);
+      detachHobbyServo();
+      return HobbyServoMotion::MoveResult::PwmError;
+    }
+  }
+
+  LOG_NFO("Hobby servo move accepted: position=%u speed=%u target=%lu us duration=%lu ms\r\n",
+          static_cast<unsigned>(position),
+          static_cast<unsigned>(speed),
+          static_cast<unsigned long>(targetUs),
+          static_cast<unsigned long>(durationMs));
+  return HobbyServoMotion::MoveResult::Accepted;
+}
+
+static void hobbyServoUpdate(uint32_t nowMs)
+{
+  if (!hobbyServo.attached || !hobbyServo.moving) {
+    return;
+  }
+
+  const uint32_t elapsedMs = HobbyServoMotion::elapsedMsSince(
+      nowMs, hobbyServo.startedMs);
+  const uint32_t pulseUs = HobbyServoMotion::interpolatePulseUs(
+      hobbyServo.startUs, hobbyServo.targetUs, elapsedMs, hobbyServo.durationMs);
+  if (pulseUs != hobbyServo.currentUs) {
+    if (!writeHobbyServoPulse(pulseUs)) {
+      LOG_ERR("Hobby servo PWM update failed; disabling GPIO3 output\r\n");
+      params.set("servo", 0.0f);
+      detachHobbyServo();
+      return;
+    }
+    hobbyServo.currentUs = pulseUs;
+  }
+  if (elapsedMs >= hobbyServo.durationMs) {
+    hobbyServo.currentUs = hobbyServo.targetUs;
+    hobbyServo.moving = false;
+  }
+}
+
 void paramsInit()
 {
   if (!params.begin()) {
@@ -715,6 +919,10 @@ void paramsInit()
   params.initKey("pkvel", PARK_DEFAULT_VELOCITY_DEG_S); // park speed in joint deg/s
   params.initKey("pkenc", PARK_DEFAULT_ENCODER_ANGLE_DEG); // final encoder modulo angle in deg
   params.initKey("pkpos", PARK_DEFAULT_JOINT_POSITION_DEG); // known logical joint position at park
+  params.initKey("servo", 0.0f); // 1=GPIO3 hobby servo output; allowed only with pkdir=0
+  params.initKey("srvzero", static_cast<float>(HOBBY_SERVO_ZERO_DEFAULT_US)); // rest pulse, microseconds
+  params.initKey("srvmin", static_cast<float>(HOBBY_SERVO_MIN_DEFAULT_US)); // minimum pulse, microseconds
+  params.initKey("srvmax", static_cast<float>(HOBBY_SERVO_MAX_DEFAULT_US)); // maximum pulse, microseconds
 
   // Joint safety limits in zeroed real joint degrees.
   params.initKey("jmin", JOINT_MIN_DEG_DEFAULT);
@@ -722,7 +930,7 @@ void paramsInit()
   params.initKey("jtol", JOINT_LIMIT_TOL_DEFAULT); // allowed measured overshoot beyond jmin/jmax before fault
 
   // PID + analytic quintic trajectory controller parameters.
-  // Key names are intentionally short because PersistentParams allows max 6 chars.
+  // Key names are intentionally short because PersistentParams allows max 7 chars.
   params.initKey("kp", SERVO_KP);
   params.initKey("ki", SERVO_KI);
   params.initKey("kd", SERVO_KD);
@@ -745,6 +953,7 @@ void paramsInit()
   params.load();
   applyLogLevelFromParams(false);
   applyZeroOffsetFromParams(false);
+  applyHobbyServoParams();
 
   LOG_DBG("Loaded parameters:\r\n");
   for (uint8_t i = 0; i < params.count(); i++) {
@@ -982,6 +1191,13 @@ void onConsoleParamSet(const char* key)
     return;
   }
 
+  if (strcmp(key, "servo") == 0 || strcmp(key, "srvzero") == 0 ||
+      strcmp(key, "srvmin") == 0 || strcmp(key, "srvmax") == 0) {
+    applyHobbyServoParams();
+    LOG_NFO("Use 'save' to persist hobby servo parameters.\r\n");
+    return;
+  }
+
   if (strcmp(key, "pkdir") == 0) {
     const float directionValue = readParamFloatOrDefault("pkdir", 0.0f);
     stopMotion();
@@ -1003,6 +1219,7 @@ void onConsoleParamSet(const char* key)
     } else {
       LOG_ERR("Invalid pkdir: use -1, 0, or +1\r\n");
     }
+    applyHobbyServoParams();
     return;
   }
 
@@ -2791,6 +3008,25 @@ static JointBus::CommandResult jointBusClearFault(void* context)
   return JointBus::CommandResult::fail(JointBus::NackCode::InternalError);
 }
 
+static JointBus::CommandResult jointBusServoMove(void* context,
+                                                 uint16_t position,
+                                                 uint8_t speed)
+{
+  (void)context;
+  switch (moveHobbyServo(position, speed)) {
+    case HobbyServoMotion::MoveResult::Accepted:
+      return JointBus::CommandResult::ok(JointBus::AckCode::Accepted);
+    case HobbyServoMotion::MoveResult::InvalidArgument:
+      return JointBus::CommandResult::fail(JointBus::NackCode::BadPayload);
+    case HobbyServoMotion::MoveResult::Disabled:
+    case HobbyServoMotion::MoveResult::InvalidConfig:
+      return JointBus::CommandResult::fail(JointBus::NackCode::RejectedByState);
+    case HobbyServoMotion::MoveResult::PwmError:
+      return JointBus::CommandResult::fail(JointBus::NackCode::InternalError);
+  }
+  return JointBus::CommandResult::fail(JointBus::NackCode::InternalError);
+}
+
 static JointBus::CommandResult jointBusReboot(void* context, uint16_t magic)
 {
   (void)context;
@@ -2961,6 +3197,7 @@ static void setupJointBusHooks()
   hooks.holdPosition = jointBusHoldPosition;
   hooks.emergencyStop = jointBusEmergencyStop;
   hooks.clearFault = jointBusClearFault;
+  hooks.servoMove = jointBusServoMove;
   hooks.reboot = jointBusReboot;
   hooks.status = jointBusStatus;
   hooks.quickStatus = jointBusQuickStatus;
@@ -3413,7 +3650,7 @@ void setup()
   LOG_NFO("Use zero, then save, to store a new logical zero.\r\n");
   LOG_NFO("Direction signs: mdir=%+.0f edir=%+.0f.\r\n",
           activeMotorDirectionSign, encoder.directionSign());
-  LOG_NFO("Runtime params: kp ki kd ffv ilim vmax amax outmax ptol vtol dbent dbext dbvel vtau stdeg jrev mdir edir jmin jmax jtol loglvl mhold shold zoff pkdir pkvel pkenc pkpos addr.\r\n");
+  LOG_NFO("Runtime params: kp ki kd ffv ilim vmax amax outmax ptol vtol dbent dbext dbvel vtau stdeg jrev mdir edir jmin jmax jtol loglvl mhold shold zoff pkdir pkvel pkenc pkpos servo srvzero srvmin srvmax addr.\r\n");
   LOG_NFO("trace toggles on/off; trace 0..4 selects output mode.\r\n");
   LOG_NFO("Example: set kp 1.0 / set vmax 3.0 / save\r\n");
 
@@ -3425,10 +3662,13 @@ void setup()
 
 void loop()
 {
-  const uint32_t now = millis();
-
   console.update();
   jointBus.update();
+  // Sample time after command dispatch. A servo command can set startedMs
+  // while either update() runs, so a timestamp captured before them could
+  // otherwise look older and complete the ramp immediately by unsigned wrap.
+  const uint32_t now = millis();
+  hobbyServoUpdate(now);
   jointBusScheduledStartUpdate();
 
   if (jointBusRebootPending && static_cast<uint32_t>(now - jointBusRebootRequestedMs) >= 150U) {

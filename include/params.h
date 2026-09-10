@@ -5,7 +5,10 @@
 
 class PersistentParams {
 public:
-    static constexpr uint8_t MAX_KEY_LEN = 6;
+    // Seven characters are required by the public `srvzero` parameter. The
+    // item still occupies 12 bytes because the float remains aligned at byte 8,
+    // so version-1 NVM images written with six-character keys remain compatible.
+    static constexpr uint8_t MAX_KEY_LEN = 7;
     static constexpr uint8_t MAX_PARAMS  = 48;
 
     enum class LoadResult {
@@ -199,6 +202,9 @@ private:
         ParamItem items[MAX_PARAMS];
         uint32_t crc32;
     };
+
+    static_assert(sizeof(ParamItem) == 12,
+                  "Changing ParamItem size requires an NVM format migration");
 
     static constexpr uint32_t MAGIC = 0x504A5053; // "PJPS" circa: PlanetJoint Params Storage
     static constexpr uint16_t VERSION = 1;

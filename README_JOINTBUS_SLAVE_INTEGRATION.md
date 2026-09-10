@@ -77,6 +77,7 @@ save
 | `MOVEB` | connected to `jointMoveToBlended()` |
 | `STOP` | connected to `jointStop()` |
 | `HOLD_POSITION` | cancels coordinated motion and actively holds the measured position |
+| `SERVO_MOVE` | moves the optional GPIO3 hobby servo when `servo=1` and `pkdir=0` |
 | `ZERO` | connected to `setZero()` |
 | `PARK` | connected to `startPark()` |
 | `STATUS` | connected to real joint status |

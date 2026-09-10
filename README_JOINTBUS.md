@@ -48,6 +48,13 @@ For safe recovery from a latched fault, see:
 README_JOINTBUS_CLEAR_FAULT.md
 ```
 
+For the optional GPIO3 hobby-servo output, its NVM parameters, and the
+`SERVO_MOVE` master integration, see:
+
+```text
+README_JOINTBUS_HOBBY_SERVO.md
+```
+
 For RS485 speed considerations, see:
 
 ```text

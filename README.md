@@ -905,7 +905,7 @@ See `README_PERSISTENT_ZERO.md` for the `zoff` parameter, `zero`/`save` workflow
 
 ## Multi-turn park reference
 
-This build requires a successful `park` command after every boot before normal motion is accepted. GPIO3 is the active-low park sensor input. See `README_PARK_REFERENCE.md` for the state machine and parameters `pkdir`, `pkvel`, `pkenc`, and `pkpos`.
+When `pkdir` is non-zero, this build requires a successful `park` command after every boot before normal motion is accepted and GPIO3 is the active-low park sensor input. See `README_PARK_REFERENCE.md` for the state machine and parameters `pkdir`, `pkvel`, `pkenc`, and `pkpos`.
 
 ## Park reference safety update
 
@@ -914,6 +914,10 @@ This build requires a successful `park` command after every boot before normal m
 GPIO3 park sensor is already active when `park` starts, the firmware never
 continues the search movement; it aligns directly to `pkenc`. See
 `README_PARK_REFERENCE.md`.
+
+With `pkdir=0`, GPIO3 can instead drive a standard hobby servo when the NVM
+parameter `servo=1`. See `README_JOINTBUS_HOBBY_SERVO.md` for `srvzero`,
+`srvmin`, `srvmax`, and the serial/JointBus move commands.
 
 ---
 

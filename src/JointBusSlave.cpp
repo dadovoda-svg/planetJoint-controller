@@ -363,6 +363,25 @@ void Slave::handleFrame(const Frame& request) {
         break;
     }
 
+    case Command::ServoMove: {
+        if (request.payloadLen != SERVO_MOVE_PAYLOAD_SIZE) {
+            sendNack(request.seq, NackCode::BadLength);
+            break;
+        }
+        const uint16_t position = getU16LE(&request.payload[0]);
+        const uint8_t speed = request.payload[2];
+        if (position > 999U || speed < 1U || speed > 10U) {
+            sendNack(request.seq, NackCode::BadPayload);
+            break;
+        }
+        const CommandResult r = _hooks.servoMove
+            ? _hooks.servoMove(_hooks.context, position, speed)
+            : CommandResult::fail(NackCode::BadCommand);
+        r.accepted ? sendAck(request.seq, r.ack, r.detail)
+                   : sendNack(request.seq, r.nack, r.detail);
+        break;
+    }
+
     case Command::Reboot: {
         if (request.payloadLen != 2) {
             sendNack(request.seq, NackCode::BadLength);

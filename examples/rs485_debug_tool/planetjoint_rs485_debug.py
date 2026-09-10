@@ -59,6 +59,7 @@ class Command(enum.IntEnum):
     MOTION_CONFIG = 0x0F
     CLEAR_FAULT = 0x12
     PREPARE_HOLD = 0x13
+    SERVO_MOVE = 0x15
     PING = 0x7F
 
     ACK = 0x80
@@ -305,6 +306,9 @@ class JointBusClient:
         self.simulated_motion_config: Dict[int, Tuple[int, int, int, int]] = {
             addr: (-17000, 17000, 200, 600) for addr in self.simulated_nodes
         }
+        self.simulated_servo_position: Dict[int, int] = {
+            addr: 0 for addr in self.simulated_nodes
+        }
 
         if not self.offline:
             if serial is None:
@@ -499,6 +503,17 @@ class JointBusClient:
             else:
                 rsp_command = Command.MOTION_CONFIG_RSP
                 rsp_payload = struct.pack("<hhHH", *self.simulated_motion_config[address])
+        elif command == Command.SERVO_MOVE:
+            if len(payload) != 3:
+                rsp_command = Command.NACK
+                rsp_payload = bytes((0x02, 0x00))
+            else:
+                position, speed = struct.unpack("<HB", payload)
+                if position > 999 or not 1 <= speed <= 10:
+                    rsp_command = Command.NACK
+                    rsp_payload = bytes((0x04, 0x00))
+                else:
+                    self.simulated_servo_position[address] = position
         elif command == Command.PING:
             rsp_payload = bytes((0x00, 0x00))
         else:
@@ -776,6 +791,22 @@ class JointBusShell(cmd.Cmd):
     def do_config(self, line: str) -> None:
         """config <address> -- alias for mconfig."""
         self.do_mconfig(line)
+
+    def do_srvmove(self, line: str) -> None:
+        """srvmove <address> <position_0_999> <speed_1_10> -- move the GPIO3 hobby servo."""
+        tokens = self._tokens(
+            line, 3, "srvmove <address> <position_0_999> <speed_1_10>")
+        address = parse_address(tokens[0])
+        position = int(tokens[1], 0)
+        speed = int(tokens[2], 0)
+        if not 0 <= position <= 999:
+            raise ValueError("position must be in range 0..999")
+        if not 1 <= speed <= 10:
+            raise ValueError("speed must be in range 1..10")
+        frame = self.client.transact(
+            address, Command.SERVO_MOVE, struct.pack("<HB", position, speed))
+        if frame:
+            print(describe_frame(frame))
 
     def _move(self, line: str, command: Command) -> None:
         tokens = self._tokens(line, 4, f"{command.name.lower()} <address> <angle_deg> <vmax_deg_s> <amax_deg_s2>")

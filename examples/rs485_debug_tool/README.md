@@ -83,6 +83,7 @@ status <addr>
 qstatus <addr>
 mconfig <addr>
 config <addr>
+srvmove <addr> <position_0_999> <speed_1_10>
 sync <first_addr> <last_addr> [passes]
 scan [first_addr] [last_addr]
 purge
@@ -103,6 +104,10 @@ addr=1 seq=1 type=RESPONSE cmd=MOTION_CONFIG_RSP
 ```
 
 The offline simulator uses these same defaults for nodes `0..7`.
+
+`srvmove` sends the addressed `SERVO_MOVE` command. The offline simulator
+assumes hobby-servo mode is enabled; real nodes return `REJECTED_BY_STATE`
+unless the persisted/runtime configuration has `servo=1` and `pkdir=0`.
 
 `clearfault` sends the addressed `CLEAR_FAULT` request. The real node clears
 the latch only after fresh encoder and driver checks, valid persistent joint

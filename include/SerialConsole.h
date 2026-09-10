@@ -75,6 +75,7 @@ private:
   void cmdStop(int argc, char* argv[]);
   void cmdClearFault(int argc, char* argv[]);
   void cmdServo(int argc, char* argv[]);
+  void cmdServoMove(int argc, char* argv[]);
   void cmdReboot(int argc, char* argv[]);
   void cmdJointBusStats(int argc, char* argv[]);
 

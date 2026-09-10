@@ -11,6 +11,7 @@ static constexpr uint8_t SOF = 0xA5;
 static constexpr uint8_t BROADCAST_ADDRESS = 0x0F;
 static constexpr uint8_t NO_SEGMENT_ID = 0xFF;
 static constexpr size_t MAX_PAYLOAD = 16;
+static constexpr size_t SERVO_MOVE_PAYLOAD_SIZE = 3;
 static constexpr size_t MAX_FRAME_SIZE = 1 + 1 + 1 + 1 + 1 + MAX_PAYLOAD + 2;
 
 // Header layout:
@@ -52,6 +53,7 @@ enum class Command : uint8_t {
     ClearFault   = 0x12,
     PrepareHold  = 0x13,
     HoldPosition = 0x14,
+    ServoMove    = 0x15,
     Ping       = 0x7F,
 
     Ack        = 0x80,
